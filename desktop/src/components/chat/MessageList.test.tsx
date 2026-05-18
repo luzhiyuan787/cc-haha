@@ -905,8 +905,8 @@ describe('MessageList nested tool calls', () => {
     await selectMessageText(userText, 'workspace selection behavior')
     const floatingAddButton = screen.getByRole('button', { name: 'Add to chat' })
 
-    expect(floatingAddButton.style.left).toBe('260px')
-    expect(floatingAddButton.style.top).toBe('112px')
+    expect(floatingAddButton.style.left).toBe('141px')
+    expect(floatingAddButton.style.top).toBe('26px')
 
     fireEvent.click(floatingAddButton)
 
@@ -951,6 +951,80 @@ describe('MessageList nested tool calls', () => {
         messageId: 'assistant-1',
         sourceRole: 'assistant',
         quote: 'quote the selected lines',
+      },
+    ])
+  })
+
+  it('dismisses the selected-message action when clicking outside the popover', async () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [{
+            id: 'assistant-1',
+            type: 'assistant_text',
+            content: 'Clicking outside should clear this selected reply.',
+            timestamp: 1,
+          }],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    const assistantText = screen.getByText(/Clicking outside should clear/)
+    await selectMessageText(assistantText, 'selected reply')
+    expect(screen.getByRole('button', { name: 'Add to chat' })).toBeTruthy()
+
+    await act(async () => {
+      fireEvent.pointerDown(document.body)
+      await Promise.resolve()
+    })
+
+    expect(screen.queryByRole('button', { name: 'Add to chat' })).toBeNull()
+    expect(window.getSelection()?.toString()).toBe('')
+  })
+
+  it('keeps only the latest selected-message action when selecting across messages', async () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            {
+              id: 'assistant-1',
+              type: 'assistant_text',
+              content: 'First assistant reply can be selected.',
+              timestamp: 1,
+            },
+            {
+              id: 'assistant-2',
+              type: 'assistant_text',
+              content: 'Second assistant reply should replace it.',
+              timestamp: 2,
+            },
+          ],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    const firstText = screen.getByText(/First assistant reply/)
+    const secondText = screen.getByText(/Second assistant reply/)
+    await selectMessageText(firstText, 'First assistant reply')
+    expect(screen.getAllByRole('button', { name: 'Add to chat' })).toHaveLength(1)
+
+    await act(async () => {
+      fireEvent.pointerDown(secondText)
+      await Promise.resolve()
+    })
+    await selectMessageText(secondText, 'Second assistant reply')
+
+    expect(screen.getAllByRole('button', { name: 'Add to chat' })).toHaveLength(1)
+    fireEvent.click(screen.getByRole('button', { name: 'Add to chat' }))
+    expect(useWorkspaceChatContextStore.getState().referencesBySession[ACTIVE_TAB]).toMatchObject([
+      {
+        messageId: 'assistant-2',
+        quote: 'Second assistant reply',
       },
     ])
   })

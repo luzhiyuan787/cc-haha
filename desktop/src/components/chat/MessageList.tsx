@@ -1,5 +1,5 @@
 import { useRef, useEffect, useMemo, memo, useState, useCallback, useLayoutEffect, type ReactNode } from 'react'
-import { ArrowDown, BookMarked, Bot, CheckCircle2, ChevronDown, ChevronRight, CircleStop, LoaderCircle, Settings, Target, XCircle } from 'lucide-react'
+import { ArrowDown, BookMarked, Bot, CheckCircle2, ChevronDown, ChevronRight, CircleStop, LoaderCircle, MessageCircle, Settings, Target, XCircle } from 'lucide-react'
 import { ApiError } from '../../api/client'
 import { sessionsApi, type SessionTurnCheckpoint } from '../../api/sessions'
 import { useChatStore } from '../../stores/chatStore'
@@ -22,6 +22,7 @@ import { InlineTaskSummary } from './InlineTaskSummary'
 import { CurrentTurnChangeCard } from './CurrentTurnChangeCard'
 import type { AgentTaskNotification, UIMessage } from '../../types/chat'
 import { ConfirmDialog } from '../shared/ConfirmDialog'
+import { clearWindowSelection, getSelectionPopoverPosition, useSelectionPopoverDismiss } from '../../hooks/useSelectionPopoverDismiss'
 
 type ToolCall = Extract<UIMessage, { type: 'tool_use' }>
 type ToolResult = Extract<UIMessage, { type: 'tool_result' }>
@@ -62,11 +63,9 @@ type ChatSelectionState = {
   y: number
 }
 
-const CHAT_SELECTION_MENU_OFFSET = 8
-
-function clampValue(value: number, min: number, max: number) {
-  return Math.max(min, Math.min(value, max))
-}
+const CHAT_SELECTION_MENU_OFFSET = 10
+const CHAT_SELECTION_MENU_WIDTH = 158
+const CHAT_SELECTION_MENU_HEIGHT = 44
 
 function getElementForNode(node: Node | null): Element | null {
   if (!node) return null
@@ -74,32 +73,12 @@ function getElementForNode(node: Node | null): Element | null {
 }
 
 function getChatSelectionPosition(range: Range, root: HTMLElement, pointer: { clientX: number; clientY: number }) {
-  const rect = typeof range.getBoundingClientRect === 'function'
-    ? range.getBoundingClientRect()
-    : null
-  const rootRect = root.getBoundingClientRect()
-  const pointerInsideRoot =
-    pointer.clientX >= rootRect.left &&
-    pointer.clientX <= rootRect.right &&
-    pointer.clientY >= rootRect.top &&
-    pointer.clientY <= rootRect.bottom
-  const fallbackX = rect && rect.width > 0
-    ? rect.left + rect.width / 2
-    : rect?.left ?? rootRect.left + 24
-  const fallbackY = rect
-    ? rect.bottom + CHAT_SELECTION_MENU_OFFSET
-    : rootRect.top + 24
-  const unclampedX = pointerInsideRoot ? pointer.clientX : fallbackX
-  const unclampedY = pointerInsideRoot ? pointer.clientY + CHAT_SELECTION_MENU_OFFSET : fallbackY
-  const minX = Math.max(12, rootRect.left + 8)
-  const maxX = Math.max(minX, Math.min(window.innerWidth - 160, rootRect.right - 136))
-  const minY = Math.max(12, rootRect.top + 8)
-  const maxY = Math.max(minY, Math.min(window.innerHeight - 48, rootRect.bottom - 40))
-
-  return {
-    x: clampValue(unclampedX, minX, maxX),
-    y: clampValue(unclampedY, minY, maxY),
-  }
+  return getSelectionPopoverPosition(range, root, {
+    menuWidth: CHAT_SELECTION_MENU_WIDTH,
+    menuHeight: CHAT_SELECTION_MENU_HEIGHT,
+    offset: CHAT_SELECTION_MENU_OFFSET,
+    fallbackPointer: pointer,
+  })
 }
 
 function getChatSelectionFromContainer(
@@ -129,22 +108,25 @@ function getChatSelectionFromContainer(
 function ChatSelectionMenu({
   selection,
   onAdd,
+  popoverRef,
 }: {
   selection: ChatSelectionState | null
   onAdd: () => void
+  popoverRef: { current: HTMLButtonElement | null }
 }) {
   const t = useTranslation()
   if (!selection) return null
 
   return (
     <button
+      ref={popoverRef}
       type="button"
       onMouseDown={(event) => event.preventDefault()}
       onClick={onAdd}
-      className="fixed z-50 inline-flex h-8 items-center gap-1.5 rounded-[8px] border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] px-2.5 text-[12px] font-medium text-[var(--color-text-primary)] shadow-[var(--shadow-dropdown)] transition-colors hover:bg-[var(--color-surface-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-brand)]/35"
+      className="fixed z-50 inline-flex h-11 items-center gap-2 rounded-full border border-[var(--color-border)]/70 bg-[var(--color-surface-container-lowest)] px-5 text-[15px] font-semibold text-[var(--color-text-primary)] shadow-[0_10px_28px_rgba(15,23,42,0.14),0_2px_8px_rgba(15,23,42,0.08)] transition-colors hover:bg-[var(--color-surface)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-brand)]/35"
       style={{ left: selection.x, top: selection.y }}
     >
-      <span aria-hidden="true" className="material-symbols-outlined text-[15px] text-[var(--color-text-tertiary)]">person_add</span>
+      <MessageCircle size={21} strokeWidth={2.15} className="shrink-0 text-[var(--color-text-primary)]" aria-hidden="true" />
       <span>{t('chat.addSelectionToChat')}</span>
     </button>
   )
@@ -299,6 +281,7 @@ function SelectableChatMessage({
   children: ReactNode
 }) {
   const rootRef = useRef<HTMLDivElement>(null)
+  const selectionMenuRef = useRef<HTMLButtonElement>(null)
   const addReference = useWorkspaceChatContextStore((state) => state.addReference)
   const [selectionMenu, setSelectionMenu] = useState<ChatSelectionState | null>(null)
   const t = useTranslation()
@@ -309,6 +292,16 @@ function SelectableChatMessage({
   useEffect(() => {
     setSelectionMenu(null)
   }, [content, messageId])
+
+  const dismissSelectionMenu = useCallback(() => {
+    setSelectionMenu(null)
+  }, [])
+
+  useSelectionPopoverDismiss({
+    active: Boolean(selectionMenu),
+    popoverRef: selectionMenuRef,
+    onDismiss: dismissSelectionMenu,
+  })
 
   const addCurrentSelectionToChat = useCallback(() => {
     if (!sessionId || !selectionMenu) return
@@ -321,7 +314,7 @@ function SelectableChatMessage({
       messageId,
     })
     setSelectionMenu(null)
-    window.getSelection()?.removeAllRanges()
+    clearWindowSelection()
   }, [addReference, messageId, role, selectionMenu, sessionId, sourceName])
 
   return (
@@ -335,7 +328,7 @@ function SelectableChatMessage({
       }}
     >
       {children}
-      <ChatSelectionMenu selection={selectionMenu} onAdd={addCurrentSelectionToChat} />
+      <ChatSelectionMenu selection={selectionMenu} onAdd={addCurrentSelectionToChat} popoverRef={selectionMenuRef} />
     </div>
   )
 }
