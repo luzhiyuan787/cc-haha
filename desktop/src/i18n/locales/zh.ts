@@ -1236,6 +1236,8 @@ export const zh: Record<TranslationKey, string> = {
   'tool.toolOutput': '工具输出',
   'tool.toolInput': '工具输入',
   'tool.partialInput': '部分输入',
+  'tool.writerPreview': 'Writer',
+  'tool.writerPreviewLatest': '正在显示最新 {visible} / {total} 行',
   'tool.generatingContent': '正在生成内容',
   'tool.preparingEdit': '正在准备编辑',
   'tool.preparingTool': '正在准备工具',

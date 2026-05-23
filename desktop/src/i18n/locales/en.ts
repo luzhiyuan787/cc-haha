@@ -1234,6 +1234,8 @@ export const en = {
   'tool.toolOutput': 'Tool Output',
   'tool.toolInput': 'Tool Input',
   'tool.partialInput': 'Partial input',
+  'tool.writerPreview': 'Writer',
+  'tool.writerPreviewLatest': 'Showing latest {visible} of {total} lines',
   'tool.generatingContent': 'Generating content',
   'tool.preparingEdit': 'Preparing edit',
   'tool.preparingTool': 'Preparing tool',

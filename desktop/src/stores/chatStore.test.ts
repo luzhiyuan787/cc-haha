@@ -1332,6 +1332,8 @@ describe('chatStore history mapping', () => {
   })
 
   it('renders a pending tool call as soon as the tool stream starts', () => {
+    vi.useFakeTimers()
+
     useChatStore.setState({
       sessions: {
         [TEST_SESSION_ID]: makeSession(),
@@ -1359,6 +1361,7 @@ describe('chatStore history mapping', () => {
       type: 'content_delta',
       toolInput: '{"file_path":"/private/tmp/ai-code-novel.md","content":"第一章',
     })
+    vi.advanceTimersByTime(60)
 
     expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.messages).toMatchObject([
       {
@@ -1395,6 +1398,54 @@ describe('chatStore history mapping', () => {
       isPending: false,
     })
     expect(toolMessages[0]).not.toHaveProperty('partialInput')
+
+    vi.runOnlyPendingTimers()
+    vi.useRealTimers()
+  })
+
+  it('batches streaming tool input deltas before updating the pending card', () => {
+    vi.useFakeTimers()
+
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession(),
+      },
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'content_start',
+      blockType: 'tool_use',
+      toolName: 'Write',
+      toolUseId: 'write-1',
+    })
+
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'content_delta',
+      toolInput: '{"file_path":"/private/tmp/story.md","content":"第一',
+    })
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+      type: 'content_delta',
+      toolInput: '章\\n第二段',
+    })
+
+    const beforeFlush = useChatStore.getState().sessions[TEST_SESSION_ID]?.messages[0]
+    expect(beforeFlush).toMatchObject({
+      type: 'tool_use',
+      isPending: true,
+      input: {},
+      partialInput: '',
+    })
+
+    vi.advanceTimersByTime(60)
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.messages[0]).toMatchObject({
+      type: 'tool_use',
+      input: { file_path: '/private/tmp/story.md' },
+      partialInput: '{"file_path":"/private/tmp/story.md","content":"第一章\\n第二段',
+    })
+
+    vi.runOnlyPendingTimers()
+    vi.useRealTimers()
   })
 
   it('refreshes merged slash commands when a live CLI update omits project commands', async () => {

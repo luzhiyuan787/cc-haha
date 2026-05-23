@@ -33,6 +33,9 @@ const TOOL_ICONS: Record<string, string> = {
   Skill: 'auto_awesome',
 }
 
+const WRITER_PREVIEW_MAX_LINES = 120
+const WRITER_PREVIEW_MAX_CHARS = 30000
+
 export function ToolCallBlock({ toolName, input, result, compact = false, isPending = false, partialInput }: Props) {
   const [expanded, setExpanded] = useState(false)
   const t = useTranslation()
@@ -186,6 +189,12 @@ function renderDetails(
   partialInput?: string,
 ) {
   if (partialInput) {
+    if (toolName === 'Write') {
+      const writerContent = extractPartialJsonStringField(partialInput, 'content')
+      if (writerContent) {
+        return renderWriterPreview(writerContent, t)
+      }
+    }
     return renderPartialInput(partialInput, t)
   }
 
@@ -204,6 +213,110 @@ function renderDetails(
         />
       </div>
       <CodeViewer code={text} language="json" maxLines={18} />
+    </div>
+  )
+}
+
+function extractPartialJsonStringField(source: string, field: string): string | null {
+  const key = `"${field}"`
+  const keyIndex = source.indexOf(key)
+  if (keyIndex < 0) return null
+  const colonIndex = source.indexOf(':', keyIndex + key.length)
+  if (colonIndex < 0) return null
+
+  let index = colonIndex + 1
+  while (index < source.length && /\s/.test(source[index] ?? '')) index += 1
+  if (source[index] !== '"') return null
+  index += 1
+
+  let value = ''
+  while (index < source.length) {
+    const char = source[index]
+    if (char === '"') return value
+    if (char !== '\\') {
+      value += char
+      index += 1
+      continue
+    }
+
+    const escaped = source[index + 1]
+    if (escaped === undefined) break
+    switch (escaped) {
+      case 'n':
+        value += '\n'
+        index += 2
+        break
+      case 'r':
+        value += '\r'
+        index += 2
+        break
+      case 't':
+        value += '\t'
+        index += 2
+        break
+      case 'b':
+        value += '\b'
+        index += 2
+        break
+      case 'f':
+        value += '\f'
+        index += 2
+        break
+      case '"':
+      case '\\':
+      case '/':
+        value += escaped
+        index += 2
+        break
+      case 'u': {
+        const hex = source.slice(index + 2, index + 6)
+        if (/^[0-9a-fA-F]{4}$/.test(hex)) {
+          value += String.fromCharCode(Number.parseInt(hex, 16))
+          index += 6
+        } else {
+          index = source.length
+        }
+        break
+      }
+      default:
+        value += escaped
+        index += 2
+        break
+    }
+  }
+  return value
+}
+
+function renderWriterPreview(
+  content: string,
+  t?: (key: TranslationKey, params?: Record<string, string | number>) => string,
+) {
+  const lines = content.split('\n')
+  const totalLines = lines.length
+  const visibleLines = lines.length > WRITER_PREVIEW_MAX_LINES
+    ? lines.slice(-WRITER_PREVIEW_MAX_LINES)
+    : lines
+  let visibleContent = visibleLines.join('\n')
+  const charTruncated = visibleContent.length > WRITER_PREVIEW_MAX_CHARS
+  if (charTruncated) {
+    visibleContent = visibleContent.slice(-WRITER_PREVIEW_MAX_CHARS)
+  }
+  const lineWindowed = totalLines > visibleLines.length
+  const isWindowed = lineWindowed || charTruncated
+
+  return (
+    <div className="overflow-hidden rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)]">
+      <div className="flex items-center justify-between border-b border-[var(--color-border)] px-3 py-2 text-[10px] uppercase tracking-[0.18em] text-[var(--color-outline)]">
+        <span>{t?.('tool.writerPreview') ?? 'Writer'}</span>
+        {isWindowed ? (
+          <span className="normal-case tracking-normal">
+            {t?.('tool.writerPreviewLatest', { visible: visibleLines.length, total: totalLines }) ?? `Showing latest ${visibleLines.length} of ${totalLines} lines`}
+          </span>
+        ) : null}
+      </div>
+      <pre className="max-h-[420px] overflow-auto whitespace-pre-wrap break-words bg-[var(--color-code-bg)] px-3 py-2 font-[var(--font-mono)] text-[12px] leading-[1.45] text-[var(--color-code-fg)]">
+        {visibleContent}
+      </pre>
     </div>
   )
 }

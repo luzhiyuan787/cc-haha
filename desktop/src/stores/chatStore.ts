@@ -288,6 +288,8 @@ function upsertToolUseMessage(
 // multiple desktop tabs can stream at the same time.
 const pendingDeltaBySession = new Map<string, string>()
 const flushTimerBySession = new Map<string, ReturnType<typeof setTimeout>>()
+const pendingToolInputDeltaBySession = new Map<string, string>()
+const toolInputFlushTimerBySession = new Map<string, ReturnType<typeof setTimeout>>()
 
 function consumePendingDelta(sessionId: string): string {
   const flushTimer = flushTimerBySession.get(sessionId)
@@ -314,6 +316,33 @@ function clearPendingDelta(sessionId: string): void {
     flushTimerBySession.delete(sessionId)
   }
   pendingDeltaBySession.delete(sessionId)
+}
+
+function consumePendingToolInputDelta(sessionId: string): string {
+  const flushTimer = toolInputFlushTimerBySession.get(sessionId)
+  if (flushTimer) {
+    clearTimeout(flushTimer)
+    toolInputFlushTimerBySession.delete(sessionId)
+  }
+  const text = pendingToolInputDeltaBySession.get(sessionId) ?? ''
+  pendingToolInputDeltaBySession.delete(sessionId)
+  return text
+}
+
+function appendPendingToolInputDelta(sessionId: string, text: string): void {
+  pendingToolInputDeltaBySession.set(
+    sessionId,
+    `${pendingToolInputDeltaBySession.get(sessionId) ?? ''}${text}`,
+  )
+}
+
+function clearPendingToolInputDelta(sessionId: string): void {
+  const flushTimer = toolInputFlushTimerBySession.get(sessionId)
+  if (flushTimer) {
+    clearTimeout(flushTimer)
+    toolInputFlushTimerBySession.delete(sessionId)
+  }
+  pendingToolInputDeltaBySession.delete(sessionId)
 }
 
 function appendAssistantTextMessage(
@@ -767,6 +796,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       const text = consumePendingDelta(sessionId)
       set((s) => ({ sessions: updateSessionIn(s.sessions, sessionId, (sess) => ({ streamingText: sess.streamingText + text })) }))
     }
+    clearPendingToolInputDelta(sessionId)
     clearPendingTaskToolUseIds(sessionId)
     clearPendingToolParentUseIds(sessionId)
     wsManager.disconnect(sessionId)
@@ -932,6 +962,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       const text = consumePendingDelta(sessionId)
       set((s) => ({ sessions: updateSessionIn(s.sessions, sessionId, (sess) => ({ streamingText: sess.streamingText + text })) }))
     }
+    clearPendingToolInputDelta(sessionId)
     set((s) => {
       const session = s.sessions[sessionId]
       if (!session) return s
@@ -1090,6 +1121,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   clearMessages: (sessionId) => {
     clearPendingTaskToolUseIds(sessionId)
     clearPendingToolParentUseIds(sessionId)
+    clearPendingToolInputDelta(sessionId)
     set((s) => ({ sessions: updateSessionIn(s.sessions, sessionId, () => ({
       messages: [],
       activeGoal: null,
@@ -1180,6 +1212,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             apiRetry: null,
           }))
         } else if (msg.blockType === 'tool_use') {
+          clearPendingToolInputDelta(sessionId)
           rememberPendingToolParentUseId(sessionId, msg.toolUseId, msg.parentToolUseId)
           const toolUseId = msg.toolUseId ?? null
           const toolName = msg.toolName ?? 'unknown'
@@ -1247,31 +1280,39 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           }
         }
         if (msg.toolInput !== undefined) {
-          update((s) => {
-            const partialInput = s.streamingToolInput + msg.toolInput
-            const activeToolUseId = s.activeToolUseId
-            return {
-              streamingToolInput: partialInput,
-              ...(activeToolUseId
-                ? {
-                    messages: upsertToolUseMessage(s.messages, activeToolUseId, (existing) => {
-                      const toolName = existing?.toolName ?? s.activeToolName ?? 'unknown'
-                      return {
-                        id: existing?.id ?? nextId(),
-                        type: 'tool_use',
-                        toolName,
-                        toolUseId: activeToolUseId,
-                        input: buildPartialToolInputPreview(partialInput, existing?.input),
-                        timestamp: existing?.timestamp ?? Date.now(),
-                        parentToolUseId: existing?.parentToolUseId ?? getPendingToolParentUseId(sessionId, activeToolUseId),
-                        isPending: true,
-                        partialInput,
+          appendPendingToolInputDelta(sessionId, msg.toolInput)
+          if (!toolInputFlushTimerBySession.has(sessionId)) {
+            const timer = setTimeout(() => {
+              const text = consumePendingToolInputDelta(sessionId)
+              if (!text) return
+              update((s) => {
+                const partialInput = s.streamingToolInput + text
+                const activeToolUseId = s.activeToolUseId
+                return {
+                  streamingToolInput: partialInput,
+                  ...(activeToolUseId
+                    ? {
+                        messages: upsertToolUseMessage(s.messages, activeToolUseId, (existing) => {
+                          const toolName = existing?.toolName ?? s.activeToolName ?? 'unknown'
+                          return {
+                            id: existing?.id ?? nextId(),
+                            type: 'tool_use',
+                            toolName,
+                            toolUseId: activeToolUseId,
+                            input: buildPartialToolInputPreview(partialInput, existing?.input),
+                            timestamp: existing?.timestamp ?? Date.now(),
+                            parentToolUseId: existing?.parentToolUseId ?? getPendingToolParentUseId(sessionId, activeToolUseId),
+                            isPending: true,
+                            partialInput,
+                          }
+                        }),
                       }
-                    }),
-                  }
-                : {}),
-            }
-          })
+                    : {}),
+                }
+              })
+            }, 50)
+            toolInputFlushTimerBySession.set(sessionId, timer)
+          }
         }
         break
 
@@ -1298,6 +1339,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         break
 
       case 'tool_use_complete': {
+        clearPendingToolInputDelta(sessionId)
         const session = get().sessions[sessionId]
         const toolName = msg.toolName || session?.activeToolName || 'unknown'
         const toolUseId = msg.toolUseId || session?.activeToolUseId || ''
