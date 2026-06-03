@@ -10,7 +10,7 @@ bun run verify
 
 `bun run verify` 会一键检查 policy、desktop、server、adapters、native、docs、quarantine 和 coverage。非 0 退出就说明当前分支还不能提交 PR。
 
-已安装本地 hook 的仓库在 `git push` 前会自动运行快速门禁 `bun run quality:push`；它复用 PR 门禁但默认跳过耗时的 coverage lane，完整覆盖率仍以 `bun run verify` 为准。
+`git push` 不再自动运行本地质量门禁。需要质量检查时请手动运行 `bun run quality:push` 或 `bun run verify`；完整覆盖率仍以 `bun run verify` 为准。
 
 只改了某个模块时可以用窄命令快速迭代：
 

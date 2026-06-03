@@ -58,7 +58,7 @@ Use the narrowest meaningful verification while iterating, then run the correct 
 | Docs, README, release notes, or docs workflow changes | `bun run check:docs` | This runs `npm ci`; run it sequentially, not in parallel with commands that depend on root `node_modules`. |
 | Persistence shape changes | `bun run check:persistence-upgrade` | Required for local JSON, `localStorage`, app config migrations, and old-fixture upgrade behavior. |
 | Coverage during handoff | `bun run check:coverage` or `bun run verify` | Changed executable production lines must meet the changed-line threshold. |
-| Fast local pre-push hook | `bun run quality:push` | Path-aware PR mode with coverage skipped by default; useful for human push latency, not a substitute for PR-ready verification. |
+| Optional fast local check | `bun run quality:push` | Path-aware PR mode with coverage skipped by default; run manually when useful, not as a push-time blocker or substitute for PR-ready verification. |
 | PR-ready / final agent handoff for code changes | `bun run verify` | Unified local entrypoint: `bun run verify` is equivalent to `bun run quality:pr` and is the default non-live quality gate. |
 | Live agent/provider confidence | `bun run quality:providers`, then `bun run quality:smoke --provider-model <provider:model[:label]>` | Quick live provider/proxy and desktop agent-browser smoke when provider access exists. |
 | High-risk pre-merge confidence | `bun run quality:gate --mode baseline --allow-live --provider-model <provider:model[:label]>` | Use for agent-loop, provider routing, model selection, tool execution, session resume, desktop chat, or other core Coding Agent paths. |
