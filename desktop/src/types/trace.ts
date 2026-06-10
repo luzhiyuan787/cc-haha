@@ -15,6 +15,13 @@ export type TraceProviderInfo = {
 export type TraceCallStatus = 'pending' | 'ok' | 'error'
 export type TraceEventSeverity = 'info' | 'warning' | 'error'
 
+export type TraceCallUsage = {
+  inputTokens: number
+  outputTokens: number
+  cacheReadInputTokens?: number
+  cacheCreationInputTokens?: number
+}
+
 export type TraceCallRecord = {
   id: string
   sessionId: string
@@ -26,6 +33,7 @@ export type TraceCallRecord = {
   startedAt: string
   completedAt?: string
   durationMs?: number
+  usage?: TraceCallUsage
   metadata?: Record<string, unknown>
   request: {
     method: string

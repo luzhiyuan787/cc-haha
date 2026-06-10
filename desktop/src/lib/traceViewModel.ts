@@ -1,5 +1,5 @@
 import type { MessageEntry } from '../types/session'
-import type { TraceCallRecord, TraceEventRecord, TraceSession as TraceSessionData } from '../types/trace'
+import type { TraceCallRecord, TraceCallUsage, TraceEventRecord, TraceSession as TraceSessionData } from '../types/trace'
 
 export type TraceSpanKind = 'session' | 'turn' | 'message' | 'llm' | 'tool' | 'tool_result' | 'event'
 export type TraceSpanStatus = 'ok' | 'error' | 'pending'
@@ -24,6 +24,8 @@ export type TraceSpan = {
   input?: unknown
   output?: unknown
   isSidechain?: boolean
+  tokenUsage?: TraceCallUsage
+  isLifecycleNoise?: boolean
   raw: unknown
 }
 
@@ -66,7 +68,6 @@ export type TraceViewModel = {
   turns: TraceTurn[]
   orderedSpanIds: string[]
   diagnosis: TraceDiagnosis
-  fullRaw: unknown
 }
 
 type ToolUseBlock = {
@@ -240,6 +241,7 @@ export function buildTraceViewModel(
       durationMs: call.durationMs,
       turnIndex: turn.index,
       call,
+      tokenUsage: call.usage,
       raw: call,
     })
     turn.spanIds.push(spanId)
@@ -260,6 +262,7 @@ export function buildTraceViewModel(
       timestamp: event.timestamp,
       turnIndex: turn.index,
       event,
+      isLifecycleNoise: isLifecycleNoiseEvent(event),
       raw: event,
     })
     turn.spanIds.push(spanId)
@@ -289,13 +292,6 @@ export function buildTraceViewModel(
     turns,
     orderedSpanIds,
     diagnosis: buildDiagnosis(spanList, turns, rootId, fallbackTimestamp),
-    fullRaw: {
-      session: trace.session,
-      summary: trace.summary,
-      calls: trace.calls,
-      events: traceEvents,
-      messages,
-    },
   }
 }
 
@@ -607,6 +603,17 @@ function getEventStatus(event: TraceEventRecord): TraceSpanStatus {
   return event.severity === 'error' ? 'error' : 'ok'
 }
 
+const LIFECYCLE_NOISE_PHASES = new Set([
+  'api_call_started',
+  'api_call_completed',
+  'upstream_fetch_started',
+  'upstream_fetch_completed',
+])
+
+function isLifecycleNoiseEvent(event: TraceEventRecord): boolean {
+  return event.severity === 'info' && LIFECYCLE_NOISE_PHASES.has(event.phase)
+}
+
 function formatTraceEventPhase(phase: string): string {
   return phase
     .split(/[_\s-]+/)
@@ -617,7 +624,8 @@ function formatTraceEventPhase(phase: string): string {
 
 function formatUnknown(value: unknown): string {
   try {
-    return JSON.stringify(value, null, 2)
+    // JSON.stringify(undefined) yields undefined, not a string.
+    return JSON.stringify(value, null, 2) ?? String(value)
   } catch {
     return String(value)
   }

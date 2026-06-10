@@ -1,13 +1,17 @@
 import { createHash, randomUUID } from 'crypto'
 import { existsSync, readFileSync, statSync } from 'fs'
 import { promises as fs } from 'fs'
+import type { Stats } from 'fs'
 import { dirname, join } from 'path'
 import { getClaudeConfigHomeDir, isEnvDefinedFalsy, isEnvTruthy } from '../../utils/envUtils.js'
 
-const TRACE_PREVIEW_CHARS = 2048
-const TRACE_STREAM_CAPTURE_BYTES = 256 * 1024
+const TRACE_PREVIEW_CHARS = 240_000
+export const TRACE_STREAM_CAPTURE_BYTES = 1024 * 1024
+export const TRACE_LIST_PREVIEW_CHARS = 2048
 const TRACE_SETTINGS_KEY = 'traceCapture'
-const SENSITIVE_KEY_RE = /authorization|api[-_]?key|secret|token|cookie|password|bearer/i
+// `token(?!s)` keeps secret-bearing keys (token, access_token, api_token) redacted while
+// letting token-count fields (input_tokens, max_tokens, prompt_tokens) through.
+const SENSITIVE_KEY_RE = /authorization|api[-_]?key|secret|token(?!s)|cookie|password|bearer/i
 
 export type TraceCaptureSettings = {
   enabled: boolean
@@ -32,6 +36,13 @@ export type TraceCallStatus = 'pending' | 'ok' | 'error'
 
 export type TraceEventSeverity = 'info' | 'warning' | 'error'
 
+export type TraceCallUsage = {
+  inputTokens: number
+  outputTokens: number
+  cacheReadInputTokens?: number
+  cacheCreationInputTokens?: number
+}
+
 export type TraceCallRecord = {
   id: string
   sessionId: string
@@ -43,6 +54,7 @@ export type TraceCallRecord = {
   startedAt: string
   completedAt?: string
   durationMs?: number
+  usage?: TraceCallUsage
   metadata?: Record<string, unknown>
   request: {
     method: string
@@ -171,7 +183,15 @@ type TraceFileEntry =
   | { type: 'call'; record: TraceCallRecord }
   | { type: 'event'; event: TraceEventRecord }
 
+type TraceReadCacheEntry = {
+  mtimeMs: number
+  size: number
+  calls: TraceCallRecord[]
+  events: TraceEventRecord[]
+}
+
 const traceWriteQueues = new Map<string, Promise<void>>()
+const traceReadCache = new Map<string, TraceReadCacheEntry>()
 
 export function shouldCaptureApiTrace(): boolean {
   if (isEnvDefinedFalsy(process.env.CC_HAHA_TRACE_API_CALLS)) return false
@@ -238,8 +258,36 @@ export function createTraceBodySnapshot(
   }
 }
 
+export function trimTraceCallPreviews(
+  call: TraceCallRecord,
+  maxPreviewChars = TRACE_LIST_PREVIEW_CHARS,
+): TraceCallRecord {
+  const requestBody = trimBodySnapshotPreview(call.request.body, maxPreviewChars)
+  const responseBody = call.response
+    ? trimBodySnapshotPreview(call.response.body, maxPreviewChars)
+    : undefined
+  if (requestBody === call.request.body && (!call.response || responseBody === call.response.body)) {
+    return call
+  }
+  return {
+    ...call,
+    request: { ...call.request, body: requestBody },
+    ...(call.response && responseBody ? { response: { ...call.response, body: responseBody } } : {}),
+  }
+}
+
+function trimBodySnapshotPreview(body: TraceBodySnapshot, maxPreviewChars: number): TraceBodySnapshot {
+  if (body.preview.length <= maxPreviewChars) return body
+  return {
+    ...body,
+    preview: body.preview.slice(0, maxPreviewChars),
+    truncated: true,
+  }
+}
+
 export function clearTraceCaptureStateForTests(): void {
   traceWriteQueues.clear()
+  traceReadCache.clear()
 }
 
 export function createTraceCallId(): string {
@@ -318,6 +366,11 @@ class TraceCaptureService {
       calls,
       events,
     }
+  }
+
+  async getSessionTraceCall(sessionId: string, callId: string): Promise<TraceCallRecord | null> {
+    const { calls } = await readTraceEntries(sessionId)
+    return calls.find((call) => call.id === callId) ?? null
   }
 
   async listSessionTraces(options?: {
@@ -559,6 +612,7 @@ async function appendTraceEntry(sessionId: string, entry: TraceFileEntry): Promi
       const filePath = getTraceFilePath(sessionId)
       await fs.mkdir(dirname(filePath), { recursive: true })
       await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, 'utf-8')
+      traceReadCache.delete(filePath)
     })
   traceWriteQueues.set(sessionId, next)
   try {
@@ -595,11 +649,30 @@ async function listTraceFiles(storageDir: string): Promise<Array<{ name: string;
 
 async function readTraceEntries(sessionId: string): Promise<{ calls: TraceCallRecord[]; events: TraceEventRecord[] }> {
   const filePath = getTraceFilePath(sessionId)
+  let stat: Stats
+  try {
+    stat = await fs.stat(filePath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      traceReadCache.delete(filePath)
+      return { calls: [], events: [] }
+    }
+    throw error
+  }
+
+  const cached = traceReadCache.get(filePath)
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    return { calls: cached.calls, events: cached.events }
+  }
+
   let raw = ''
   try {
     raw = await fs.readFile(filePath, 'utf-8')
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { calls: [], events: [] }
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      traceReadCache.delete(filePath)
+      return { calls: [], events: [] }
+    }
     throw error
   }
 
@@ -631,10 +704,19 @@ async function readTraceEntries(sessionId: string): Promise<{ calls: TraceCallRe
     }
   }
 
-  return {
-    calls: Array.from(callsById.values()).sort((a, b) => a.startedAt.localeCompare(b.startedAt)),
-    events: events.sort((a, b) => a.timestamp.localeCompare(b.timestamp)),
-  }
+  const calls = Array.from(callsById.values())
+    .sort((a, b) => a.startedAt.localeCompare(b.startedAt))
+    .map((call) => attachCallUsage(call))
+  const sortedEvents = events.sort((a, b) => a.timestamp.localeCompare(b.timestamp))
+
+  traceReadCache.set(filePath, {
+    mtimeMs: stat.mtimeMs,
+    size: stat.size,
+    calls,
+    events: sortedEvents,
+  })
+
+  return { calls, events: sortedEvents }
 }
 
 function isTraceCallRecordLike(value: unknown): value is TraceCallRecord {
@@ -669,9 +751,8 @@ function summarizeCalls(calls: TraceCallRecord[]): TraceSessionSummary {
     if (call.status === 'error' || call.error || (call.response?.status ?? 200) >= 400) failedCalls += 1
     if (typeof call.durationMs === 'number') totalDurationMs += call.durationMs
     if (call.model) modelCounts.set(call.model, (modelCounts.get(call.model) ?? 0) + 1)
-    const usage = extractUsage(call.response?.body.preview)
-    totalInputTokens += usage.input
-    totalOutputTokens += usage.output
+    totalInputTokens += call.usage?.inputTokens ?? 0
+    totalOutputTokens += call.usage?.outputTokens ?? 0
     updatedAt = call.completedAt ?? call.startedAt
   }
 
@@ -686,20 +767,139 @@ function summarizeCalls(calls: TraceCallRecord[]): TraceSessionSummary {
   }
 }
 
-function extractUsage(preview: string | undefined): { input: number; output: number } {
-  if (!preview) return { input: 0, output: 0 }
-  const parsed = parseJsonOrText(preview)
-  if (!parsed || typeof parsed !== 'object') return { input: 0, output: 0 }
-  const usage = 'usage' in parsed && parsed.usage && typeof parsed.usage === 'object'
-    ? parsed.usage as Record<string, unknown>
-    : parsed as Record<string, unknown>
-  const input = numberFromUnknown(usage.input_tokens) + numberFromUnknown(usage.prompt_tokens)
-  const output = numberFromUnknown(usage.output_tokens) + numberFromUnknown(usage.completion_tokens)
-  return { input, output }
+function attachCallUsage(call: TraceCallRecord): TraceCallRecord {
+  const usage = extractTraceCallUsage(call)
+  return usage ? { ...call, usage } : call
+}
+
+function extractTraceCallUsage(call: TraceCallRecord): TraceCallUsage | undefined {
+  const preview = call.response?.body.preview
+  if (!preview) return undefined
+  try {
+    if (looksLikeSseText(preview)) {
+      return extractUsageFromSseText(preview)
+    }
+    const parsed = parseJsonOrText(preview)
+    if (!parsed || typeof parsed !== 'object') return undefined
+    return extractUsageFromJsonPayload(unwrapAnthropicResponsePayload(parsed))
+  } catch {
+    return undefined
+  }
+}
+
+function looksLikeSseText(preview: string): boolean {
+  for (const line of preview.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    return trimmed.startsWith('event:') || trimmed.startsWith('data:')
+  }
+  return false
+}
+
+function unwrapAnthropicResponsePayload(parsed: object): Record<string, unknown> {
+  // Proxy responses persist as `{ upstream, anthropic }`; usage lives on the anthropic copy.
+  const record = parsed as Record<string, unknown>
+  if (record.anthropic && typeof record.anthropic === 'object' && !Array.isArray(record.anthropic)) {
+    return record.anthropic as Record<string, unknown>
+  }
+  return record
+}
+
+function extractUsageFromJsonPayload(payload: Record<string, unknown>): TraceCallUsage | undefined {
+  const hasUsageObject = Boolean(payload.usage && typeof payload.usage === 'object' && !Array.isArray(payload.usage))
+  const usageSource = hasUsageObject
+    ? payload.usage as Record<string, unknown>
+    : payload
+  const inputTokens = numberFromUnknown(usageSource.input_tokens) + numberFromUnknown(usageSource.prompt_tokens)
+  const outputTokens = numberFromUnknown(usageSource.output_tokens) + numberFromUnknown(usageSource.completion_tokens)
+  const cacheReadInputTokens = finiteNumberOrUndefined(usageSource.cache_read_input_tokens)
+  const cacheCreationInputTokens = finiteNumberOrUndefined(usageSource.cache_creation_input_tokens)
+  if (!hasUsageObject
+    && inputTokens === 0
+    && outputTokens === 0
+    && cacheReadInputTokens === undefined
+    && cacheCreationInputTokens === undefined) {
+    return undefined
+  }
+  return {
+    inputTokens,
+    outputTokens,
+    ...(cacheReadInputTokens !== undefined ? { cacheReadInputTokens } : {}),
+    ...(cacheCreationInputTokens !== undefined ? { cacheCreationInputTokens } : {}),
+  }
+}
+
+type TraceUsageAccumulator = {
+  inputTokens?: number
+  outputTokens?: number
+  cacheReadInputTokens?: number
+  cacheCreationInputTokens?: number
+}
+
+function extractUsageFromSseText(preview: string): TraceCallUsage | undefined {
+  const accumulated: TraceUsageAccumulator = {}
+
+  for (const line of preview.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed.startsWith('data:')) continue
+    const payload = trimmed.slice('data:'.length).trim()
+    if (!payload || payload === '[DONE]') continue
+
+    let event: unknown
+    try {
+      event = JSON.parse(payload)
+    } catch {
+      continue
+    }
+    if (!event || typeof event !== 'object') continue
+
+    const record = event as Record<string, unknown>
+    if (record.type === 'message_start') {
+      const message = record.message
+      accumulateUsageFields(
+        accumulated,
+        message && typeof message === 'object' ? (message as Record<string, unknown>).usage : undefined,
+      )
+    } else if (record.type === 'message_delta') {
+      accumulateUsageFields(accumulated, record.usage)
+    }
+  }
+
+  if (accumulated.inputTokens === undefined
+    && accumulated.outputTokens === undefined
+    && accumulated.cacheReadInputTokens === undefined
+    && accumulated.cacheCreationInputTokens === undefined) {
+    return undefined
+  }
+  return {
+    inputTokens: accumulated.inputTokens ?? 0,
+    outputTokens: accumulated.outputTokens ?? 0,
+    ...(accumulated.cacheReadInputTokens !== undefined
+      ? { cacheReadInputTokens: accumulated.cacheReadInputTokens }
+      : {}),
+    ...(accumulated.cacheCreationInputTokens !== undefined
+      ? { cacheCreationInputTokens: accumulated.cacheCreationInputTokens }
+      : {}),
+  }
+}
+
+function accumulateUsageFields(accumulated: TraceUsageAccumulator, usage: unknown): void {
+  if (!usage || typeof usage !== 'object' || Array.isArray(usage)) return
+  const record = usage as Record<string, unknown>
+  accumulated.inputTokens = finiteNumberOrUndefined(record.input_tokens) ?? accumulated.inputTokens
+  accumulated.outputTokens = finiteNumberOrUndefined(record.output_tokens) ?? accumulated.outputTokens
+  accumulated.cacheReadInputTokens = finiteNumberOrUndefined(record.cache_read_input_tokens)
+    ?? accumulated.cacheReadInputTokens
+  accumulated.cacheCreationInputTokens = finiteNumberOrUndefined(record.cache_creation_input_tokens)
+    ?? accumulated.cacheCreationInputTokens
+}
+
+function finiteNumberOrUndefined(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
 function numberFromUnknown(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+  return finiteNumberOrUndefined(value) ?? 0
 }
 
 function getTraceFilePath(sessionId: string): string {

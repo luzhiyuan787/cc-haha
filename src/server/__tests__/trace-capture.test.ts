@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { createHash } from 'crypto'
 import * as fs from 'fs/promises'
 import * as os from 'os'
 import * as path from 'path'
@@ -7,6 +8,7 @@ import {
   clearTraceCaptureStateForTests,
   createTraceCallId,
   createTraceBodySnapshot,
+  readResponseTraceSnapshot,
   traceCaptureService,
   updateTraceCaptureSettings,
 } from '../services/traceCaptureService.js'
@@ -53,7 +55,7 @@ describe('trace capture service', () => {
       messages: [
         { role: 'user', content: 'explain the failed provider response' },
       ],
-      padding: 'x'.repeat(3000),
+      padding: 'x'.repeat(250_000),
     }
 
     await traceCaptureService.recordCall({
@@ -96,12 +98,17 @@ describe('trace capture service', () => {
     expect(trace.summary.apiCalls).toBe(1)
     expect(trace.summary.failedCalls).toBe(0)
     expect(trace.summary.totalDurationMs).toBe(47)
+    expect(trace.summary.totalInputTokens).toBe(31)
+    expect(trace.summary.totalOutputTokens).toBe(7)
     expect(trace.summary.models).toEqual([{ model: 'deepseek-v4-pro', calls: 1 }])
     expect(trace.calls[0].request.headers.Authorization).toBe('[redacted]')
     expect(trace.calls[0].request.body.preview).toContain('explain the failed provider response')
     expect(trace.calls[0].request.body.preview).not.toContain('sk-body-secret')
+    expect(trace.calls[0].request.body.preview.length).toBe(240_000)
+    expect(trace.calls[0].request.body.bytes).toBeGreaterThan(240_000)
     expect(trace.calls[0].request.body.truncated).toBe(true)
     expect(trace.calls[0].response.body.preview).toContain('chatcmpl-742')
+    expect(trace.calls[0].usage).toEqual({ inputTokens: 31, outputTokens: 7 })
   })
 
   test('builds stable body snapshots without throwing on non-json input', () => {
@@ -111,6 +118,264 @@ describe('trace capture service', () => {
     expect(snapshot.preview).toBe('plain text response')
     expect(snapshot.truncated).toBe(false)
     expect(snapshot.sha256).toMatch(/^[0-9a-f]{64}$/)
+  })
+
+  test('redacts secret token keys while preserving token-count fields', async () => {
+    await traceCaptureService.recordCall({
+      sessionId: 'session-redact-boundary',
+      source: 'anthropic',
+      model: 'claude-fable-5',
+      startedAt: '2026-06-09T08:00:00.000Z',
+      completedAt: '2026-06-09T08:00:00.050Z',
+      durationMs: 50,
+      request: {
+        method: 'POST',
+        url: 'https://api.anthropic.com/v1/messages',
+        body: {
+          model: 'claude-fable-5',
+          max_tokens: 4096,
+          access_token: 'super-secret-value',
+          refresh_token: 'another-secret-value',
+        },
+      },
+      response: {
+        status: 200,
+        body: {
+          id: 'msg-redact-boundary',
+          usage: { input_tokens: 12, output_tokens: 34 },
+        },
+      },
+    })
+
+    const trace = await traceCaptureService.getSessionTrace('session-redact-boundary')
+    const requestPreview = trace.calls[0].request.body.preview
+
+    expect(requestPreview).toContain('"max_tokens": 4096')
+    expect(requestPreview).not.toContain('super-secret-value')
+    expect(requestPreview).not.toContain('another-secret-value')
+    expect(trace.calls[0].response?.body.preview).toContain('"input_tokens": 12')
+    expect(trace.calls[0].usage).toEqual({ inputTokens: 12, outputTokens: 34 })
+  })
+
+  test('captures streamed response bodies up to 1MB before truncating', async () => {
+    const chunk = 'a'.repeat(64 * 1024)
+    const makeResponse = (chunkCount: number) => new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (let index = 0; index < chunkCount; index++) {
+            controller.enqueue(new TextEncoder().encode(chunk))
+          }
+          controller.close()
+        },
+      }),
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    )
+
+    const midSized = await readResponseTraceSnapshot(makeResponse(6))
+    expect(midSized.bytes).toBe(6 * 64 * 1024)
+    expect(midSized.sha256).toBe(createHash('sha256').update(chunk.repeat(6)).digest('hex'))
+    expect(midSized.preview.length).toBe(240_000)
+    expect(midSized.truncated).toBe(true)
+
+    const oversized = await readResponseTraceSnapshot(makeResponse(17))
+    expect(oversized.bytes).toBe(1024 * 1024)
+    expect(oversized.truncated).toBe(true)
+  })
+
+  test('extracts per-call usage from non-streaming anthropic JSON responses', async () => {
+    await traceCaptureService.recordCall({
+      sessionId: 'session-usage-json',
+      source: 'anthropic',
+      model: 'claude-fable-5',
+      startedAt: '2026-06-09T08:00:00.000Z',
+      completedAt: '2026-06-09T08:00:01.000Z',
+      durationMs: 1000,
+      request: {
+        method: 'POST',
+        url: 'https://api.anthropic.com/v1/messages',
+        body: { model: 'claude-fable-5', messages: [{ role: 'user', content: 'usage me' }] },
+      },
+      response: {
+        status: 200,
+        body: {
+          id: 'msg-usage-json',
+          content: [{ type: 'text', text: 'ok' }],
+          usage: {
+            input_tokens: 1200,
+            output_tokens: 350,
+            cache_read_input_tokens: 800,
+            cache_creation_input_tokens: 45,
+          },
+        },
+      },
+    })
+
+    const trace = await traceCaptureService.getSessionTrace('session-usage-json')
+
+    expect(trace.calls[0].usage).toEqual({
+      inputTokens: 1200,
+      outputTokens: 350,
+      cacheReadInputTokens: 800,
+      cacheCreationInputTokens: 45,
+    })
+    expect(trace.summary.totalInputTokens).toBe(1200)
+    expect(trace.summary.totalOutputTokens).toBe(350)
+  })
+
+  test('extracts per-call usage from streaming SSE previews by merging message_start and message_delta', async () => {
+    const sseBody = [
+      'event: message_start',
+      'data: {"type":"message_start","message":{"id":"msg_stream","model":"claude-fable-5","usage":{"input_tokens":2500,"output_tokens":2,"cache_read_input_tokens":1800,"cache_creation_input_tokens":90}}}',
+      '',
+      'event: content_block_delta',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}',
+      '',
+      'event: message_delta',
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":640}}',
+      '',
+      'event: message_stop',
+      'data: {"type":"message_stop"}',
+      '',
+    ].join('\n')
+
+    await traceCaptureService.recordCall({
+      sessionId: 'session-usage-sse',
+      source: 'anthropic',
+      model: 'claude-fable-5',
+      startedAt: '2026-06-09T08:00:00.000Z',
+      completedAt: '2026-06-09T08:00:02.000Z',
+      durationMs: 2000,
+      request: {
+        method: 'POST',
+        url: 'https://api.anthropic.com/v1/messages',
+        body: { model: 'claude-fable-5', stream: true },
+      },
+      response: {
+        status: 200,
+        body: sseBody,
+      },
+    })
+
+    const trace = await traceCaptureService.getSessionTrace('session-usage-sse')
+
+    expect(trace.calls[0].usage).toEqual({
+      inputTokens: 2500,
+      outputTokens: 640,
+      cacheReadInputTokens: 1800,
+      cacheCreationInputTokens: 90,
+    })
+    expect(trace.summary.totalInputTokens).toBe(2500)
+    expect(trace.summary.totalOutputTokens).toBe(640)
+  })
+
+  test('extracts per-call usage from the anthropic side of proxy response wrappers', async () => {
+    await traceCaptureService.recordCall({
+      sessionId: 'session-usage-proxy',
+      source: 'proxy',
+      model: 'deepseek-v4-pro',
+      startedAt: '2026-06-09T08:00:00.000Z',
+      completedAt: '2026-06-09T08:00:01.500Z',
+      durationMs: 1500,
+      request: {
+        method: 'POST',
+        url: 'https://api.deepseek.com/v1/chat/completions',
+        body: {
+          anthropic: { model: 'deepseek-v4-pro' },
+          upstream: { model: 'deepseek-chat' },
+        },
+      },
+      response: {
+        status: 200,
+        body: {
+          upstream: { usage: { prompt_tokens: 999, completion_tokens: 111 } },
+          anthropic: {
+            id: 'msg-proxy-usage',
+            usage: {
+              input_tokens: 77,
+              output_tokens: 33,
+              cache_read_input_tokens: 5,
+              cache_creation_input_tokens: 0,
+            },
+          },
+        },
+      },
+    })
+
+    const trace = await traceCaptureService.getSessionTrace('session-usage-proxy')
+
+    expect(trace.calls[0].usage).toEqual({
+      inputTokens: 77,
+      outputTokens: 33,
+      cacheReadInputTokens: 5,
+      cacheCreationInputTokens: 0,
+    })
+    expect(trace.summary.totalInputTokens).toBe(77)
+    expect(trace.summary.totalOutputTokens).toBe(33)
+  })
+
+  test('omits usage when the response preview is missing, truncated or unparsable', async () => {
+    await traceCaptureService.recordCall({
+      id: 'call-usage-truncated',
+      sessionId: 'session-usage-missing',
+      source: 'anthropic',
+      model: 'claude-fable-5',
+      startedAt: '2026-06-09T08:00:00.000Z',
+      completedAt: '2026-06-09T08:00:01.000Z',
+      durationMs: 1000,
+      request: {
+        method: 'POST',
+        url: 'https://api.anthropic.com/v1/messages',
+        body: { model: 'claude-fable-5' },
+      },
+      response: {
+        status: 200,
+        bodySnapshot: createTraceBodySnapshot(
+          { id: 'msg-truncated', usage: { input_tokens: 100, output_tokens: 50 } },
+          { maxPreviewChars: 24 },
+        ),
+      },
+    })
+    await traceCaptureService.recordCall({
+      id: 'call-usage-pending',
+      sessionId: 'session-usage-missing',
+      source: 'anthropic',
+      model: 'claude-fable-5',
+      status: 'pending',
+      startedAt: '2026-06-09T08:00:02.000Z',
+      request: {
+        method: 'POST',
+        url: 'https://api.anthropic.com/v1/messages',
+        body: { model: 'claude-fable-5' },
+      },
+    })
+    await traceCaptureService.recordCall({
+      id: 'call-usage-absent',
+      sessionId: 'session-usage-missing',
+      source: 'anthropic',
+      model: 'claude-fable-5',
+      startedAt: '2026-06-09T08:00:03.000Z',
+      completedAt: '2026-06-09T08:00:04.000Z',
+      durationMs: 1000,
+      request: {
+        method: 'POST',
+        url: 'https://api.anthropic.com/v1/messages',
+        body: { model: 'claude-fable-5' },
+      },
+      response: {
+        status: 200,
+        body: { ok: true },
+      },
+    })
+
+    const trace = await traceCaptureService.getSessionTrace('session-usage-missing')
+
+    expect(trace.calls).toHaveLength(3)
+    expect(trace.calls[0].response?.body.truncated).toBe(true)
+    for (const call of trace.calls) {
+      expect(call.usage).toBeUndefined()
+    }
+    expect(trace.summary.totalInputTokens).toBe(0)
+    expect(trace.summary.totalOutputTokens).toBe(0)
   })
 
   test('skips malformed trace jsonl entries when reading a session', async () => {
@@ -391,6 +656,117 @@ describe('session trace API', () => {
     expect(body.events).toEqual([])
   })
 
+  test('trims call body previews in the session trace list response without touching stored data', async () => {
+    const recorded = await traceCaptureService.recordCall({
+      sessionId: 'session-trim-api',
+      source: 'anthropic',
+      model: 'claude-fable-5',
+      startedAt: '2026-06-09T08:00:00.000Z',
+      completedAt: '2026-06-09T08:00:01.000Z',
+      durationMs: 1000,
+      request: {
+        method: 'POST',
+        url: 'https://api.anthropic.com/v1/messages',
+        body: {
+          model: 'claude-fable-5',
+          messages: [{ role: 'user', content: 'find the trimmed call' }],
+          padding: 'y'.repeat(6000),
+        },
+      },
+      response: {
+        status: 200,
+        body: {
+          id: 'msg-trim-api',
+          content: [{ type: 'text', text: 'z'.repeat(6000) }],
+          usage: { input_tokens: 10, output_tokens: 20 },
+        },
+      },
+    })
+
+    const req = new Request('http://localhost:3456/api/sessions/session-trim-api/trace')
+    const res = await handleApiRequest(req, new URL(req.url))
+    const body = await res.json() as {
+      calls: Array<{
+        usage?: { inputTokens: number; outputTokens: number }
+        request: { body: { preview: string; truncated: boolean; bytes: number; sha256: string } }
+        response?: { body: { preview: string; truncated: boolean; bytes: number; sha256: string } }
+      }>
+    }
+
+    expect(res.status).toBe(200)
+    expect(body.calls).toHaveLength(1)
+    expect(body.calls[0].request.body.preview.length).toBe(2048)
+    expect(body.calls[0].request.body.truncated).toBe(true)
+    expect(body.calls[0].response?.body.preview.length).toBe(2048)
+    expect(body.calls[0].response?.body.truncated).toBe(true)
+    expect(body.calls[0].usage).toEqual({ inputTokens: 10, outputTokens: 20 })
+
+    const stored = await traceCaptureService.getSessionTrace('session-trim-api')
+    expect(stored.calls[0].request.body.preview.length).toBeGreaterThan(2048)
+    expect(stored.calls[0].request.body.truncated).toBe(false)
+    expect(stored.calls[0].response?.body.preview.length).toBeGreaterThan(2048)
+    expect(stored.calls[0].response?.body.truncated).toBe(false)
+    expect(body.calls[0].request.body.bytes).toBe(stored.calls[0].request.body.bytes)
+    expect(body.calls[0].request.body.sha256).toBe(stored.calls[0].request.body.sha256)
+    expect(body.calls[0].response?.body.bytes).toBe(stored.calls[0].response?.body.bytes)
+    expect(body.calls[0].response?.body.sha256).toBe(stored.calls[0].response?.body.sha256)
+    expect(recorded).not.toBeNull()
+  })
+
+  test('returns the full untrimmed call record from the trace call detail endpoint', async () => {
+    const recorded = await traceCaptureService.recordCall({
+      sessionId: 'session-call-detail',
+      source: 'anthropic',
+      model: 'claude-fable-5',
+      startedAt: '2026-06-09T08:00:00.000Z',
+      completedAt: '2026-06-09T08:00:01.000Z',
+      durationMs: 1000,
+      request: {
+        method: 'POST',
+        url: 'https://api.anthropic.com/v1/messages',
+        body: {
+          model: 'claude-fable-5',
+          messages: [{ role: 'user', content: 'full detail please' }],
+          padding: 'y'.repeat(6000),
+        },
+      },
+      response: {
+        status: 200,
+        body: {
+          id: 'msg-call-detail',
+          usage: { input_tokens: 64, output_tokens: 16 },
+        },
+      },
+    })
+
+    const req = new Request(`http://localhost:3456/api/sessions/session-call-detail/trace/calls/${recorded?.id}`)
+    const res = await handleApiRequest(req, new URL(req.url))
+    const body = await res.json() as {
+      call: {
+        id: string
+        usage?: { inputTokens: number; outputTokens: number }
+        request: { body: { preview: string; truncated: boolean } }
+      }
+    }
+
+    expect(res.status).toBe(200)
+    expect(body.call.id).toBe(recorded!.id)
+    expect(body.call.request.body.preview.length).toBeGreaterThan(2048)
+    expect(body.call.request.body.truncated).toBe(false)
+    expect(body.call.request.body.preview).toContain('full detail please')
+    expect(body.call.usage).toEqual({ inputTokens: 64, outputTokens: 16 })
+  })
+
+  test('returns 404 with an error payload when the trace call id is unknown', async () => {
+    const req = new Request('http://localhost:3456/api/sessions/session-call-detail/trace/calls/call-not-there')
+    const res = await handleApiRequest(req, new URL(req.url))
+    const body = await res.json() as { error: string; message: string }
+
+    expect(res.status).toBe(404)
+    expect(body.error).toBe('NOT_FOUND')
+    expect(body.message).toContain('call-not-there')
+  })
+
   test('lists trace sessions with storage metadata and managed settings', async () => {
     await traceCaptureService.recordCall({
       sessionId: 'session-list-trace',
@@ -538,5 +914,109 @@ describe('session trace API', () => {
     } finally {
       sessionService.getSession = originalGetSession
     }
+  })
+})
+
+describe('trace read cache', () => {
+  function buildTraceCallLine(id: string): string {
+    return `${JSON.stringify({
+      type: 'call',
+      record: {
+        id,
+        sessionId: 'session-cache-hit',
+        source: 'proxy',
+        status: 'ok',
+        startedAt: '2026-06-09T08:00:00.000Z',
+        completedAt: '2026-06-09T08:00:00.020Z',
+        durationMs: 20,
+        request: {
+          method: 'POST',
+          url: 'https://api.example.test/v1/chat/completions',
+          headers: {},
+          body: createTraceBodySnapshot({ model: 'gpt-5.5' }),
+        },
+        response: {
+          status: 200,
+          headers: {},
+          body: createTraceBodySnapshot({ ok: true }),
+        },
+      },
+    })}\n`
+  }
+
+  test('serves cached entries while file mtime and size are unchanged', async () => {
+    const traceDir = path.join(tmpDir, 'cc-haha', 'traces')
+    const filePath = path.join(traceDir, 'session-cache-hit.jsonl')
+    await fs.mkdir(traceDir, { recursive: true })
+
+    const lineA = buildTraceCallLine('call-aaa')
+    const lineB = buildTraceCallLine('call-bbb')
+    expect(Buffer.byteLength(lineA)).toBe(Buffer.byteLength(lineB))
+
+    const initialTime = new Date('2026-06-09T08:00:00.000Z')
+    await fs.writeFile(filePath, lineA)
+    await fs.utimes(filePath, initialTime, initialTime)
+
+    const first = await traceCaptureService.getSessionTrace('session-cache-hit')
+    expect(first.calls.map((call) => call.id)).toEqual(['call-aaa'])
+
+    // Same size + restored mtime: the cached parse result must be reused.
+    await fs.writeFile(filePath, lineB)
+    await fs.utimes(filePath, initialTime, initialTime)
+
+    const second = await traceCaptureService.getSessionTrace('session-cache-hit')
+    expect(second.calls.map((call) => call.id)).toEqual(['call-aaa'])
+
+    const laterTime = new Date('2026-06-09T08:00:05.000Z')
+    await fs.utimes(filePath, laterTime, laterTime)
+
+    const third = await traceCaptureService.getSessionTrace('session-cache-hit')
+    expect(third.calls.map((call) => call.id)).toEqual(['call-bbb'])
+  })
+
+  test('invalidates the cache when new entries are appended in process', async () => {
+    await traceCaptureService.recordCall({
+      id: 'call-cache-1',
+      sessionId: 'session-cache-append',
+      source: 'proxy',
+      model: 'gpt-5.5',
+      startedAt: '2026-06-09T08:00:00.000Z',
+      completedAt: '2026-06-09T08:00:00.010Z',
+      durationMs: 10,
+      request: {
+        method: 'POST',
+        url: 'https://api.example.test/v1/messages',
+        body: { model: 'gpt-5.5' },
+      },
+      response: {
+        status: 200,
+        body: { ok: true },
+      },
+    })
+
+    const first = await traceCaptureService.getSessionTrace('session-cache-append')
+    expect(first.calls.map((call) => call.id)).toEqual(['call-cache-1'])
+
+    await traceCaptureService.recordCall({
+      id: 'call-cache-2',
+      sessionId: 'session-cache-append',
+      source: 'proxy',
+      model: 'gpt-5.5',
+      startedAt: '2026-06-09T08:00:01.000Z',
+      completedAt: '2026-06-09T08:00:01.010Z',
+      durationMs: 10,
+      request: {
+        method: 'POST',
+        url: 'https://api.example.test/v1/messages',
+        body: { model: 'gpt-5.5' },
+      },
+      response: {
+        status: 200,
+        body: { ok: true },
+      },
+    })
+
+    const second = await traceCaptureService.getSessionTrace('session-cache-append')
+    expect(second.calls.map((call) => call.id)).toEqual(['call-cache-1', 'call-cache-2'])
   })
 })

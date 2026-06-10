@@ -25,6 +25,7 @@ import { normalizeModelStringForAPI } from '../../utils/model/model.js'
 import {
   createTraceCallId,
   createTraceBodySnapshot,
+  TRACE_STREAM_CAPTURE_BYTES,
   traceCaptureService,
   type TraceBodySnapshot,
   type TraceProviderInfo,
@@ -749,7 +750,7 @@ function captureTraceStream(
 
   const captureChunk = (chunk: Uint8Array) => {
     bytes += chunk.byteLength
-    if (bytes <= 256 * 1024) {
+    if (bytes <= TRACE_STREAM_CAPTURE_BYTES) {
       captured += decoder.decode(chunk, { stream: true })
     } else {
       truncated = true

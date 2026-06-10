@@ -2,7 +2,7 @@ import { api } from './client'
 import type { AgentTaskNotification } from '../types/chat'
 import type { SessionListItem, MessageEntry } from '../types/session'
 import type { PermissionMode } from '../types/settings'
-import type { TraceSession } from '../types/trace'
+import type { TraceCallRecord, TraceSession } from '../types/trace'
 
 type SessionsResponse = { sessions: SessionListItem[]; total: number }
 type MessagesResponse = {
@@ -323,6 +323,10 @@ export const sessionsApi = {
 
   getTrace(sessionId: string) {
     return api.get<TraceSession>(`/api/sessions/${sessionId}/trace`)
+  },
+
+  getTraceCall(sessionId: string, callId: string) {
+    return api.get<{ call: TraceCallRecord }>(`/api/sessions/${sessionId}/trace/calls/${callId}`)
   },
 
   create(input?: string | CreateSessionRequest) {

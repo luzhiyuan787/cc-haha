@@ -25,6 +25,7 @@ const trace: TraceSession = {
       startedAt: '2026-06-09T10:00:01.000Z',
       completedAt: '2026-06-09T10:00:02.000Z',
       durationMs: 1000,
+      usage: { inputTokens: 12, outputTokens: 18, cacheReadInputTokens: 4 },
       request: {
         method: 'POST',
         url: 'https://sub2api.example/v1/messages',
@@ -135,6 +136,25 @@ describe('traceViewModel', () => {
     expect(viewModel.spansById.get('llm:call-1')?.childIds).toContain('event:event-1')
   })
 
+  it('passes call usage through to llm spans as tokenUsage', () => {
+    const viewModel = buildTraceViewModel(trace, messages)
+
+    expect(viewModel.spansById.get('llm:call-1')?.tokenUsage).toEqual({
+      inputTokens: 12,
+      outputTokens: 18,
+      cacheReadInputTokens: 4,
+    })
+    expect(viewModel.spansById.get('llm:call-2')?.tokenUsage).toBeUndefined()
+  })
+
+  it('marks info lifecycle events as noise and omits fullRaw', () => {
+    const viewModel = buildTraceViewModel(trace, messages)
+
+    expect(viewModel.spansById.get('event:event-1')?.isLifecycleNoise).toBe(true)
+    expect(viewModel.spansById.get('llm:call-1')?.isLifecycleNoise).toBeUndefined()
+    expect('fullRaw' in viewModel).toBe(false)
+  })
+
   it('marks pending tool spans when a result has not arrived', () => {
     const viewModel = buildTraceViewModel(trace, messages.slice(0, 2))
     expect(viewModel.spansById.get('tool:tool-1')).toMatchObject({ status: 'pending' })
@@ -175,6 +195,7 @@ describe('traceViewModel', () => {
       kind: 'event',
       status: 'error',
       title: 'Upstream Fetch Failed',
+      isLifecycleNoise: false,
     })
     expect(viewModel.diagnosis).toMatchObject({
       status: 'blocked',

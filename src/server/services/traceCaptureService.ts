@@ -7,7 +7,10 @@ export {
   readTraceCaptureSettings,
   readResponseTraceSnapshot,
   shouldCaptureApiTrace,
+  TRACE_LIST_PREVIEW_CHARS,
+  TRACE_STREAM_CAPTURE_BYTES,
   traceCaptureService,
+  trimTraceCallPreviews,
   updateTraceCaptureSettings,
 } from '../../services/api/traceCapture.js'
 export type {
@@ -17,6 +20,7 @@ export type {
   TraceCaptureSettings,
   TraceCallStatus,
   TraceCallRecord,
+  TraceCallUsage,
   TraceEventRecord,
   TraceEventSeverity,
   TraceProviderInfo,

@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { AlertTriangle, CheckCircle2, ExternalLink, RefreshCw, Search, Workflow } from 'lucide-react'
+import type { KeyboardEvent, MouseEvent, ReactNode } from 'react'
+import { ExternalLink, RefreshCw, Search, Workflow } from 'lucide-react'
 import { tracesApi } from '../api/traces'
 import { SETTINGS_TAB_ID, useTabStore } from '../stores/tabStore'
 import { useUIStore } from '../stores/uiStore'
 import { useTranslation } from '../i18n'
 import { Button } from '../components/shared/Button'
-import { formatBytes } from '../lib/formatBytes'
 import { getDesktopHost } from '../lib/desktopHost'
 import type { TraceSessionList, TraceSessionListItem } from '../types/trace'
 
@@ -17,6 +17,13 @@ type TraceListState =
 const POLL_MS = 5_000
 const PAGE_SIZE = 50
 const SEARCH_DEBOUNCE_MS = 250
+const MAX_MODEL_CHIPS = 2
+
+/** Skip off-screen row rendering without virtualization (WebKit-friendly). */
+const ROW_CV_STYLE = {
+  contentVisibility: 'auto',
+  containIntrinsicSize: 'auto 56px',
+} as const
 
 export function TraceList() {
   const t = useTranslation()
@@ -102,13 +109,16 @@ export function TraceList() {
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-[var(--color-surface)]">
       <header className="shrink-0 border-b border-[var(--color-border)] px-5 py-4">
-        <div className="flex flex-wrap items-start justify-between gap-4">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2 text-[11px] font-semibold uppercase text-[var(--color-text-tertiary)]">
-              <Workflow className="h-4 w-4" strokeWidth={1.8} aria-hidden="true" />
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-tertiary)]">
+              <Workflow className="h-3.5 w-3.5" strokeWidth={2} aria-hidden="true" />
               <span>{t('trace.list.eyebrow')}</span>
+            </div>
+            <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1">
+              <h1 className="text-lg font-semibold tracking-tight text-[var(--color-text-primary)]">{t('trace.list.title')}</h1>
               {state.status === 'ready' && (
-                <span className={`rounded-md border px-1.5 py-0.5 ${
+                <span className={`rounded-[var(--radius-sm)] border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
                   state.data.settings.enabled
                     ? 'border-[var(--color-success)]/25 bg-[var(--color-success)]/10 text-[var(--color-success)]'
                     : 'border-[var(--color-border)] bg-[var(--color-surface-container-low)] text-[var(--color-text-tertiary)]'
@@ -116,37 +126,36 @@ export function TraceList() {
                   {state.data.settings.enabled ? t('trace.list.collecting') : t('trace.list.paused')}
                 </span>
               )}
+              {state.status === 'ready' && (
+                <span className="min-w-0 max-w-full truncate font-mono text-[11px] text-[var(--color-text-tertiary)]" title={state.data.storageDir}>
+                  {state.data.storageDir}
+                </span>
+              )}
             </div>
-            <h1 className="mt-2 text-2xl font-semibold tracking-tight text-[var(--color-text-primary)]">{t('trace.list.title')}</h1>
-            {state.status === 'ready' && (
-              <p className="mt-1 truncate text-xs text-[var(--color-text-tertiary)]">
-                {state.data.storageDir}
-              </p>
-            )}
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-2">
             <Button size="sm" variant="secondary" onClick={() => openTraceSettings(t)}>
               {t('trace.list.settings')}
             </Button>
             <Button size="sm" variant="secondary" onClick={() => void load()}>
-              <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+              <RefreshCw className="h-3.5 w-3.5" strokeWidth={2} aria-hidden="true" />
               {t('trace.refresh')}
             </Button>
           </div>
         </div>
 
-        <div className="mt-4 grid grid-cols-4 gap-3">
-          <Metric label={t('trace.list.sessions')} value={state.status === 'ready' ? String(state.data.total) : '-'} />
-          <Metric label={t('trace.apiCalls')} value={String(summary.apiCalls)} />
-          <Metric label={t('trace.failedCalls')} value={String(summary.failedCalls)} tone={summary.failedCalls > 0 ? 'danger' : 'default'} />
-          <Metric label={t('trace.models')} value={String(summary.models)} />
+        <div className="mt-3 flex flex-wrap items-baseline gap-x-5 gap-y-1.5">
+          <MetaChip label={t('trace.list.sessions')} value={state.status === 'ready' ? String(state.data.total) : '-'} />
+          <MetaChip label={t('trace.apiCalls')} value={String(summary.apiCalls)} />
+          <MetaChip label={t('trace.failedCalls')} value={String(summary.failedCalls)} tone={summary.failedCalls > 0 ? 'danger' : 'default'} />
+          <MetaChip label={t('trace.models')} value={String(summary.models)} />
         </div>
       </header>
 
       <div className="flex min-h-0 flex-1 flex-col">
         <div className="shrink-0 border-b border-[var(--color-border)] px-5 py-3">
-          <div className="flex h-10 max-w-xl items-center rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-3 focus-within:border-[var(--color-border-focus)]">
-            <Search className="h-4 w-4 shrink-0 text-[var(--color-text-tertiary)]" strokeWidth={1.8} aria-hidden="true" />
+          <div className="flex h-9 max-w-xl items-center rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-3 focus-within:border-[var(--color-border-focus)]">
+            <Search className="h-3.5 w-3.5 shrink-0 text-[var(--color-text-tertiary)]" strokeWidth={2} aria-hidden="true" />
             <input
               value={queryInput}
               onChange={(event) => setQueryInput(event.currentTarget.value)}
@@ -156,9 +165,7 @@ export function TraceList() {
           </div>
         </div>
 
-        {state.status === 'loading' && (
-          <div className="flex flex-1 items-center justify-center text-sm text-[var(--color-text-tertiary)]">{t('common.loading')}</div>
-        )}
+        {state.status === 'loading' && <TraceListSkeleton label={t('common.loading')} />}
         {state.status === 'error' && (
           <div className="m-5 rounded-[var(--radius-md)] border border-[var(--color-error)]/30 bg-[var(--color-error)]/5 p-4 text-sm text-[var(--color-error)]">
             {state.message}
@@ -201,9 +208,9 @@ function TraceRows({
 
   if (traces.length === 0) {
     return (
-      <div className="flex flex-1 items-center justify-center px-6 text-center">
-        <div className="max-w-sm">
-          <Workflow className="mx-auto h-8 w-8 text-[var(--color-text-tertiary)]" strokeWidth={1.5} aria-hidden="true" />
+      <div className="flex flex-1 items-start justify-center px-6 py-10">
+        <div className="w-full max-w-md rounded-2xl border border-dashed border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-6 py-12 text-center">
+          <Workflow className="mx-auto h-8 w-8 text-[var(--color-text-tertiary)]" strokeWidth={2} aria-hidden="true" />
           <h2 className="mt-3 text-sm font-semibold text-[var(--color-text-primary)]">{t('trace.list.emptyTitle')}</h2>
           <p className="mt-2 text-sm leading-6 text-[var(--color-text-secondary)]">{t('trace.list.emptyBody')}</p>
         </div>
@@ -213,18 +220,12 @@ function TraceRows({
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
-      <div className="grid grid-cols-[minmax(260px,1.5fr)_120px_90px_120px_minmax(160px,1fr)_96px] border-b border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-5 py-2 text-[10px] font-semibold uppercase text-[var(--color-text-tertiary)]">
-        <div>{t('trace.list.session')}</div>
-        <div>{t('trace.apiCalls')}</div>
-        <div>{t('trace.failedCalls')}</div>
-        <div>{t('trace.duration')}</div>
-        <div>{t('trace.models')}</div>
-        <div className="text-right">{t('trace.list.actions')}</div>
+      <div className="divide-y divide-[var(--color-border)]">
+        {traces.map((trace) => (
+          <TraceRow key={trace.sessionId} trace={trace} onOpenWindow={onOpenWindow} />
+        ))}
       </div>
-      {traces.map((trace) => (
-        <TraceRow key={trace.sessionId} trace={trace} onOpenWindow={onOpenWindow} />
-      ))}
-      <div className="flex items-center justify-between border-b border-[var(--color-border)] px-5 py-3 text-xs text-[var(--color-text-tertiary)]">
+      <div className="flex items-center justify-between border-t border-[var(--color-border)] px-5 py-3 text-xs text-[var(--color-text-tertiary)]">
         <span>{t('trace.list.loadedCount', { shown: traces.length, total })}</span>
         {traces.length < total && (
           <Button size="sm" variant="secondary" onClick={onLoadMore} disabled={loadingMore}>
@@ -245,69 +246,151 @@ function TraceRow({
 }) {
   const t = useTranslation()
   const title = trace.session?.title || t('session.untitled')
-  const modelLabel = trace.summary.models.map((model) => `${model.model} x${model.calls}`).join(', ') || t('trace.noModel')
   const updatedAt = trace.summary.updatedAt ?? trace.fileUpdatedAt
-  const hasError = trace.summary.failedCalls > 0
+  const failedCalls = trace.summary.failedCalls
+  const visibleModels = trace.summary.models.slice(0, MAX_MODEL_CHIPS)
+  const hiddenModels = trace.summary.models.length - visibleModels.length
+  const totalTokens = trace.summary.totalInputTokens + trace.summary.totalOutputTokens
+
+  const open = () => openTrace(trace.sessionId, title, t)
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return
+    event.preventDefault()
+    open()
+  }
 
   return (
-    <div className="grid grid-cols-[minmax(260px,1.5fr)_120px_90px_120px_minmax(160px,1fr)_96px] items-center gap-0 border-b border-[var(--color-border)] px-5 py-3 text-sm hover:bg-[var(--color-surface-hover)]">
-      <div className="min-w-0">
-        <button
-          type="button"
-          onClick={() => openTrace(trace.sessionId, title, t)}
-          className="block min-w-0 text-left"
-        >
-          <div className="flex min-w-0 items-center gap-2">
-            {hasError
-              ? <AlertTriangle className="h-4 w-4 shrink-0 text-[var(--color-error)]" strokeWidth={1.8} aria-hidden="true" />
-              : <CheckCircle2 className="h-4 w-4 shrink-0 text-[var(--color-success)]" strokeWidth={1.8} aria-hidden="true" />}
-            <span className="truncate font-medium text-[var(--color-text-primary)]">{title}</span>
-          </div>
-          <div className="mt-1 flex min-w-0 gap-2 text-xs text-[var(--color-text-tertiary)]">
-            <span className="truncate font-mono">{trace.sessionId}</span>
-            <span className="shrink-0">{formatUpdatedAt(updatedAt)}</span>
-          </div>
-          {trace.session?.projectPath && (
-            <div className="mt-1 truncate text-[11px] text-[var(--color-text-tertiary)]">{trace.session.projectPath}</div>
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={open}
+      onKeyDown={onKeyDown}
+      className="group flex h-14 cursor-pointer items-center gap-4 px-5 transition-colors hover:bg-[var(--color-surface-hover)]"
+      style={ROW_CV_STYLE}
+    >
+      <div className="min-w-0 flex-1">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="min-w-0 truncate text-sm font-semibold text-[var(--color-text-primary)]">{title}</span>
+          {visibleModels.map((model) => (
+            <span
+              key={model.model}
+              title={`${model.model} x${model.calls}`}
+              className="shrink-0 rounded-[var(--radius-sm)] bg-[var(--color-brand)]/10 px-1.5 py-0.5 font-mono text-[10px] leading-4 text-[var(--color-brand)]"
+            >
+              {shortModelName(model.model)}
+            </span>
+          ))}
+          {hiddenModels > 0 && (
+            <span className="shrink-0 rounded-[var(--radius-sm)] bg-[var(--color-surface-container-high)] px-1.5 py-0.5 font-mono text-[10px] leading-4 text-[var(--color-text-tertiary)]">
+              +{hiddenModels}
+            </span>
           )}
-        </button>
+          {failedCalls > 0 && (
+            <span title={t('trace.failedCalls')} className="flex shrink-0 items-center gap-1">
+              <span className="h-1.5 w-1.5 rounded-full bg-[var(--color-error)]" aria-hidden="true" />
+              <span className="font-mono text-[10px] text-[var(--color-error)]">{failedCalls}</span>
+            </span>
+          )}
+        </div>
+        <div className="mt-1 flex min-w-0 items-center gap-1.5 text-[10px] text-[var(--color-text-tertiary)]">
+          <span className="shrink-0 font-mono">{trace.sessionId.slice(0, 8)}</span>
+          {trace.session?.projectPath && (
+            <>
+              <span aria-hidden="true">·</span>
+              <span className="truncate" title={trace.session.projectPath}>{trace.session.projectPath}</span>
+            </>
+          )}
+          <span aria-hidden="true">·</span>
+          <span className="shrink-0 font-mono">{formatUpdatedAt(updatedAt)}</span>
+        </div>
       </div>
-      <div className="font-mono text-[var(--color-text-primary)]">{trace.summary.apiCalls}</div>
-      <div className={hasError ? 'font-mono text-[var(--color-error)]' : 'font-mono text-[var(--color-text-primary)]'}>{trace.summary.failedCalls}</div>
-      <div className="font-mono text-[var(--color-text-secondary)]">{formatDuration(trace.summary.totalDurationMs)}</div>
-      <div className="min-w-0 truncate text-xs text-[var(--color-text-secondary)]" title={modelLabel}>{modelLabel}</div>
-      <div className="flex justify-end gap-1">
-        <button
-          type="button"
-          onClick={() => openTrace(trace.sessionId, title, t)}
-          className="flex h-8 w-8 items-center justify-center rounded-md border border-[var(--color-border)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-container-high)] hover:text-[var(--color-text-primary)]"
-          aria-label={t('trace.open')}
-          title={t('trace.open')}
-        >
-          <Workflow className="h-4 w-4" aria-hidden="true" />
-        </button>
-        <button
-          type="button"
-          onClick={() => onOpenWindow(trace.sessionId)}
-          className="flex h-8 w-8 items-center justify-center rounded-md border border-[var(--color-border)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-container-high)] hover:text-[var(--color-text-primary)]"
-          aria-label={t('trace.openWindow')}
-          title={t('trace.openWindow')}
-        >
-          <ExternalLink className="h-4 w-4" aria-hidden="true" />
-        </button>
+      <div className="grid shrink-0 grid-cols-[3.5rem_4rem_4rem] items-center gap-3">
+        <MetricCell label={t('trace.apiCalls')} value={String(trace.summary.apiCalls)} />
+        <MetricCell label={t('trace.duration')} value={formatDuration(trace.summary.totalDurationMs)} />
+        <MetricCell label={t('trace.tokens')} value={formatCompact(totalTokens)} />
       </div>
-      <div className="col-span-6 mt-2 hidden text-[11px] text-[var(--color-text-tertiary)] md:block">
-        {t('trace.list.fileSize')}: {formatBytes(trace.fileSize)}
+      <div className="flex w-[60px] shrink-0 items-center justify-end gap-1 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100">
+        <RowAction
+          label={t('trace.open')}
+          onClick={(event) => {
+            event.stopPropagation()
+            open()
+          }}
+        >
+          <Workflow className="h-3.5 w-3.5" strokeWidth={2} aria-hidden="true" />
+        </RowAction>
+        <RowAction
+          label={t('trace.openWindow')}
+          onClick={(event) => {
+            event.stopPropagation()
+            onOpenWindow(trace.sessionId)
+          }}
+        >
+          <ExternalLink className="h-3.5 w-3.5" strokeWidth={2} aria-hidden="true" />
+        </RowAction>
       </div>
     </div>
   )
 }
 
-function Metric({ label, value, tone = 'default' }: { label: string; value: string; tone?: 'default' | 'danger' }) {
+function RowAction({
+  label,
+  onClick,
+  children,
+}: {
+  label: string
+  onClick: (event: MouseEvent<HTMLButtonElement>) => void
+  children: ReactNode
+}) {
   return (
-    <div>
-      <div className="text-[10px] font-semibold uppercase text-[var(--color-text-tertiary)]">{label}</div>
-      <div className={`mt-1 truncate font-mono text-lg ${tone === 'danger' ? 'text-[var(--color-error)]' : 'text-[var(--color-text-primary)]'}`}>{value}</div>
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={label}
+      title={label}
+      className="flex h-7 w-7 items-center justify-center rounded-[var(--radius-sm)] text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface-container-high)] hover:text-[var(--color-text-primary)] active:scale-[0.98]"
+    >
+      {children}
+    </button>
+  )
+}
+
+function MetricCell({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="text-right">
+      <div className="font-mono text-[11px] leading-4 text-[var(--color-text-primary)]">{value}</div>
+      <div className="truncate text-[10px] uppercase leading-4 tracking-wide text-[var(--color-text-tertiary)]" title={label}>{label}</div>
+    </div>
+  )
+}
+
+function MetaChip({ label, value, tone = 'default' }: { label: string; value: string; tone?: 'default' | 'danger' }) {
+  return (
+    <div className="flex items-baseline gap-1.5">
+      <span className="text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-tertiary)]">{label}</span>
+      <span className={`font-mono text-[13px] ${tone === 'danger' ? 'text-[var(--color-error)]' : 'text-[var(--color-text-primary)]'}`}>{value}</span>
+    </div>
+  )
+}
+
+function TraceListSkeleton({ label }: { label: string }) {
+  return (
+    <div className="min-h-0 flex-1 overflow-hidden" role="status" aria-label={label}>
+      <div className="divide-y divide-[var(--color-border)]" aria-hidden="true">
+        {Array.from({ length: 6 }, (_, index) => (
+          <div key={index} className="flex h-14 items-center gap-4 px-5">
+            <div className="min-w-0 flex-1">
+              <div className="h-3 w-48 max-w-full animate-pulse rounded bg-[var(--color-surface-container-high)]" />
+              <div className="mt-2 h-2.5 w-72 max-w-full animate-pulse rounded bg-[var(--color-surface-container-low)]" />
+            </div>
+            <div className="flex shrink-0 items-center gap-3">
+              <div className="h-3 w-10 animate-pulse rounded bg-[var(--color-surface-container-high)]" />
+              <div className="h-3 w-12 animate-pulse rounded bg-[var(--color-surface-container-high)]" />
+              <div className="h-3 w-12 animate-pulse rounded bg-[var(--color-surface-container-high)]" />
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   )
 }
@@ -319,6 +402,22 @@ function openTrace(sessionId: string, title: string, t: ReturnType<typeof useTra
 function openTraceSettings(t: ReturnType<typeof useTranslation>) {
   useUIStore.getState().setPendingSettingsTab('general')
   useTabStore.getState().openTab(SETTINGS_TAB_ID, t('sidebar.settings'), 'settings')
+}
+
+/** `claude-sonnet-4-5-20250929` -> `sonnet-4-5`; non-Claude ids pass through. */
+function shortModelName(model: string): string {
+  const short = model.replace(/^claude-/i, '').replace(/-\d{8}$/, '')
+  return short || model
+}
+
+/** Compact count: 847 -> "847", 1234 -> "1.2k", 2345678 -> "2.3m". */
+function formatCompact(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0'
+  if (value < 1000) return String(value)
+  const scaled = value < 1_000_000 ? value / 1000 : value / 1_000_000
+  const unit = value < 1_000_000 ? 'k' : 'm'
+  const text = scaled >= 100 ? String(Math.round(scaled)) : scaled.toFixed(1).replace(/\.0$/, '')
+  return `${text}${unit}`
 }
 
 function formatDuration(ms: number): string {
