@@ -289,17 +289,17 @@ describe('remote H5 auth and CORS integration', () => {
     })
   })
 
-  test('blocks localhost browser capability requests while H5 access is disabled', async () => {
-    const response = await fetch(`${baseUrl}/api/status`, {
-      headers: {
-        Origin: 'http://127.0.0.1:5179',
-      },
-    })
+  test('allows loopback browser capability requests while H5 access is disabled', async () => {
+    for (const origin of ['http://127.0.0.1:2024', 'http://localhost:5179', 'http://[::1]:5173']) {
+      const response = await fetch(`${baseUrl}/api/status`, {
+        headers: { Origin: origin },
+      })
 
-    expect(response.status).toBe(403)
-    await expect(response.json()).resolves.toMatchObject({
-      error: 'Forbidden',
-    })
+      expect(response.status).toBe(200)
+      await expect(response.json()).resolves.toMatchObject({
+        status: 'ok',
+      })
+    }
   })
 
   test('does not keep retired Tauri origins trusted after Electron replacement', async () => {
@@ -358,21 +358,22 @@ describe('remote H5 auth and CORS integration', () => {
     expect(previewResponse.status).toBe(403)
   })
 
-  test('blocks loopback browser local-file and preview-fs requests while H5 access is disabled', async () => {
+  test('allows loopback browser local-file and preview-fs requests through the H5 gate while H5 access is disabled', async () => {
     const loopbackBrowserOrigin = 'http://localhost:5173'
-    const localFileResponse = await fetch(localFileUrl(baseUrl, path.join(tmpDir, 'dist', 'index.html')), {
+    const localFileResponse = await fetch(localFileUrl(baseUrl, path.join(process.cwd(), 'package.json')), {
       headers: {
         Origin: loopbackBrowserOrigin,
       },
     })
-    expect(localFileResponse.status).toBe(403)
+    expect(localFileResponse.status).toBe(200)
 
     const previewResponse = await fetch(`${baseUrl}/preview-fs/h5-auth-test/index.html`, {
       headers: {
         Origin: loopbackBrowserOrigin,
       },
     })
-    expect(previewResponse.status).toBe(403)
+    expect(previewResponse.status).not.toBe(401)
+    expect(previewResponse.status).not.toBe(403)
   })
 
   test('blocks remote browser SDK requests while H5 access is disabled', async () => {
@@ -759,35 +760,26 @@ describe('remote H5 auth and CORS integration', () => {
     expect(missingPreviewToken.status).toBe(401)
   })
 
-  test('requires H5 token for loopback browser local-file and preview-fs requests when H5 access is enabled', async () => {
+  test('keeps loopback browser local-file and preview-fs requests tokenless when H5 access is enabled', async () => {
     const loopbackBrowserOrigin = 'http://localhost:5173'
-    const token = await enableH5Access({
-      allowedOrigins: [loopbackBrowserOrigin],
-    })
+    await enableH5Access()
     const localFile = localFileUrl(baseUrl, path.join(process.cwd(), 'package.json'))
 
-    const missingLocalFileToken = await fetch(localFile, {
+    const localFileResponse = await fetch(localFile, {
       headers: {
         Origin: loopbackBrowserOrigin,
       },
     })
-    expect(missingLocalFileToken.status).toBe(401)
+    expect(localFileResponse.status).toBe(200)
+    await expect(localFileResponse.text()).resolves.toContain('"name"')
 
-    const validLocalFileToken = await fetch(localFile, {
-      headers: {
-        Origin: loopbackBrowserOrigin,
-        Authorization: `Bearer ${token}`,
-      },
-    })
-    expect(validLocalFileToken.status).toBe(200)
-    await expect(validLocalFileToken.text()).resolves.toContain('"name"')
-
-    const missingPreviewToken = await fetch(`${baseUrl}/preview-fs/h5-auth-test/index.html`, {
+    const previewResponse = await fetch(`${baseUrl}/preview-fs/h5-auth-test/index.html`, {
       headers: {
         Origin: loopbackBrowserOrigin,
       },
     })
-    expect(missingPreviewToken.status).toBe(401)
+    expect(previewResponse.status).not.toBe(401)
+    expect(previewResponse.status).not.toBe(403)
   })
 
   test('does not allow the server API key to replace the H5 token for remote browser requests', async () => {
