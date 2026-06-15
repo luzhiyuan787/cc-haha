@@ -127,6 +127,8 @@ export const jp: Record<TranslationKey, string> = {
   'workspace.refresh': 'ワークスペースを更新',
   'workspace.closePanel': 'ワークスペースパネルを閉じる',
   'workspace.resizePanel': 'ワークスペースパネルのサイズを変更',
+  'workspace.showNavigator': 'ファイルナビゲーターを表示',
+  'workspace.hideNavigator': 'ファイルナビゲーターを非表示',
   'workbench.modeSwitch': 'ワークベンチモード',
   'workbench.modeWorkspace': 'ファイル',
   'workbench.modeBrowser': 'ブラウザ',

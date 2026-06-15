@@ -127,6 +127,8 @@ export const zh: Record<TranslationKey, string> = {
   'workspace.refresh': '重新整理工作區',
   'workspace.closePanel': '關閉工作區面板',
   'workspace.resizePanel': '調整工作區寬度',
+  'workspace.showNavigator': '顯示檔案導覽',
+  'workspace.hideNavigator': '隱藏檔案導覽',
   'workbench.modeSwitch': '工作臺模式',
   'workbench.modeWorkspace': '檔案',
   'workbench.modeBrowser': '瀏覽器',

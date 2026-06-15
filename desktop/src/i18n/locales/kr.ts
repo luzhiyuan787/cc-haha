@@ -127,6 +127,8 @@ export const kr: Record<TranslationKey, string> = {
   'workspace.refresh': '작업 공간 새로 고침',
   'workspace.closePanel': '작업 공간 패널 닫기',
   'workspace.resizePanel': '작업 공간 패널 크기 조정',
+  'workspace.showNavigator': '파일 탐색기 표시',
+  'workspace.hideNavigator': '파일 탐색기 숨기기',
   'workbench.modeSwitch': '워크벤치 모드',
   'workbench.modeWorkspace': '파일',
   'workbench.modeBrowser': '브라우저',

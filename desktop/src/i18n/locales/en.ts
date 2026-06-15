@@ -125,6 +125,8 @@ export const en = {
   'workspace.refresh': 'Refresh workspace',
   'workspace.closePanel': 'Close workspace panel',
   'workspace.resizePanel': 'Resize workspace panel',
+  'workspace.showNavigator': 'Show file navigator',
+  'workspace.hideNavigator': 'Hide file navigator',
   'workbench.modeSwitch': 'Workbench mode',
   'workbench.modeWorkspace': 'Files',
   'workbench.modeBrowser': 'Browser',
