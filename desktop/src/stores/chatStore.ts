@@ -2171,6 +2171,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           clearPendingToolParentUseIds(sessionId)
           useCLITaskStore.getState().clearTasks(sessionId)
           useSessionStore.getState().updateSessionTitle(sessionId, 'New Session')
+          useSessionStore.getState().updateSessionMessageCount(sessionId, 0)
           useTabStore.getState().updateTabTitle(sessionId, 'New Session')
           useTabStore.getState().updateTabStatus(sessionId, 'idle')
         }

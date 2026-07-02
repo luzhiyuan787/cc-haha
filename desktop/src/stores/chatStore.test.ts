@@ -19,6 +19,7 @@ const {
   updateTabTitleMock,
   updateTabStatusMock,
   updateSessionTitleMock,
+  updateSessionMessageCountMock,
   updateSessionPermissionModeMock,
   sessionStoreSnapshot,
   cliTaskStoreSnapshot,
@@ -39,6 +40,7 @@ const {
   updateTabTitleMock: vi.fn(),
   updateTabStatusMock: vi.fn(),
   updateSessionTitleMock: vi.fn(),
+  updateSessionMessageCountMock: vi.fn(),
   updateSessionPermissionModeMock: vi.fn(),
   sessionStoreSnapshot: {
     sessions: [] as Array<{
@@ -105,6 +107,7 @@ vi.mock('./sessionStore', () => ({
     getState: () => ({
       sessions: sessionStoreSnapshot.sessions,
       updateSessionTitle: updateSessionTitleMock,
+      updateSessionMessageCount: updateSessionMessageCountMock,
       updateSessionPermissionMode: updateSessionPermissionModeMock,
     }),
   },
@@ -276,6 +279,7 @@ describe('chatStore history mapping', () => {
     updateTabTitleMock.mockReset()
     updateTabStatusMock.mockReset()
     updateSessionTitleMock.mockReset()
+    updateSessionMessageCountMock.mockReset()
     vi.mocked(sessionsApi.getMessages).mockReset()
     vi.mocked(sessionsApi.getMessages).mockResolvedValue({ messages: [] })
     sessionStoreSnapshot.sessions = []
@@ -3000,6 +3004,8 @@ describe('chatStore history mapping', () => {
     expect(session?.streamingResponseChars).toBe(0)
     expect(session?.slashCommands).toEqual([])
     expect(clearTasksMock).toHaveBeenCalledWith(TEST_SESSION_ID)
+    expect(updateSessionTitleMock).toHaveBeenCalledWith(TEST_SESSION_ID, 'New Session')
+    expect(updateSessionMessageCountMock).toHaveBeenCalledWith(TEST_SESSION_ID, 0)
 
     vi.advanceTimersByTime(60)
     expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.streamingText).toBe('')

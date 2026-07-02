@@ -165,6 +165,21 @@ describe('sessionStore', () => {
     expect(useTabStore.getState().tabs[0]?.title).toBe('使用bash写一个shell，随便写点什么东西')
   })
 
+  it('updates a session message count without changing other metadata', () => {
+    useSessionStore.setState({
+      sessions: [makeSession('session-count-1', '2026-05-07T00:00:00.000Z', 'Working session')],
+    })
+
+    useSessionStore.getState().updateSessionMessageCount('session-count-1', 0)
+
+    expect(useSessionStore.getState().sessions[0]).toMatchObject({
+      id: 'session-count-1',
+      title: 'Working session',
+      messageCount: 0,
+      workDir: '/workspace/project',
+    })
+  })
+
   it('requests a large default session page for noisy history directories', async () => {
     listMock.mockResolvedValue({
       sessions: [makeSession('session-newest', '2026-05-07T00:00:03.000Z')],
