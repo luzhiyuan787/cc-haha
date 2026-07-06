@@ -275,12 +275,6 @@ function registerIpcHandlers() {
   registerHandler(ELECTRON_IPC_CHANNELS.runtimeHttpRequest, (_event, payload) =>
     performHttpRequest(payload as Parameters<typeof performHttpRequest>[0]),
   )
-  registerHandler(ELECTRON_IPC_CHANNELS.runtimeCheckServerHealth, (_event, serverUrl) =>
-    probeServerHealth(String(serverUrl)),
-  )
-  registerHandler(ELECTRON_IPC_CHANNELS.runtimeHttpRequest, (_event, payload) =>
-    performHttpRequest(payload as Parameters<typeof performHttpRequest>[0]),
-  )
   registerHandler(ELECTRON_IPC_CHANNELS.commandInvoke, (_event, payload) => handleCommandInvoke(payload))
   registerHandler(ELECTRON_IPC_CHANNELS.clipboardReadText, () => clipboard.readText())
   registerHandler(ELECTRON_IPC_CHANNELS.clipboardWriteText, (_event, payload) => clipboard.writeText(String(payload)))
