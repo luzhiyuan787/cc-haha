@@ -399,6 +399,21 @@ async function createMainWindow() {
     writeWindowSmokeSnapshot(mainWindow, `did-fail-load:${errorCode}:${errorDescription}:${validatedURL}`)
   })
 
+  // F12 toggles DevTools. Without this, users on Windows cannot diagnose
+  // renderer-side issues (WebSocket state, fetch errors, console logs). The
+  // toggle is bound to the main window's webContents and only fires when the
+  // window itself is focused, so it does not interfere with other shortcuts.
+  mainWindow.webContents.on('before-input-event', (_event, input) => {
+    if (input.type !== 'keyDown') return
+    if (input.key === 'F12') {
+      if (mainWindow?.webContents.isDevToolsOpened()) {
+        mainWindow.webContents.closeDevTools()
+      } else {
+        mainWindow?.webContents.openDevTools({ mode: 'detach' })
+      }
+    }
+  })
+
   writeWindowSmokeSnapshot(mainWindow, 'after-create')
 
   await loadRendererEntry(mainWindow)
