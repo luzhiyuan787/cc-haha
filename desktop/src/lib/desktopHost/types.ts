@@ -147,6 +147,7 @@ export type DesktopHost = {
   capabilities: DesktopHostCapabilities
   runtime: {
     getServerUrl(): Promise<string>
+    checkServerHealth(serverUrl: string): Promise<{ ok: true } | { ok: false, reason: string }>
   }
   app: {
     getVersion(): Promise<string>

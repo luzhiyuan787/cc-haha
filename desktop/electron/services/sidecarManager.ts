@@ -165,6 +165,51 @@ export function preferredServerPorts(env: NodeJS.ProcessEnv = process.env): numb
   return ports
 }
 
+/**
+ * One-shot health probe against an already-known server URL. Returns a
+ * structured result instead of throwing so the IPC handler can surface a
+ * stable error shape to the renderer. Uses raw `http.request` to skip
+ * system-proxy resolution (#953 follow-up).
+ */
+export async function probeServerHealth(
+  serverUrl: string,
+  timeoutMs = 2_000,
+): Promise<{ ok: true } | { ok: false, reason: string }> {
+  const baseUrl = serverUrl.replace(/\/+$/, '')
+  const healthUrl = `${baseUrl}/health`
+
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await getHealthResponse(healthUrl, controller.signal)
+    if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
+      return { ok: false, reason: `healthcheck returned ${response.statusCode}` }
+    }
+
+    const contentType = (response.headers['content-type'] ?? '').toString()
+    if (!contentType.toLowerCase().includes('application/json')) {
+      return { ok: false, reason: `healthcheck returned non-JSON response from ${healthUrl}` }
+    }
+
+    const rawBody = await readResponseBody(response)
+    let body: unknown = null
+    try {
+      body = JSON.parse(rawBody)
+    } catch {
+      return { ok: false, reason: `healthcheck returned non-JSON body from ${healthUrl}` }
+    }
+    if (!body || typeof body !== 'object' || !('status' in body) || body.status !== 'ok') {
+      return { ok: false, reason: `healthcheck returned invalid response from ${healthUrl}` }
+    }
+    return { ok: true }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return { ok: false, reason: message }
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
 export async function waitForServer(host: string, port: number, timeoutMs = SERVER_STARTUP_TIMEOUT_MS): Promise<void> {
   const deadline = Date.now() + timeoutMs
   const healthUrl = `http://${host}:${port}/health`

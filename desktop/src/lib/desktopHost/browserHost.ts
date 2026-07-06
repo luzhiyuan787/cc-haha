@@ -44,6 +44,34 @@ export const browserHost: DesktopHost = {
     async getServerUrl() {
       unsupported('Resolving the bundled server URL')
     },
+    async checkServerHealth(serverUrl) {
+      // Browser runtime has no IPC fallback; use fetch directly. This path is
+      // only hit when running the renderer in a plain browser (dev), so it is
+      // not subject to the Electron-session proxy quirks that motivated the
+      // IPC version.
+      try {
+        const response = await fetch(`${serverUrl.replace(/\/+$/, '')}/health`, {
+          cache: 'no-store',
+        })
+        if (!response.ok) {
+          return { ok: false as const, reason: `healthcheck returned ${response.status}` }
+        }
+        const contentType = response.headers.get('content-type') ?? ''
+        if (!contentType.toLowerCase().includes('application/json')) {
+          return { ok: false as const, reason: 'healthcheck returned non-JSON response' }
+        }
+        const body = await response.json().catch(() => null)
+        if (!body || typeof body !== 'object' || !('status' in body) || body.status !== 'ok') {
+          return { ok: false as const, reason: 'healthcheck returned invalid response' }
+        }
+        return { ok: true as const }
+      } catch (error) {
+        return {
+          ok: false as const,
+          reason: error instanceof Error ? error.message : String(error),
+        }
+      }
+    },
   },
   app: {
     async getVersion() {

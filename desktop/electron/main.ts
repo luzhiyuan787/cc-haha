@@ -4,6 +4,7 @@ import path from 'node:path'
 import { ELECTRON_EVENT_CHANNELS, ELECTRON_INTERNAL_CHANNELS, ELECTRON_IPC_CHANNELS, type ElectronIpcChannel } from './ipc/channels'
 import { isElectronIpcChannel, validateElectronIpcPayload } from './ipc/capabilities'
 import { ElectronServerRuntime } from './services/serverRuntime'
+import { probeServerHealth } from './services/sidecarManager'
 import { openDialog, saveDialog } from './services/dialogs'
 import { openExternalUrl, openSystemPath, openSystemSettingsUrl } from './services/shell'
 import {
@@ -257,6 +258,9 @@ function registerIpcHandlers() {
   })
   registerHandler(ELECTRON_IPC_CHANNELS.appGetVersion, () => app.getVersion())
   registerHandler(ELECTRON_IPC_CHANNELS.runtimeGetServerUrl, () => getServerRuntime().getServerUrl())
+  registerHandler(ELECTRON_IPC_CHANNELS.runtimeCheckServerHealth, (_event, serverUrl) =>
+    probeServerHealth(String(serverUrl)),
+  )
   registerHandler(ELECTRON_IPC_CHANNELS.commandInvoke, (_event, payload) => handleCommandInvoke(payload))
   registerHandler(ELECTRON_IPC_CHANNELS.clipboardReadText, () => clipboard.readText())
   registerHandler(ELECTRON_IPC_CHANNELS.clipboardWriteText, (_event, payload) => clipboard.writeText(String(payload)))

@@ -264,28 +264,19 @@ async function initializeBrowserServerUrl(fallbackUrl: string) {
 }
 
 async function waitForHealth(serverUrl: string) {
+  // Probe via the desktop host (IPC under Electron, fetch in the browser
+  // fallback). Routing the probe through the main process avoids the
+  // Electron renderer's fetch being affected by the app/session proxy
+  // configuration, which on Windows-on-corp-network causes `Failed to fetch`
+  // even though the sidecar is reachable on loopback (#953 follow-up).
+  const host = getDetectedDesktopHost()
   let lastError: unknown
 
   for (let attempt = 0; attempt < 30; attempt++) {
     try {
-      const response = await fetch(`${serverUrl}/health`, {
-        cache: 'no-store',
-      })
-      if (response.ok) {
-        const contentType = response.headers.get('content-type') ?? ''
-        if (!contentType.toLowerCase().includes('application/json')) {
-          lastError = new Error(`healthcheck returned non-JSON response from ${serverUrl}/health`)
-          break
-        } else {
-          const body = await response.json().catch(() => null)
-          if (body && typeof body === 'object' && 'status' in body && body.status === 'ok') {
-            return
-          }
-          lastError = new Error(`healthcheck returned invalid response from ${serverUrl}/health`)
-        }
-      } else {
-        lastError = new Error(`healthcheck returned ${response.status}`)
-      }
+      const result = await host.runtime.checkServerHealth(serverUrl)
+      if (result.ok) return
+      lastError = new Error(result.reason)
     } catch (error) {
       lastError = error
     }

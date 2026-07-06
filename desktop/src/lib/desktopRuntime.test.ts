@@ -138,6 +138,7 @@ describe('desktopRuntime browser H5 bootstrap', () => {
       isDesktop: true,
       runtime: {
         getServerUrl: vi.fn().mockResolvedValue(serverUrl),
+        checkServerHealth: vi.fn().mockResolvedValue({ ok: true }),
       },
     }
     globalThis.fetch = vi.fn().mockResolvedValue(
@@ -147,12 +148,12 @@ describe('desktopRuntime browser H5 bootstrap', () => {
     await expect(initializeDesktopServerUrl()).resolves.toBe(serverUrl)
 
     expect(window.desktopHost.runtime.getServerUrl).toHaveBeenCalledTimes(1)
+    expect(window.desktopHost.runtime.checkServerHealth).toHaveBeenCalledWith(serverUrl)
     expect(clientMocks.setBaseUrl).toHaveBeenLastCalledWith(serverUrl)
     expect(clientMocks.setAuthToken).toHaveBeenLastCalledWith(null)
-    expect(globalThis.fetch).toHaveBeenCalledWith(`${serverUrl}/health`, {
+    expect(globalThis.fetch).toHaveBeenCalledWith(`${serverUrl}/api/status`, {
       cache: 'no-store',
     })
-    expect(globalThis.fetch).toHaveBeenCalledTimes(1)
   })
 
   it('classifies browser H5 runtime using the desktop host boundary', () => {
@@ -178,6 +179,7 @@ describe('desktopRuntime browser H5 bootstrap', () => {
       isDesktop: true,
       runtime: {
         getServerUrl: vi.fn().mockRejectedValue(error),
+        checkServerHealth: vi.fn(),
       },
     }
 
