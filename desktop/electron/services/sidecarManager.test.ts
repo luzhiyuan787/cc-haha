@@ -303,4 +303,43 @@ describe('Electron sidecar manager', () => {
       await close(server)
     }
   })
+
+  it('probes /health even when system proxy env vars are set (loopback bypass)', async () => {
+    // Regression for the Windows-on-corp-network startup hang (#953 follow-up):
+    // the sidecar stdout shows the server listening, but the Electron main
+    // process's undici-based fetch honors HTTP_PROXY and refuses to dial
+    // loopback. waitForServer must not depend on fetch's proxy behavior.
+    const server = http.createServer((request, response) => {
+      if (request.url !== '/health') {
+        response.writeHead(404)
+        response.end()
+        return
+      }
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ status: 'ok', timestamp: 't' }))
+    })
+    const port = await listen(server)
+
+    const proxyKeys = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NO_PROXY', 'no_proxy'] as const
+    const previous: Record<string, string | undefined> = {}
+    for (const key of proxyKeys) previous[key] = process.env[key]
+    // Point the proxy env at a definitely-unroutable address. If the health
+    // probe accidentally honored these, it would hang and the test would
+    // hit the 1.5s timeout below.
+    process.env.HTTP_PROXY = 'http://127.0.0.1:1'
+    process.env.HTTPS_PROXY = 'http://127.0.0.1:1'
+    process.env.http_proxy = 'http://127.0.0.1:1'
+    process.env.https_proxy = 'http://127.0.0.1:1'
+
+    try {
+      await expect(waitForServer('127.0.0.1', port, 1500)).resolves.toBeUndefined()
+    } finally {
+      await close(server)
+      for (const key of proxyKeys) {
+        const value = previous[key]
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  })
 })

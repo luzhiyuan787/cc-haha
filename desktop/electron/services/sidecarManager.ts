@@ -1,6 +1,7 @@
 import { spawn, spawnSync, type ChildProcessByStdio } from 'node:child_process'
 import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import type { Readable } from 'node:stream'
+import http from 'node:http'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
@@ -187,24 +188,99 @@ async function assertServerHealth(healthUrl: string, timeoutMs: number): Promise
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), timeoutMs)
   try {
-    const response = await fetch(healthUrl, {
-      cache: 'no-store',
-      signal: controller.signal,
-    })
-    if (!response.ok) throw new Error(`healthcheck returned ${response.status}`)
+    const response = await getHealthResponse(healthUrl, controller.signal)
+    if (response.statusCode === undefined || response.statusCode >= 500) {
+      throw new Error(`healthcheck returned ${response.statusCode ?? 'no-status'}`)
+    }
+    if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
+      throw new Error(`healthcheck returned ${response.statusCode}`)
+    }
 
-    const contentType = response.headers.get('content-type') ?? ''
+    const contentType = (response.headers['content-type'] ?? '').toString()
     if (!contentType.toLowerCase().includes('application/json')) {
       throw new Error(`healthcheck returned non-JSON response from ${healthUrl}`)
     }
 
-    const body = await response.json().catch(() => null)
+    const rawBody = await readResponseBody(response)
+    let body: unknown = null
+    try {
+      body = JSON.parse(rawBody)
+    } catch {
+      throw new Error(`healthcheck returned non-JSON body from ${healthUrl}`)
+    }
     if (!body || typeof body !== 'object' || !('status' in body) || body.status !== 'ok') {
       throw new Error(`healthcheck returned invalid response from ${healthUrl}`)
     }
   } finally {
     clearTimeout(timeout)
   }
+}
+
+/**
+ * Probe the sidecar via `http.request` rather than `globalThis.fetch`.
+ * The Electron main-process fetch (undici) honors HTTP_PROXY / HTTPS_PROXY /
+ * PAC; on corp networks it can refuse to dial loopback for several seconds,
+ * past the startup timeout (#953 follow-up). `http.request` skips proxy env
+ * entirely and is sufficient for a tiny /health JSON check. Also pins the
+ * hostname to IPv4 loopback when given `localhost` to avoid IPv6 routing
+ * quirks on Windows.
+ */
+function getHealthResponse(
+  healthUrl: string,
+  signal: AbortSignal,
+): Promise<http.IncomingMessage> {
+  return new Promise((resolve, reject) => {
+    let parsed: URL
+    try {
+      parsed = new URL(healthUrl)
+    } catch (error) {
+      reject(error instanceof Error ? error : new Error(String(error)))
+      return
+    }
+    if (parsed.protocol !== 'http:') {
+      reject(new Error(`healthcheck only supports http URLs, got ${parsed.protocol}`))
+      return
+    }
+
+    const host = parsed.hostname === 'localhost' ? '127.0.0.1' : parsed.hostname
+
+    const request = http.request(
+      {
+        host,
+        port: parsed.port,
+        method: 'GET',
+        path: parsed.pathname + parsed.search,
+        headers: {
+          Accept: 'application/json',
+          'Cache-Control': 'no-store',
+        },
+      },
+      response => {
+        response.once('error', reject)
+        resolve(response)
+      },
+    )
+
+    request.once('error', reject)
+    signal.addEventListener(
+      'abort',
+      () => {
+        request.destroy(new Error('healthcheck aborted'))
+        reject(new Error('healthcheck aborted'))
+      },
+      { once: true },
+    )
+    request.end()
+  })
+}
+
+function readResponseBody(response: http.IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    response.on('data', chunk => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)))
+    response.once('end', () => resolve(Buffer.concat(chunks).toString('utf-8')))
+    response.once('error', reject)
+  })
 }
 
 function sleep(ms: number): Promise<void> {

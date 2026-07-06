@@ -313,7 +313,10 @@ describe('packaged artifact inspection', () => {
     })
 
     expect(report.passed).toBe(true)
-    expect(report.artifactsDir.endsWith('desktop/build-artifacts/windows-x64')).toBe(true)
+    // expect(report.artifactsDir.endsWith('desktop/build-artifacts/windows-x64')).toBe(true)
+    // 将实际路径中的 \ 替换为 / 再做比较
+    const normalizedDir = report.artifactsDir.replace(/\\/g, '/');
+    expect(normalizedDir.endsWith('desktop/build-artifacts/windows-x64')).toBe(true)
   })
 
   test('passes Windows arm64 checks only when arm64 sidecar and node-pty native module are present', async () => {
@@ -444,7 +447,9 @@ describe('packaged artifact inspection', () => {
     })
 
     expect(report.passed).toBe(true)
-    expect(report.artifactsDir.endsWith('desktop/build-artifacts/linux-x64')).toBe(true)
+    // expect(report.artifactsDir.endsWith('desktop/build-artifacts/linux-x64')).toBe(true)
+    const normalizedDir = report.artifactsDir.replace(/\\/g, '/');
+    expect(normalizedDir.endsWith('desktop/build-artifacts/linux-x64')).toBe(true)
   })
 
   test('accepts Linux architecture-specific update metadata from arm64 builds', async () => {
@@ -515,7 +520,12 @@ describe('packaged artifact inspection', () => {
     })
 
     expect(report.passed).toBe(true)
-    expect(report.passedChecks.some((check) => check.path.includes('linux-arm64-unpacked/resources/app.asar'))).toBe(true)
+    // expect(report.passedChecks.some((check) => check.path.includes('linux-arm64-unpacked/resources/app.asar'))).toBe(true)
+    expect(report.passedChecks.some((check) => {
+    // 同样将 check.path 转换为正斜杠路径
+    const normalizedPath = check.path.replace(/\\/g, '/');
+      return normalizedPath.includes('linux-arm64-unpacked/resources/app.asar');
+    })).toBe(true)
   })
 
   test('passes Linux directory-only checks for electron-builder --dir output', async () => {
