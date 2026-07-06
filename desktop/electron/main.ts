@@ -405,6 +405,22 @@ if (!acquireSingleInstanceLock(app, () => mainWindow)) {
 registerIpcHandlers()
 
 app.whenReady().then(async () => {
+  // Force every network request from this Electron session — including the
+  // renderer process's fetch AND WebSocket — to bypass the system proxy
+  // when the target is loopback. Without this, on Windows machines whose
+  // system proxy is set, the renderer cannot dial 127.0.0.1 and surfaces
+  // `TypeError: Failed to fetch` plus silently hanging WebSocket upgrade
+  // attempts (#953 follow-up; also blocks chat streaming).
+  try {
+    await session.defaultSession.setProxy({
+      proxyRules: '',
+      proxyBypassRules: '<local>;127.0.0.1;localhost;::1;*.localhost',
+    })
+    await session.defaultSession.forceReloadProxyConfig()
+  } catch (error) {
+    console.error('[desktop] failed to install loopback proxy bypass', error)
+  }
+
   applyWindowsAppUserModelId(app)
   applyStartupPortableMode(app)
   await getServerRuntime().startServer().catch(error => {
