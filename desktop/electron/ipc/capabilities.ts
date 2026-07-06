@@ -8,6 +8,20 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const noPayload: Validator = value => value === undefined
 const optionalRecord: Validator = value => value === undefined || isRecord(value)
 const stringPayload: Validator = value => typeof value === 'string'
+
+const httpRequestPayload: Validator = value => {
+  if (!isRecord(value)) return false
+  if (typeof value.url !== 'string' || value.url.length === 0) return false
+  if (value.method !== undefined && typeof value.method !== 'string') return false
+  if (value.headers !== undefined) {
+    if (!isRecord(value.headers)) return false
+    for (const header of Object.values(value.headers)) {
+      if (typeof header !== 'string') return false
+    }
+  }
+  if (value.body !== undefined && typeof value.body !== 'string') return false
+  return true
+}
 const booleanPayload: Validator = value => typeof value === 'boolean'
 const hasOnlyKeys = (value: Record<string, unknown>, allowedKeys: string[]) =>
   Object.keys(value).every(key => allowedKeys.includes(key))
@@ -73,6 +87,7 @@ export const ELECTRON_IPC_VALIDATORS = {
   [ELECTRON_IPC_CHANNELS.appGetVersion]: noPayload,
   [ELECTRON_IPC_CHANNELS.runtimeGetServerUrl]: noPayload,
   [ELECTRON_IPC_CHANNELS.runtimeCheckServerHealth]: stringPayload,
+  [ELECTRON_IPC_CHANNELS.runtimeHttpRequest]: httpRequestPayload,
   [ELECTRON_IPC_CHANNELS.commandInvoke]: commandInvoke,
   [ELECTRON_IPC_CHANNELS.clipboardReadText]: noPayload,
   [ELECTRON_IPC_CHANNELS.clipboardWriteText]: stringPayload,

@@ -148,6 +148,7 @@ export type DesktopHost = {
   runtime: {
     getServerUrl(): Promise<string>
     checkServerHealth(serverUrl: string): Promise<{ ok: true } | { ok: false, reason: string }>
+    httpRequest(payload: { url: string, method?: string, headers?: Record<string, string>, body?: string }): Promise<{ status: number, statusText: string, headers: Record<string, string>, body: string }>
   }
   app: {
     getVersion(): Promise<string>

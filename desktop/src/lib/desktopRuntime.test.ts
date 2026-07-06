@@ -139,6 +139,7 @@ describe('desktopRuntime browser H5 bootstrap', () => {
       runtime: {
         getServerUrl: vi.fn().mockResolvedValue(serverUrl),
         checkServerHealth: vi.fn().mockResolvedValue({ ok: true }),
+        httpRequest: vi.fn(),
       },
     }
     globalThis.fetch = vi.fn().mockResolvedValue(
@@ -147,8 +148,10 @@ describe('desktopRuntime browser H5 bootstrap', () => {
 
     await expect(initializeDesktopServerUrl()).resolves.toBe(serverUrl)
 
-    expect(window.desktopHost.runtime.getServerUrl).toHaveBeenCalledTimes(1)
-    expect(window.desktopHost.runtime.checkServerHealth).toHaveBeenCalledWith(serverUrl)
+    const host = window.desktopHost
+    if (!host) throw new Error('desktopHost was not installed')
+    expect(host.runtime.getServerUrl).toHaveBeenCalledTimes(1)
+    expect(host.runtime.checkServerHealth).toHaveBeenCalledWith(serverUrl)
     expect(clientMocks.setBaseUrl).toHaveBeenLastCalledWith(serverUrl)
     expect(clientMocks.setAuthToken).toHaveBeenLastCalledWith(null)
     expect(globalThis.fetch).toHaveBeenCalledWith(`${serverUrl}/api/status`, {
@@ -180,6 +183,7 @@ describe('desktopRuntime browser H5 bootstrap', () => {
       runtime: {
         getServerUrl: vi.fn().mockRejectedValue(error),
         checkServerHealth: vi.fn(),
+        httpRequest: vi.fn(),
       },
     }
 

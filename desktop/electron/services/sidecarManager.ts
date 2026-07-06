@@ -210,6 +210,86 @@ export async function probeServerHealth(
   }
 }
 
+/**
+ * Generic HTTP request handler for the IPC `runtime:http-request` channel.
+ * Forwards arbitrary HTTP requests through `http.request` so the renderer
+ * fetch can be patched to delegate loopback traffic here and bypass any
+ * session proxy configuration that breaks 127.0.0.1 fetches in Electron
+ * (#953 follow-up).
+ */
+export async function performHttpRequest(payload: {
+  url: string
+  method?: string
+  headers?: Record<string, string>
+  body?: string
+  timeoutMs?: number
+}): Promise<{ status: number, statusText: string, headers: Record<string, string>, body: string }> {
+  const method = (payload.method ?? 'GET').toUpperCase()
+  const timeoutMs = payload.timeoutMs ?? 30_000
+  let parsed: URL
+  try {
+    parsed = new URL(payload.url)
+  } catch (error) {
+    throw new Error(`invalid http-request url: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`http-request only supports http(s), got ${parsed.protocol}`)
+  }
+
+  const host = parsed.hostname === 'localhost' ? '127.0.0.1' : parsed.hostname
+
+  return await new Promise((resolve, reject) => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    const request = http.request(
+      {
+        host,
+        port: parsed.port || (parsed.protocol === 'https:' ? '443' : '80'),
+        method,
+        path: parsed.pathname + parsed.search,
+        headers: payload.headers ?? {},
+      },
+      response => {
+        const chunks: Buffer[] = []
+        response.on('data', chunk => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)))
+        response.once('end', () => {
+          clearTimeout(timer)
+          const headers: Record<string, string> = {}
+          for (const [k, v] of Object.entries(response.headers)) {
+            if (Array.isArray(v)) headers[k] = v.join(', ')
+            else if (v !== undefined) headers[k] = String(v)
+          }
+          resolve({
+            status: response.statusCode ?? 0,
+            statusText: response.statusMessage ?? '',
+            headers,
+            body: Buffer.concat(chunks).toString('utf-8'),
+          })
+        })
+        response.once('error', error => {
+          clearTimeout(timer)
+          reject(error)
+        })
+      },
+    )
+
+    request.once('error', error => {
+      clearTimeout(timer)
+      reject(error)
+    })
+
+    controller.signal.addEventListener('abort', () => {
+      request.destroy(new Error('http-request timed out'))
+      reject(new Error('http-request timed out'))
+    }, { once: true })
+
+    if (payload.body !== undefined) {
+      request.write(payload.body)
+    }
+    request.end()
+  })
+}
+
 export async function waitForServer(host: string, port: number, timeoutMs = SERVER_STARTUP_TIMEOUT_MS): Promise<void> {
   const deadline = Date.now() + timeoutMs
   const healthUrl = `http://${host}:${port}/health`

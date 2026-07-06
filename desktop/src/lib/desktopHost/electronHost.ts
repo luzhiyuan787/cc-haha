@@ -76,6 +76,7 @@ export function createElectronHost(bridge: ElectronHostBridge): DesktopHost {
     runtime: {
       getServerUrl: () => invoke(ELECTRON_IPC_CHANNELS.runtimeGetServerUrl),
       checkServerHealth: serverUrl => invoke(ELECTRON_IPC_CHANNELS.runtimeCheckServerHealth, serverUrl),
+      httpRequest: payload => invoke(ELECTRON_IPC_CHANNELS.runtimeHttpRequest, payload),
     },
     app: {
       getVersion: () => invoke(ELECTRON_IPC_CHANNELS.appGetVersion),

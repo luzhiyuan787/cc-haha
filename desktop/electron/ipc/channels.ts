@@ -2,6 +2,7 @@ export const ELECTRON_IPC_CHANNELS = {
   appGetVersion: 'desktop:app:get-version',
   runtimeGetServerUrl: 'desktop:runtime:get-server-url',
   runtimeCheckServerHealth: 'desktop:runtime:check-server-health',
+  runtimeHttpRequest: 'desktop:runtime:http-request',
   commandInvoke: 'desktop:command:invoke',
   clipboardReadText: 'desktop:clipboard:read-text',
   clipboardWriteText: 'desktop:clipboard:write-text',

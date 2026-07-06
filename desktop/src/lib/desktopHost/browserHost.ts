@@ -72,6 +72,26 @@ export const browserHost: DesktopHost = {
         }
       }
     },
+    async httpRequest(payload) {
+      try {
+        const response = await fetch(payload.url, {
+          method: payload.method ?? 'GET',
+          headers: payload.headers,
+          body: payload.body,
+        })
+        const headers: Record<string, string> = {}
+        response.headers.forEach((value, key) => { headers[key] = value })
+        const body = await response.text()
+        return { status: response.status, statusText: response.statusText, headers, body }
+      } catch (error) {
+        return {
+          status: 0,
+          statusText: error instanceof Error ? error.message : String(error),
+          headers: {},
+          body: '',
+        }
+      }
+    },
   },
   app: {
     async getVersion() {
