@@ -17,6 +17,32 @@ export const SERVER_STATE_FILE = 'desktop-server-state.json'
 const MIN_FIXED_PORT = 1024
 const MAX_FIXED_PORT = 65535
 
+/**
+ * Ports that Chromium refuses to connect to via fetch / WebSocket, because
+ * they have historically been bound by other system services. See
+ * https://chromium.googlesource.com/chromium/src/+/refs/heads/main/net/base/port_util.cc
+ * for the canonical list. The renderer sidecar server's `h5Access.fixedPort`
+ * defaults to 6566 in settings.json, but 6566 is on this list, so the
+ * renderer reports `net::ERR_UNSAFE_PORT` and the chat stream never
+ * establishes — even though Node's `http.request` and `Bun.serve` are happy
+ * with it. We filter the user's fixedPort through this list before the sidecar
+ * tries to bind, falling back to an OS-assigned port so the UI comes up.
+ */
+const CHROMIUM_UNSAFE_PORTS: ReadonlySet<number> = new Set([
+  1,    7,    9,    11,   13,   15,   17,   19,   20,   21,   22,
+  23,   25,   37,   42,   43,   53,   69,   77,   79,   87,   95,
+  101,  102,  103,  104,  109,  110,  111,  113,  115,  117,  119,
+  123,  135,  137,  139,  143,  161,  179,  389,  427,  465,  512,
+  513,  514,  515,  526,  530,  531,  532,  540,  548,  554,  556,
+  563,  587,  601,  636,  989,  990,  993,  995,  1719, 1720, 1723,
+  2049, 3659, 4045, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668,
+  6669, 6697, 10080,
+])
+
+export function isChromiumUnsafePort(port: number): boolean {
+  return CHROMIUM_UNSAFE_PORTS.has(port)
+}
+
 export type SidecarChild = ChildProcessByStdio<null, Readable, Readable>
 
 export type SidecarPlan = {
@@ -159,9 +185,26 @@ export function writeLastServerPort(port: number, env: NodeJS.ProcessEnv = proce
 export function preferredServerPorts(env: NodeJS.ProcessEnv = process.env): number[] {
   const ports: number[] = []
   const fixedPort = readH5FixedPort(env)
-  if (fixedPort !== null) ports.push(fixedPort)
+  if (fixedPort !== null) {
+    if (CHROMIUM_UNSAFE_PORTS.has(fixedPort)) {
+      // The renderer's fetch/WebSocket refuses to dial this port with
+      // `net::ERR_UNSAFE_PORT`. The sidecar would happily bind it, but the
+      // chat stream would never connect. Skip it so reserveServerPort falls
+      // through to an OS-assigned port that the UI can actually use.
+      console.error(
+        `[desktop] ignoring h5Access.fixedPort=${fixedPort} because Chromium blocks it as unsafe; ` +
+        'update cc-haha/settings.json to use a different port (>= 1024 and not in the unsafe list).',
+      )
+    } else {
+      ports.push(fixedPort)
+    }
+  }
   const lastPort = readLastServerPort(env)
-  if (lastPort !== null && !ports.includes(lastPort)) ports.push(lastPort)
+  if (lastPort !== null && !ports.includes(lastPort)) {
+    if (!CHROMIUM_UNSAFE_PORTS.has(lastPort)) {
+      ports.push(lastPort)
+    }
+  }
   return ports
 }
 
