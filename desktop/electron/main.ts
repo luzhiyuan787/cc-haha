@@ -56,6 +56,17 @@ const traceWindows = new Map<string, BrowserWindow>()
 let isQuitting = false
 let trayController: TrayController | null = null
 
+// Force every network request from this Electron session — including the
+// renderer process's fetch AND WebSocket — to bypass any system proxy and
+// go direct to loopback. Without this, on Windows machines whose system
+// proxy is set, the renderer cannot dial 127.0.0.1 and either surfaces
+// `TypeError: Failed to fetch` (HTTP) or silently hangs the WebSocket
+// upgrade (chat stream), making the UI spin forever (#953 follow-up; also
+// blocks chat streaming).
+app.commandLine.appendSwitch('proxy-server', 'direct://')
+app.commandLine.appendSwitch('proxy-bypass-list', '<local>;127.0.0.1;localhost;::1;*.localhost')
+app.commandLine.appendSwitch('no-proxy-server')
+
 installMacOsChromiumKeychainPromptGuard(app)
 
 function appRoot() {
@@ -264,6 +275,12 @@ function registerIpcHandlers() {
   registerHandler(ELECTRON_IPC_CHANNELS.runtimeHttpRequest, (_event, payload) =>
     performHttpRequest(payload as Parameters<typeof performHttpRequest>[0]),
   )
+  registerHandler(ELECTRON_IPC_CHANNELS.runtimeCheckServerHealth, (_event, serverUrl) =>
+    probeServerHealth(String(serverUrl)),
+  )
+  registerHandler(ELECTRON_IPC_CHANNELS.runtimeHttpRequest, (_event, payload) =>
+    performHttpRequest(payload as Parameters<typeof performHttpRequest>[0]),
+  )
   registerHandler(ELECTRON_IPC_CHANNELS.commandInvoke, (_event, payload) => handleCommandInvoke(payload))
   registerHandler(ELECTRON_IPC_CHANNELS.clipboardReadText, () => clipboard.readText())
   registerHandler(ELECTRON_IPC_CHANNELS.clipboardWriteText, (_event, payload) => clipboard.writeText(String(payload)))
@@ -413,7 +430,7 @@ app.whenReady().then(async () => {
   // attempts (#953 follow-up; also blocks chat streaming).
   try {
     await session.defaultSession.setProxy({
-      proxyRules: '',
+      proxyRules: 'direct://',
       proxyBypassRules: '<local>;127.0.0.1;localhost;::1;*.localhost',
     })
     await session.defaultSession.forceReloadProxyConfig()
