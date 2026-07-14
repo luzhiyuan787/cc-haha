@@ -1,0 +1,78 @@
+# .understandignore — patterns for files/dirs to exclude from analysis
+# Syntax: same as .gitignore (globs, # comments, ! negation, trailing / for dirs)
+# Lines below are suggestions — uncomment to activate.
+# Use ! prefix to force-include something excluded by defaults.
+#
+# Built-in defaults (always excluded unless negated):
+#   node_modules/, .git/, dist/, build/, obj/, *.lock, *.min.js, etc.
+#
+
+# --- From .gitignore (uncomment to exclude) ---
+
+# .env
+# .env.*
+# !.env.example
+# openspec
+# .DS_Store
+# .runtime/
+# extracted-natives/
+# .lark-attachments/
+# .tg-attachments/
+# .playwright-mcp/
+# .omx/
+# e2e-*.png
+# artifacts/
+# desktop/dist/
+# desktop/electron-dist/
+# desktop/build-artifacts/
+# desktop/src-tauri/binaries/
+# desktop/src-tauri/target/
+# desktop/src-tauri/gen/
+# desktop/package-lock.json
+# desktop/brand-assets/
+# .claude/
+# docs/superpowers/
+# .superpowers/
+# .tmp-*.log
+# /*.png
+# bug_attachments/
+# *.pem
+# *.key
+# *.p12
+# credentials*.json
+# *.tsbuildinfo
+# sidebar-snapshot.md
+# docs/.vitepress/dist
+# docs/.vitepress/cache
+# runtime/__pycache__
+# .codex-logs/
+# CLAUDE.md
+# .mavis/
+# .opencode/
+# graphify-out/
+
+# --- Detected directories (uncomment to exclude) ---
+
+# docs/
+# fixtures/
+# scripts/
+# tests/
+
+# --- Test file patterns (uncomment to exclude) ---
+
+# JS / TS
+# *.test.*
+# *.spec.*
+# *.snap
+# C# / .NET
+# **/*Tests.cs
+# **/*Test.cs
+# **/*Fixture.cs
+# **/*.Tests.csproj
+# Java / Kotlin
+# **/src/test/**
+# **/*Test.java
+# **/*IT.java
+# **/*Spec.kt
+# Go
+# **/*_test.go
