@@ -1,10 +1,20 @@
-import { api } from './client'
+import { api, type ApiRequestOptions } from './client'
+import type { SlashCommandOption } from '../types/slashCommand'
 import type { AgentTaskNotification } from '../types/chat'
-import type { SessionListItem, MessageEntry } from '../types/session'
+import type { LocalIndexStatus, SessionListItem, MessageEntry } from '../types/session'
 import type { PermissionMode } from '../types/settings'
 import type { TraceCallRecord, TraceSession } from '../types/trace'
 
-type SessionsResponse = { sessions: SessionListItem[]; total: number }
+export type SessionsResponse = {
+  sessions: SessionListItem[]
+  total: number
+  index?: LocalIndexStatus
+}
+export type PetSessionRuntimeStatus = 'waiting' | 'failed' | 'review' | 'running' | 'idle'
+export type SessionChatStatusResponse = {
+  state: 'idle' | 'thinking' | 'compacting' | 'tool_executing'
+  activityState: PetSessionRuntimeStatus
+}
 type MessagesResponse = {
   messages: MessageEntry[]
   taskNotifications?: AgentTaskNotification[]
@@ -62,6 +72,8 @@ export type RepositoryBranchInfo = {
   remoteRef?: string
   checkedOut: boolean
   worktreePath?: string
+  /** Commit the branch points at; absent on servers predating the field. */
+  commit?: string
 }
 export type RepositoryWorktreeInfo = {
   path: string
@@ -75,10 +87,23 @@ export type RepositoryContextResult = {
   repoName: string | null
   currentBranch: string | null
   defaultBranch: string | null
+  /** Commit `HEAD` resolves to; absent on servers predating the field. */
+  headCommit?: string | null
   dirty: boolean
   branches: RepositoryBranchInfo[]
   worktrees: RepositoryWorktreeInfo[]
   error?: string
+}
+export type CreateRepositoryBranchRequest = {
+  workDir: string
+  name: string
+  /** Branch the new one starts from, as named in `branches`. Defaults to HEAD. */
+  from?: string | null
+}
+export type CreateRepositoryBranchResult = {
+  branch: string
+  baseRef: string
+  context: RepositoryContextResult
 }
 export type SessionRewindResponse = {
   target: {
@@ -97,7 +122,22 @@ export type SessionRewindResponse = {
     insertions: number
     deletions: number
   }
+  restoreAvailable?: boolean
+  /**
+   * Tool names whose file effects the checkpoint could not capture (a writing
+   * shell command, a tool with no change extractor). Undo still works and still
+   * restores every file it lists — these are the changes it will leave behind.
+   */
+  unverifiedChangeSources?: string[]
+  /** What the executed rewind touched. Absent on dry-run previews. */
+  mode?: SessionRewindMode
 }
+
+/**
+ * `both` restores files and trims the transcript; `conversation` only trims,
+ * which stays possible even when the files cannot be restored.
+ */
+export type SessionRewindMode = 'both' | 'conversation'
 
 export type RecentProject = {
   projectPath: string
@@ -270,6 +310,13 @@ export type WorkspaceTreeResult = {
   error?: string
 }
 
+export type WorkspaceSearchResult = {
+  state: 'ok'
+  query: string
+  truncated: boolean
+  entries: WorkspaceTreeEntry[]
+}
+
 export type WorkspaceDiffResult = {
   state: 'ok' | 'missing' | 'not_git_repo' | 'error'
   path: string
@@ -282,6 +329,8 @@ export type SessionTurnCheckpoint = {
   conversation?: SessionRewindResponse['conversation']
   code: SessionRewindResponse['code']
   workDir?: string
+  restoreAvailable?: boolean
+  unverifiedChangeSources?: string[]
 }
 
 export type SessionTurnCheckpointsResponse = {
@@ -291,6 +340,22 @@ export type SessionTurnCheckpointsResponse = {
 export type TurnCheckpointDiffResult = WorkspaceDiffResult & {
   target?: SessionRewindResponse['target']
   workDir?: string
+}
+
+const gitInfoRequests = new Map<string, Promise<SessionGitInfo>>()
+
+function getSessionGitInfo(sessionId: string) {
+  const pending = gitInfoRequests.get(sessionId)
+  if (pending) return pending
+
+  const request = api.get<SessionGitInfo>(`/api/sessions/${sessionId}/git-info`)
+  const trackedRequest = request.finally(() => {
+    if (gitInfoRequests.get(sessionId) === trackedRequest) {
+      gitInfoRequests.delete(sessionId)
+    }
+  })
+  gitInfoRequests.set(sessionId, trackedRequest)
+  return trackedRequest
 }
 
 function buildWorkspacePath(
@@ -319,6 +384,10 @@ export const sessionsApi = {
 
   getMessages(sessionId: string) {
     return api.get<MessagesResponse>(`/api/sessions/${sessionId}/messages`)
+  },
+
+  getChatStatus(sessionId: string, signal?: AbortSignal) {
+    return api.get<SessionChatStatusResponse>(`/api/sessions/${sessionId}/chat/status`, { signal })
   },
 
   getTrace(sessionId: string) {
@@ -362,12 +431,14 @@ export const sessionsApi = {
     return api.get<RepositoryContextResult>(`/api/sessions/repository-context?${query.toString()}`)
   },
 
-  getGitInfo(sessionId: string) {
-    return api.get<SessionGitInfo>(`/api/sessions/${sessionId}/git-info`)
+  createRepositoryBranch(body: CreateRepositoryBranchRequest) {
+    return api.post<CreateRepositoryBranchResult>('/api/sessions/repository-branch', body)
   },
 
+  getGitInfo: getSessionGitInfo,
+
   getSlashCommands(sessionId: string) {
-    return api.get<{ commands: Array<{ name: string; description: string; argumentHint?: string }> }>(`/api/sessions/${sessionId}/slash-commands`)
+    return api.get<{ commands: SlashCommandOption[] }>(`/api/sessions/${sessionId}/slash-commands`)
   },
 
   getInspection(sessionId: string, options?: { includeContext?: boolean; timeout?: number; contextOnly?: boolean }) {
@@ -392,6 +463,11 @@ export const sessionsApi = {
     return api.get<WorkspaceTreeResult>(buildWorkspacePath(sessionId, 'tree', workspacePath))
   },
 
+  searchWorkspace(sessionId: string, query: string) {
+    const params = new URLSearchParams({ query })
+    return api.get<WorkspaceSearchResult>(`/api/sessions/${sessionId}/workspace/search?${params}`)
+  },
+
   getWorkspaceFile(sessionId: string, workspacePath: string) {
     return api.get<WorkspaceReadFileResult>(buildWorkspacePath(sessionId, 'file', workspacePath))
   },
@@ -400,8 +476,11 @@ export const sessionsApi = {
     return api.get<WorkspaceDiffResult>(buildWorkspacePath(sessionId, 'diff', workspacePath))
   },
 
-  getTurnCheckpoints(sessionId: string) {
-    return api.get<SessionTurnCheckpointsResponse>(`/api/sessions/${sessionId}/turn-checkpoints`)
+  getTurnCheckpoints(sessionId: string, options?: ApiRequestOptions) {
+    return api.get<SessionTurnCheckpointsResponse>(
+      `/api/sessions/${sessionId}/turn-checkpoints`,
+      options,
+    )
   },
 
   getTurnCheckpointDiff(
@@ -426,6 +505,7 @@ export const sessionsApi = {
     userMessageIndex?: number
     expectedContent?: string
     dryRun?: boolean
+    mode?: SessionRewindMode
   }) {
     return api.post<SessionRewindResponse>(`/api/sessions/${sessionId}/rewind`, body, {
       timeout: 60_000,

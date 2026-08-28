@@ -1,10 +1,13 @@
 export type WebviewBounds = { x: number; y: number; width: number; height: number }
 
-export function computeWebviewBounds(rect: Pick<DOMRect, 'left' | 'top' | 'width' | 'height'>): WebviewBounds {
+export function computeWebviewBounds(
+  rect: Pick<DOMRect, 'left' | 'top' | 'width' | 'height'>,
+  appZoom = 1,
+): WebviewBounds {
   return {
-    x: Math.round(rect.left),
-    y: Math.round(rect.top),
-    width: Math.max(0, Math.round(rect.width)),
-    height: Math.max(0, Math.round(rect.height)),
+    x: rect.left * appZoom,
+    y: rect.top * appZoom,
+    width: Math.max(0, rect.width * appZoom),
+    height: Math.max(0, rect.height * appZoom),
   }
 }

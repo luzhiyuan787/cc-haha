@@ -1,180 +1,121 @@
+---
+title: IM 接入
+nav_title: 总览
+description: 把飞书、Telegram、微信、钉钉或 WhatsApp 的私聊接到桌面端，用手机继续同一条会话。
+order: 0
+---
+
 # IM 接入
 
-> 当前可用的 IM 接入方案总览。  
-> 如果你只是想把微信、钉钉、WhatsApp、Telegram 或飞书接进来，从这篇开始。
+桌面端跑着的会话，可以接到你手机上的 IM 里。绑定之后，在飞书、Telegram、微信、钉钉或 WhatsApp 的私聊里发一句话，就是在驱动本机的 Claude Code：出门前让它跑一个长任务，路上用手机看进度、批权限、换项目。
 
-## 当前方案是什么
+对话对象是你自己绑定的机器人或账号，消息只经过你本机的桌面端，没有中间服务器托管你的代码。
 
-当前仓库里的 IM 接入，已经不是早期文档里设想的 “IM Gateway / MCP Channel 插件” 主路径。
+![设置里的 IM 接入页，顶部是配对管理，下面是五个平台 Tab](../images/app/zh-CN/settings-im.webp)
 
-现在真实在跑的是一条更轻的链路：
+## 接进来之后能做什么
 
-```mermaid
-flowchart TD
-    A["Desktop Webapp<br/>Settings -> IM 接入"] --> B["GET / PUT /api/adapters"]
-    B --> C["Desktop Server<br/>配置接口"]
-    C --> D["本地配置持久化"]
-    D --> E["~/.claude/adapters.json"]
+- **接着聊同一条会话**：手机上发的消息进的是本机的 Claude Code 会话，改文件、跑命令、读代码都在你电脑上真实发生。
+- **换项目**：发 `/projects` 列出最近用过的项目，回复编号或路径就切过去；`/new` 直接开一条新会话。
+- **批权限**：Claude 要写文件或执行高风险命令时，会把请求推到 IM 里。飞书和钉钉是可点的卡片，Telegram 是按钮，微信和 WhatsApp 回复一条文本命令。
+- **看状态、叫停**：`/status` 看当前项目、模型和运行状态，`/stop` 中断正在跑的这一轮。
 
-    E --> F["微信 / 钉钉 / WhatsApp / Telegram / 飞书 Adapter 进程"]
-    F --> G["加载平台配置"]
-    F --> H["校验配对与授权"]
-    F --> I["读取 / 写入会话映射"]
-    I --> J["~/.claude/adapter-sessions.json"]
+前提是桌面端一直开着。IM 侧只是遥控器，真正干活的是你的电脑。
 
-    F --> K{"当前 chatId<br/>是否已有 session?"}
-    K -->|有历史映射| L["复用已有 sessionId"]
-    K -->|无历史映射| M["解析工作目录<br/>defaultProjectDir 或当前用户工作目录"]
-    M --> N["POST /api/sessions<br/>创建新 session"]
+## 选哪个平台
 
-    N --> Q["获得 sessionId"]
-    L --> R["连接 /ws/:sessionId"]
-    Q --> R
+五个平台的能力是同一套，差别在接入成本和审批体验。
 
-    R --> S["adapters/common/ws-bridge.ts"]
-    S --> T["Desktop Server"]
-    T --> U["Claude Code session / CLI 子进程"]
+| 平台 | 怎么接 | 适合谁 | 已知限制 |
+|---|---|---|---|
+| 飞书 | 点「一键创建飞书机器人」用官方模板建一个，回填 App ID 和 App Secret | 国内团队，想要点按钮就能批权限 | 只处理单聊，不处理群聊；改机器人菜单要去开放平台发版本 |
+| Telegram | 找 `@BotFather` 要一个 Bot Token，粘进设置页 | 能连上 Telegram 的个人用户，接入最快 | 只处理私聊；国内网络下需要自己解决连通性 |
+| 微信 | 在设置页扫码登录机器人账号 | 只想用微信、不愿再装一个 App | 只处理私聊；权限审批只能回复文本命令 |
+| 钉钉 | 在设置页扫码授权，Client ID 和 Secret 自动写入 | 国内企业，钉钉是主力办公工具 | 只处理单聊；要卡片审批得额外配一个模板 ID |
+| WhatsApp | 用手机 WhatsApp 的「已关联设备」扫码 | 海外用户 | 走个人号的 Web 登录，不是官方 Cloud API；只处理个人私聊 |
 
-    U --> V["流式消息 / 权限请求 / 状态事件"]
-    V --> S
-    S --> F
-    F --> W["微信 / 钉钉 / WhatsApp / Telegram / 飞书用户"]
+拿不定主意就先接 Telegram 或飞书，两者的权限审批体验最好。
+
+## 配对流程
+
+五个平台的绑定分两层：先让桌面端拿到平台凭据，再让你这个 IM 账号本人通过配对码获得授权。第二层所有平台都一样。
+
+1. 打开「设置」→「IM 接入」。
+2. 在下方的平台 Tab 里完成绑定：飞书和 Telegram 填凭据，微信、钉钉、WhatsApp 扫码。
+3. 在「默认项目」里挑一个目录。
+4. 点「保存」。
+5. 回到顶部的「配对管理」，点「生成配对码」，拿到一枚 6 位码。
+6. 在对应 IM 里私聊你的机器人，把这 6 位码发过去。
+7. 看到配对成功提示后，直接发消息就是在跟 Claude Code 对话。
+
+配对码 60 分钟内有效，只能用一次，重新生成后旧码立刻作废。同一枚码是平台无关的，发到哪个平台就绑哪个平台的账号。同一个用户 5 分钟内连续输错 5 次会被限流。
+
+生成配对码和扫码绑定都会立即写入本机配置，不需要再点「保存」；App ID、Bot Token、「允许的用户」和「默认项目」这类手填内容才需要。
+
+配对成功的账号会出现在「已配对用户」列表里，点右侧的「解绑」即可撤销，被解绑的人要重新发一枚新码。
+
+## 默认项目决定它在哪干活
+
+「默认项目」是新建 IM 会话的工作目录。填了它，手机上发的第一句话就直接在这个目录下开会话；留空的话，机器人会先把最近用过的项目列出来让你选。
+
+同一个 IM 聊天窗口后续的消息会复用同一条会话，桌面端重启后也能接回去。想换目录发 `/new`，想清空上下文但保留项目发 `/clear`。
+
+## 允许访问的项目目录决定它能碰哪些项目
+
+「默认项目」只决定新会话开在哪，**不是**访问边界。真正的边界是「允许访问的项目目录」：机器人只能列出、打开并在这些目录内的项目里开会话，`/projects`、`/sessions` 和按名字、绝对路径选项目都受它约束。
+
+留空就是默认值——你的主目录（如果「默认项目」是主目录之外的某个具体项目目录，也一并包含）。绝大多数人不需要动它。想收紧到某几个目录，就在设置里把它们加进列表。
+
+配置写在 `~/.claude/adapters.json`，也可以按平台单独收紧：
+
+```json
+{
+  "allowedProjectRoots": ["~/work", "~/side"],
+  "whatsapp": { "allowedProjectRoots": ["~/work/sandbox"] }
+}
 ```
 
-可以把这条链路理解成四层：
+平台级配置**替换**（不是叠加）全局配置：上面这份配置里 WhatsApp 只能碰 `~/work/sandbox`，其余平台是 `~/work` 和 `~/side`。桌面端设置界面改的是全局那一份，某个平台单独配过之后，界面上的改动就不会影响它了。
 
-- 配置层：桌面端 webapp 负责填写平台凭据、默认项目和配对码管理
-- 存储层：本地服务端把配置写入 `~/.claude/adapters.json`
-- 适配层：微信 / 钉钉 / WhatsApp / Telegram / 飞书 adapter 进程负责接 IM 平台、做授权检查、恢复或创建会话
-- 会话层：adapter 通过 HTTP 创建 session，再通过 WebSocket 把 IM 消息桥接到 Claude Code 会话
+独立运行 adapter（不走桌面端）时也可以用 `ADAPTER_ALLOWED_PROJECT_ROOTS` 环境变量，多个目录用路径分隔符隔开（macOS / Linux 是 `:`，Windows 是 `;`）。这个环境变量比配置文件里的两层都优先。
 
-## 用户怎么用
+几条边界规则：
 
-### 1. 在 Desktop Webapp 里配置
+- 目录必须是已存在的绝对路径（`~` 会展开）。写不存在的路径会被忽略并打日志；一个都解析不出来时回退到默认值，而不是把机器人锁死。
+- 默认值不会自动继承 `/` 或 `/Users` 这类目录。桌面端以 GUI 方式启动时 sidecar 的工作目录是 `/`，直接拿来当边界等于没有边界。
+- 「默认项目」如果落在允许范围之外，新会话会开在列表里第一个允许的目录，并打一条日志——这样 `/new` 不会因为两处配置不一致而失败。
 
-打开桌面端设置页的 `IM 接入` 标签，填写：
+配对仍然是第一道关：没配对的人根本发不了命令，这份目录列表是在此之上的第二道防线。注意主目录里也包含 `~/.claude`、`~/.ssh` 这些敏感目录，需要更强隔离就显式收紧到具体的项目目录。
 
-- `serverUrl`
-- `defaultProjectDir`
-- 微信 / 钉钉 / WhatsApp 扫码绑定，或填写 Telegram / 飞书各自的凭据
-- 可选 `allowedUsers`
+## 通用命令
 
-这里的配置会通过 `GET /api/adapters` 和 `PUT /api/adapters` 读写到 `~/.claude/adapters.json`。
+各平台的入口略有差异（飞书可以把命令配成机器人菜单），但这几条到处都能用：
 
-### 2. 生成配对码
+- `/help` — 列出当前可用命令
+- `/status` — 当前项目、模型、运行状态
+- `/projects` — 列出最近项目并切换
+- `/new` — 开一条新会话，可带项目编号或路径
+- `/clear` — 清空上下文，保留项目绑定
+- `/stop` — 停止本轮生成
 
-配对也在同一个设置页完成：
+微信、钉钉、飞书还支持中文别名，例如 `帮助`、`状态`、`项目列表`、`新会话`、`清空`、`停止`。
 
-- 点击“生成配对码”
-- 前端生成 6 位码并写入 `pairing.code / expiresAt / createdAt`
-- 码有效期 60 分钟
-- 配对成功后立即失效
+## 安全须知
 
-配对码是平台无关的，同一个码可以在微信、钉钉、WhatsApp、Telegram 或飞书私聊里使用一次。
+::: warning 这是一把能改你电脑的遥控器
+配对成功的 IM 账号可以让 Claude 在你本机读写文件、执行命令。只把配对码发给你自己，别在群里贴，也别把机器人凭据提交进仓库。
+:::
 
-微信、钉钉和 WhatsApp 的“扫码绑定”只负责把机器人或账号凭据写到本机；具体 IM 用户仍然需要发送配对码，或被加入 `allowedUsers`。
+授权规则是「允许的用户」加已配对用户取并集，两者都为空时一律拒绝。扫码绑定只是让桌面端拿到账号凭据，不等于放行这个账号的所有联系人。
 
-### 3. 启动对应 Adapter 进程
+平台凭据、配对状态和授权名单保存在 `~/.claude/adapters.json`，聊天窗口到会话的映射保存在 `~/.claude/adapter-sessions.json`。这两个文件都在本机，含有可直接操控你机器的凭据，不要外传。设置页读回配置时敏感字段会被打码。
 
-发布版桌面端会在本地 server 启动后自动拉起 adapter sidecar，并在保存凭据、扫码绑定或解绑后重启 adapter 让新配置生效。本地开发或单独调试 adapter 时可以手动启动：
+想在手机浏览器里获得完整界面而不只是聊天，看[H5 访问](../desktop/remote.md)。
 
-```bash
-cd adapters
-bun install
-bun run telegram
-# 或
-bun run feishu
-# 或
-bun run wechat
-# 或
-bun run dingtalk
-# 或
-bun run whatsapp
-```
+## 分平台教程
 
-### 4. 在 IM 里私聊 Bot
-
-- 未配对用户：先把配对码发给 bot
-- 已配对用户：直接发送自然语言消息
-- 没有默认项目时：bot 会使用当前用户工作目录作为新会话目录
-- 后续消息会复用同一个 Claude session
-
-## 配置和状态分别存哪
-
-### `~/.claude/adapters.json`
-
-保存平台配置和授权状态，包括：
-
-- `serverUrl`
-- `defaultProjectDir`
-- `pairing`
-- `telegram`
-- `feishu`
-- `wechat`
-- `dingtalk`
-- `whatsapp`
-
-其中：
-
-- 敏感字段会在 API 返回时被脱敏
-- 配对码也会被 `/api/adapters` 返回值掩码为 `******`
-
-### `~/.claude/adapter-sessions.json`
-
-保存 IM chat 到 Claude session 的映射：
-
-- `chatId`
-- `sessionId`
-- `workDir`
-- `updatedAt`
-
-这让 bot 重启后仍然能接回原来的会话。
-
-## 当前安全模型
-
-授权规则是：
-
-- `allowedUsers` 和 `pairedUsers` 取并集
-- 两者都为空时，默认拒绝访问
-- 配对码为 6 位安全字符集
-- 配对码一次性使用
-- 同一用户 5 分钟内最多失败 5 次
-
-这和旧 README 里“`allowedUsers` 为空就允许所有人”的说法已经不同，旧说法已过时。
-
-## 会话行为
-
-Adapter 不是直接把消息丢给一个全局 Claude 进程，而是：
-
-1. 先用 `POST /api/sessions` 创建 session
-2. 再用 `ws://.../ws/:sessionId` 建立桥接
-3. 把 IM 消息转成：
-   - `user_message`
-   - `permission_response`
-   - `stop_generation`
-4. 把服务端流式消息再格式化回 IM
-
-如果没有 `defaultProjectDir`，Adapter 会优先使用当前用户工作目录作为新 session 的工作目录，避免扫码绑定后还必须先在桌面端打开项目。
-
-## 平台差异
-
-- Telegram：`grammy`，按钮审批，纯私聊模式
-- 飞书：`@larksuiteoapi/node-sdk`，长连接事件订阅，交互卡片审批，当前只处理 `p2p`
-- 微信：扫码绑定账号，`getupdates` 长轮询接收消息，文本命令审批使用 `/allow <requestId>` / `/deny <requestId>`
-- 钉钉：扫码给本机写入 Stream 凭据，`dingtalk-stream` 长连接收发消息，配对码绑定用户后开始聊天
-- WhatsApp：`@whiskeysockets/baileys` 连接 WhatsApp Web，扫码写入本机 auth state，当前只处理个人私聊，文本命令审批
-
-分别看：
-
-- [微信接入](./wechat.md)
-- [钉钉接入](./dingtalk.md)
-- [WhatsApp 接入](./whatsapp.md)
-- [Telegram 接入](./telegram.md)
-- [飞书接入](./feishu.md)
-
-## 和 `docs/channel/` 的关系
-
-`docs/channel/` 主要是 Claude Code 原生 Channel/MCP 体系的源码研究资料，不是这个仓库当前推荐的 IM 接入方式。
-
-如果你是要“把 bot 真跑起来”，看本目录。  
-如果你是要研究 Claude Code 原始 Channel 设计，再去看 `docs/channel/`。
+- [飞书](./feishu.md) — 一键模板建机器人，卡片审批
+- [Telegram](./telegram.md) — BotFather 拿 Token，按钮审批
+- [微信](./wechat.md) — 扫码绑定账号，文本命令审批
+- [钉钉](./dingtalk.md) — 扫码授权，AI Card 流式输出
+- [WhatsApp](./whatsapp.md) — 个人号关联设备，文本命令审批

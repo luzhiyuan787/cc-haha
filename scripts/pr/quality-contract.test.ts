@@ -2,21 +2,46 @@ import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 
 describe('feature quality contract', () => {
-  test('keeps the agent-facing implementation contract explicit', () => {
+  test('keeps root agent guidance small, high-signal, and layered', () => {
     const agents = readFileSync('AGENTS.md', 'utf8')
 
-    expect(agents).toContain('## Feature Quality Contract')
-    expect(agents).toContain('## Persistent Storage Compatibility')
-    expect(agents).toContain('Any change to local JSON, `localStorage`, or app config persistence formats must ship with a forward migration')
-    expect(agents).toContain('`~/.claude/settings.json` is user-owned shared state')
-    expect(agents).toContain('persistence upgrade gate')
-    expect(agents).toContain('Production code changes under `desktop/src`, `src/server`, `src/tools`, `src/utils`, or `adapters` must include a same-area test file')
-    expect(agents).toContain('Coverage is part of PR readiness, not an afterthought.')
-    expect(agents).toContain('changed executable production line must meet the changed-line coverage gate')
-    expect(agents).toContain('E2E is required when the feature crosses process boundaries')
-    expect(agents).toContain('AI agents must include this evidence')
-    expect(agents).toContain('Unified local entrypoint: `bun run verify`')
-    expect(agents).toContain('If `bun run verify` is intentionally run and fails, do not stop at reporting the failure')
+    // Codex has a 32 KiB default budget for the complete instruction chain.
+    // Keep the root well below that limit so nested guidance has room to load.
+    expect(Buffer.byteLength(agents)).toBeLessThan(16 * 1024)
+    expect(agents).toContain('## Start Here')
+    expect(agents).toContain('## Repository Map')
+    expect(agents).toContain('## Verification')
+    expect(agents).toContain('## User-State Safety')
+    expect(agents).toContain('## Handoff')
+    expect(agents).toContain('read the nested `AGENTS.md` in that directory')
+    expect(agents).toContain('Tool access is capability, not authorization.')
+    expect(agents).toContain('same-area regression test')
+    expect(agents).toContain('`bun run check:impact`')
+    expect(agents).toContain('`bun run verify`')
+    expect(agents).toContain('Required PR checks must be deterministic')
+    expect(agents).toContain('finding credentials on the machine is not authorization')
+    expect(agents).toContain('`bun run check:persistence-upgrade`')
+    expect(agents).toContain('`~/.claude/settings.json` as user-owned shared state')
+    expect(agents).toContain('commands actually run and their observed results')
+  })
+
+  test('keeps specialized agent guidance next to the affected code', () => {
+    const policy = readFileSync('.github/AGENTS.md', 'utf8')
+    const runtime = readFileSync('src/AGENTS.md', 'utf8')
+    const desktop = readFileSync('desktop/AGENTS.md', 'utf8')
+    const adapters = readFileSync('adapters/AGENTS.md', 'utf8')
+    const docs = readFileSync('docs/AGENTS.md', 'utf8')
+
+    expect(policy).toContain('`scripts/pr/change-policy.ts` is the source of truth')
+    expect(policy).toContain('`pull_request_target`')
+    expect(policy).toContain('`pr-quality-gate`')
+    expect(runtime).toContain('`bun run check:server`')
+    expect(runtime).toContain('temporary `HOME`/`CLAUDE_CONFIG_DIR`')
+    expect(runtime).toContain('`bun run check:provider-contract`')
+    expect(desktop).toContain('`bun run check:desktop`')
+    expect(desktop).toContain('`bun run check:chat-contract`')
+    expect(adapters).toContain('`bun run check:adapters`')
+    expect(docs).toContain('`bun run check:docs`')
   })
 
   test('keeps PR authors accountable for tests, coverage, E2E, and risk', () => {
@@ -32,19 +57,40 @@ describe('feature quality contract', () => {
     expect(template).toContain('I added or updated same-area tests')
   })
 
+  test('keeps quality policy and cross-process boundaries maintainer-owned', () => {
+    const codeowners = readFileSync('.github/CODEOWNERS', 'utf8')
+
+    expect(codeowners).toContain('/.github/workflows/ @NanmiCoder')
+    expect(codeowners).toContain('/AGENTS.md @NanmiCoder')
+    expect(codeowners).toContain('**/AGENTS.md @NanmiCoder')
+    expect(codeowners).toContain('/CONTRIBUTING.md @NanmiCoder')
+    expect(codeowners).toContain('/scripts/pr/ @NanmiCoder')
+    expect(codeowners).toContain('/scripts/quality-gate/ @NanmiCoder')
+    expect(codeowners).toContain('/desktop/src/api/websocket* @NanmiCoder')
+    expect(codeowners).toContain('/desktop/src/lib/persistenceMigrations* @NanmiCoder')
+    expect(codeowners).toContain('/src/server/services/conversationService* @NanmiCoder')
+    expect(codeowners).toContain('/src/server/proxy/ @NanmiCoder')
+    expect(codeowners).toContain('/src/server/ws/ @NanmiCoder')
+    expect(codeowners).toContain('/src/services/openaiAuth/ @NanmiCoder')
+    expect(codeowners).toContain('/src/utils/model/ @NanmiCoder')
+  })
+
   test('keeps the one-command verification entrypoint documented', () => {
     const packageJson = JSON.parse(readFileSync('package.json', 'utf8')) as {
       scripts?: Record<string, string>
     }
     const prePushHook = readFileSync('scripts/git-hooks/pre-push', 'utf8')
-    const contributing = readFileSync('docs/guide/contributing.md', 'utf8')
-    const englishContributing = readFileSync('docs/en/guide/contributing.md', 'utf8')
+    const contributing = readFileSync('docs/internals/contributing.md', 'utf8')
+    const englishContributing = readFileSync('docs/en/internals/contributing.md', 'utf8')
     const rootContributing = readFileSync('CONTRIBUTING.md', 'utf8')
 
     expect(packageJson.scripts?.verify).toBe('bun run quality:pr')
     expect(packageJson.scripts?.['quality:verify']).toBe('bun run quality:pr')
     expect(packageJson.scripts?.['quality:push']).toBe('bun run quality:gate --mode pr --skip coverage')
     expect(packageJson.scripts?.['check:persistence-upgrade']).toBe('bun run scripts/quality-gate/persistence-upgrade.ts')
+    expect(packageJson.scripts?.['check:provider-contract']).toBe('bun run scripts/pr/run-provider-contract-tests.ts')
+    expect(packageJson.scripts?.['check:chat-contract']).toBe('bun run scripts/pr/run-chat-contract-tests.ts')
+    expect(packageJson.scripts?.['check:policy']).toContain('bun test ./scripts/')
     expect(packageJson.scripts?.['check:native']).toContain('electron:package:dir')
     expect(packageJson.scripts?.['check:native']).toContain('test:package-smoke:current')
     expect(packageJson.scripts?.['test:package-smoke:current']).toBe('bun run scripts/quality-gate/package-smoke/current.ts')
@@ -79,14 +125,83 @@ describe('feature quality contract', () => {
     expect(buildSidecars).toContain("process.arch")
   })
 
+  test('keeps stateful server tests deterministic', () => {
+    const serverRunner = readFileSync('scripts/pr/run-server-tests.ts', 'utf8')
+    const providerRunner = readFileSync('scripts/pr/run-provider-contract-tests.ts', 'utf8')
+    const chatRunner = readFileSync('scripts/pr/run-chat-contract-tests.ts', 'utf8')
+    const testEnvironment = readFileSync('scripts/pr/test-environment.ts', 'utf8')
+    const coverageRunner = readFileSync('scripts/quality-gate/coverage.ts', 'utf8')
+
+    expect(serverRunner).toContain("'--max-concurrency=1'")
+    expect(serverRunner).toContain("'--timeout=20000'")
+    expect(serverRunner).toContain('TEST_PROCESS_CONCURRENCY = 4')
+    expect(serverRunner).toContain('TEST_FILE_PATTERN')
+    expect(serverRunner).toContain("'--no-env-file'")
+    expect(serverRunner).toContain('createSandboxedTestEnvironment')
+    expect(serverRunner).toContain('rootBunTestFilter(file)')
+    expect(serverRunner).toContain('evidenceComplete')
+    expect(serverRunner).toContain('reportedFiles === 1')
+    expect(serverRunner).toContain('passedTests + failedTests > 0')
+    expect(testEnvironment).toContain('CLAUDE_CONFIG_DIR:')
+    expect(testEnvironment).toContain("BUN_OPTIONS: '--no-env-file'")
+    expect(coverageRunner).toContain('TEST_FILE_PATTERN')
+    expect(coverageRunner).toContain("'--no-env-file'")
+    expect(coverageRunner).toContain('createSandboxedTestEnvironment')
+    expect(coverageRunner).toContain('serverFiles.map(rootBunTestFilter)')
+    expect(coverageRunner).toContain("correctness is enforced by check:server's per-file sandboxed test processes")
+    expect(coverageRunner).toContain('rootCoverageAvailable')
+    expect(coverageRunner).toContain('rootTestDiscoveryComplete')
+    expect(coverageRunner).toContain("id: 'root-runtime'")
+    for (const contractRunner of [providerRunner, chatRunner]) {
+      expect(contractRunner).toContain("'--no-env-file'")
+      expect(contractRunner).toContain('createSandboxedTestEnvironment')
+      expect(contractRunner).toContain('rootBunTestFilter')
+    }
+  })
+
+  test('keeps quality gate lanes that boot the real server out of the developer config', () => {
+    // Baseline, desktop smoke, and provider smoke all spawn src/server/index.ts.
+    // That server resolves transcripts, session index, diagnostics, and settings
+    // from CLAUDE_CONFIG_DIR, so inheriting the parent environment makes a QA run
+    // read and write the developer's real ~/.claude. Desktop smoke additionally
+    // switched the global permission mode to bypassPermissions.
+    const laneSources = {
+      'scripts/quality-gate/baseline/execute.ts': readFileSync('scripts/quality-gate/baseline/execute.ts', 'utf8'),
+      'scripts/quality-gate/desktop-smoke/execute.ts': readFileSync('scripts/quality-gate/desktop-smoke/execute.ts', 'utf8'),
+      'scripts/quality-gate/provider-smoke/execute.ts': readFileSync('scripts/quality-gate/provider-smoke/execute.ts', 'utf8'),
+    }
+
+    for (const [path, source] of Object.entries(laneSources)) {
+      const serverSpawns = source.split('\n').filter((line) => line.includes("'src/server/index.ts'"))
+      expect(serverSpawns.length, `${path} should still spawn the real server`).toBeGreaterThan(0)
+      expect(source, `${path} must sandbox the server it spawns`).toContain('createQualityGateSandbox')
+      expect(source, `${path} must pass the sandbox environment to the server`).toContain('...sandbox.env')
+      expect(source, `${path} must not inherit the developer environment`).not.toContain('...process.env,\n      SERVER_PORT')
+      expect(source, `${path} must release the sandbox`).toContain('sandbox.cleanup()')
+      expect(
+        source.includes('applyUserStateGuard') || source.includes('detectUserStateMutations'),
+        `${path} must fail the lane when user state was written`,
+      ).toBe(true)
+    }
+
+    const sandbox = readFileSync('scripts/quality-gate/sandbox.ts', 'utf8')
+    expect(sandbox).toContain('createSandboxedTestEnvironment')
+    expect(sandbox).toContain('GUARDED_USER_STATE_PATHS')
+    expect(sandbox).toContain("'settings.json'")
+    expect(sandbox).toContain("'cc-haha/providers.json'")
+  })
+
   test('keeps general AI coding tools pointed at the same quality bar', () => {
     const instructions = readFileSync('.github/copilot-instructions.md', 'utf8')
 
-    expect(instructions).toContain('Follow the repository contract in `AGENTS.md`')
+    expect(instructions).toContain('Follow the root `AGENTS.md` and the nearest nested `AGENTS.md`')
     expect(instructions).toContain('Add same-area tests with the production change')
     expect(instructions).toContain('Preserve or improve the coverage ratchet')
     expect(instructions).toContain('changed-line coverage threshold')
-    expect(instructions).toContain('E2E or agent-browser smoke')
-    expect(instructions).toContain('include changed files, tests added, coverage report path')
+    expect(instructions).toContain('E2E or desktop UI smoke')
+    expect(instructions).toContain('Ad-hoc browser automation')
+    expect(instructions).toContain('Provider/auth/runtime-env/model-window/proxy changes require offline `bun run check:provider-contract`')
+    expect(instructions).toContain('Live smoke is trusted-maintainer evidence only and requires explicit authorization')
+    expect(instructions).toContain('include changed files, tests added, commands actually run with pass/fail counts')
   })
 })

@@ -33,9 +33,11 @@ import {
   isTeammate,
 } from '../../utils/teammate.js'
 import {
+  createMailboxMessageId,
   createShutdownApprovedMessage,
   createShutdownRejectedMessage,
   createShutdownRequestMessage,
+  isStructuredProtocolMessage,
   writeToMailbox,
 } from '../../utils/teammateMailbox.js'
 import { resumeAgentBackground } from '../AgentTool/resumeAgent.js'
@@ -216,6 +218,8 @@ async function handleBroadcast(
   }
 
   const senderColor = getTeammateColor()
+  const messageId = createMailboxMessageId()
+  const timestamp = new Date().toISOString()
 
   const recipients: string[] = []
   for (const member of teamFile.members) {
@@ -239,10 +243,11 @@ async function handleBroadcast(
     await writeToMailbox(
       recipientName,
       {
+        id: messageId,
         from: senderName,
         text: content,
         summary,
-        timestamp: new Date().toISOString(),
+        timestamp,
         color: senderColor,
       },
       teamName,
@@ -665,6 +670,14 @@ export const SendMessageTool: Tool<InputSchema, SendMessageToolOutput> =
         return { result: true }
       }
       if (typeof input.message === 'string') {
+        if (isStructuredProtocolMessage(input.message)) {
+          return {
+            result: false,
+            message:
+              'reserved team protocol messages must use the structured message path',
+            errorCode: 9,
+          }
+        }
         if (!input.summary || input.summary.trim().length === 0) {
           return {
             result: false,

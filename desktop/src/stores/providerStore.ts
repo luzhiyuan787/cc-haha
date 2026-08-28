@@ -11,12 +11,21 @@ import {
   OPENAI_OFFICIAL_DEFAULT_MODEL_ID,
   OPENAI_OFFICIAL_PROVIDER_ID,
 } from '../constants/openaiOfficialProvider'
+import {
+  GROK_OFFICIAL_DEFAULT_MODEL_ID,
+  GROK_OFFICIAL_PROVIDER_ID,
+} from '../constants/grokOfficialProvider'
+import { BUNDLED_PROVIDER_PRESETS } from '../config/providerPresets'
 import type {
   SavedProvider,
   CreateProviderInput,
   UpdateProviderInput,
   TestProviderConfigInput,
   ProviderTestResult,
+  CcSwitchScanResult,
+  CcSwitchImportResult,
+  ProviderModelsInput,
+  ProviderModelsResult,
 } from '../types/provider'
 import type { ProviderPreset } from '../types/providerPreset'
 import type { RuntimeSelection } from '../types/runtime'
@@ -28,19 +37,20 @@ type ProviderStore = {
   hasLoadedProviders: boolean
   presets: ProviderPreset[]
   isLoading: boolean
-  isPresetsLoading: boolean
   error: string | null
 
   fetchProviders: () => Promise<void>
-  fetchPresets: () => Promise<void>
   createProvider: (input: CreateProviderInput) => Promise<SavedProvider>
   updateProvider: (id: string, input: UpdateProviderInput) => Promise<SavedProvider>
   deleteProvider: (id: string) => Promise<void>
   reorderProviders: (orderedIds: string[]) => Promise<void>
   activateProvider: (id: string) => Promise<void>
   activateOfficial: () => Promise<void>
-  testProvider: (id: string, overrides?: { baseUrl?: string; modelId?: string; apiFormat?: string; authStrategy?: string }) => Promise<ProviderTestResult>
+  testProvider: (id: string, overrides?: { modelId?: string }) => Promise<ProviderTestResult>
   testConfig: (input: TestProviderConfigInput) => Promise<ProviderTestResult>
+  scanCcSwitch: () => Promise<CcSwitchScanResult>
+  importCcSwitch: (sourceIds: string[]) => Promise<CcSwitchImportResult>
+  fetchModels: (input: ProviderModelsInput) => Promise<ProviderModelsResult>
 }
 
 function defaultProviderOrder(providers: SavedProvider[]): string[] {
@@ -160,9 +170,8 @@ export const useProviderStore = create<ProviderStore>((set, get) => ({
   providerOrder: [...BUILT_IN_PROVIDER_IDS],
   activeId: null,
   hasLoadedProviders: false,
-  presets: [],
+  presets: BUNDLED_PROVIDER_PRESETS,
   isLoading: false,
-  isPresetsLoading: false,
   error: null,
 
   fetchProviders: async () => {
@@ -181,16 +190,6 @@ export const useProviderStore = create<ProviderStore>((set, get) => ({
         isLoading: false,
         error: err instanceof Error ? err.message : String(err),
       })
-    }
-  },
-
-  fetchPresets: async () => {
-    set({ isPresetsLoading: true, error: null })
-    try {
-      const { presets } = await providersApi.presets()
-      set({ presets, isPresetsLoading: false })
-    } catch (err) {
-      set({ isPresetsLoading: false, error: err instanceof Error ? err.message : String(err) })
     }
   },
 
@@ -268,6 +267,11 @@ export const useProviderStore = create<ProviderStore>((set, get) => ({
       await settings.fetchAll()
       return
     }
+    if (id === GROK_OFFICIAL_PROVIDER_ID) {
+      await settings.setModel(GROK_OFFICIAL_DEFAULT_MODEL_ID)
+      await settings.fetchAll()
+      return
+    }
 
     const provider = get().providers.find((p) => p.id === id)
     if (!provider) return
@@ -292,5 +296,23 @@ export const useProviderStore = create<ProviderStore>((set, get) => ({
   testConfig: async (input) => {
     const { result } = await providersApi.testConfig(input)
     return result
+  },
+
+  scanCcSwitch: async () => {
+    return providersApi.scanCcSwitch()
+  },
+
+  importCcSwitch: async (sourceIds) => {
+    const result = await providersApi.importCcSwitch(sourceIds)
+    // Imported providers only reach the list through the shared refresh path,
+    // so the order and the active id stay whatever the server decided.
+    if (result.imported.length > 0) {
+      await get().fetchProviders()
+    }
+    return result
+  },
+
+  fetchModels: async (input) => {
+    return providersApi.fetchModels(input)
   },
 }))

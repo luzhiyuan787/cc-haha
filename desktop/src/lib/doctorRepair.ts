@@ -1,11 +1,21 @@
-import { doctorApi, type DoctorReportRepairResponse } from '../api/doctor'
+import { doctorApi, type DoctorReport } from '../api/doctor'
+import {
+  FOLLOW_SYSTEM_THEME_STORAGE_KEY,
+  LIGHT_THEME_STORAGE_KEY,
+  THEME_STORAGE_KEY,
+} from '../theme/systemAppearance'
 import { APP_ZOOM_STORAGE_KEY, LEGACY_UI_ZOOM_STORAGE_KEY } from './appZoom'
 import { DESKTOP_PERSISTENCE_VERSION_KEY } from './persistenceMigrations'
 
 export const SAFE_DOCTOR_STORAGE_KEYS = [
   'cc-haha-open-tabs',
   'cc-haha-session-runtime',
-  'cc-haha-theme',
+  THEME_STORAGE_KEY,
+  // The theme is three keys, not one: dropping only the applied theme would
+  // leave the switch and the light half behind, so a reset would not actually
+  // return the appearance to its out-of-the-box state.
+  FOLLOW_SYSTEM_THEME_STORAGE_KEY,
+  LIGHT_THEME_STORAGE_KEY,
   'cc-haha-locale',
   APP_ZOOM_STORAGE_KEY,
   LEGACY_UI_ZOOM_STORAGE_KEY,
@@ -18,12 +28,6 @@ export type LocalDoctorRepairResult = {
   removedKeys: string[]
   missingKeys: string[]
   failedKeys: string[]
-}
-
-export type DoctorRepairResult = {
-  local: LocalDoctorRepairResult
-  server: DoctorReportRepairResponse | null
-  serverError: string | null
 }
 
 function getDefaultDoctorStorage(): DoctorStorage | null {
@@ -63,23 +67,7 @@ export function runLocalDoctorRepair(storage: DoctorStorage | null = getDefaultD
   return { removedKeys, missingKeys, failedKeys }
 }
 
-export async function runDoctorRepair(options?: {
-  includeServer?: boolean
-  storage?: DoctorStorage | null
-}): Promise<DoctorRepairResult> {
-  const local = runLocalDoctorRepair(options?.storage)
-  if (options?.includeServer === false) {
-    return { local, server: null, serverError: null }
-  }
-
-  try {
-    const server = await doctorApi.reportAndRepair()
-    return { local, server, serverError: null }
-  } catch (error) {
-    return {
-      local,
-      server: null,
-      serverError: error instanceof Error ? error.message : String(error),
-    }
-  }
+export async function runDoctorCheck(options: { cwd?: string } = {}): Promise<DoctorReport> {
+  const { report } = await doctorApi.report(options.cwd)
+  return report
 }

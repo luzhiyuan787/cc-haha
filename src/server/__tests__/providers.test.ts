@@ -9,18 +9,25 @@ import * as os from 'os'
 import { ProviderService } from '../services/providerService.js'
 import { handleProvidersApi } from '../api/providers.js'
 import { handleProxyRequest } from '../proxy/handler.js'
-import { clearTraceCaptureStateForTests, traceCaptureService } from '../services/traceCaptureService.js'
+import {
+  clearTraceCaptureStateForTests,
+  setTraceAppendBeforeWriteHookForTests,
+  traceCaptureService,
+} from '../services/traceCaptureService.js'
 import type { CreateProviderInput } from '../types/provider.js'
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
 let tmpDir: string
 let originalConfigDir: string | undefined
+let originalHome: string | undefined
 
 async function setup() {
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'provider-test-'))
   originalConfigDir = process.env.CLAUDE_CONFIG_DIR
+  originalHome = process.env.HOME
   process.env.CLAUDE_CONFIG_DIR = tmpDir
+  process.env.HOME = tmpDir
   clearTraceCaptureStateForTests()
 }
 
@@ -30,6 +37,11 @@ async function teardown() {
     process.env.CLAUDE_CONFIG_DIR = originalConfigDir
   } else {
     delete process.env.CLAUDE_CONFIG_DIR
+  }
+  if (originalHome !== undefined) {
+    process.env.HOME = originalHome
+  } else {
+    delete process.env.HOME
   }
   await fs.rm(tmpDir, { recursive: true, force: true })
 }
@@ -81,6 +93,49 @@ async function readProvidersConfig(): Promise<Record<string, unknown>> {
   return JSON.parse(raw) as Record<string, unknown>
 }
 
+async function waitForCompletedProxyTrace(sessionId: string) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const trace = await traceCaptureService.getSessionTrace(sessionId)
+    if (
+      trace.calls.some((call) => call.response) &&
+      trace.events.some((event) => event.phase === 'upstream_fetch_completed')
+    ) {
+      return trace
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  return traceCaptureService.getSessionTrace(sessionId)
+}
+
+function blockNextTraceAppend() {
+  let releaseWrite: () => void = () => {}
+  const blockedWrite = new Promise<void>((resolve) => {
+    releaseWrite = resolve
+  })
+  let signalBlocked: () => void = () => {}
+  const writeBlocked = new Promise<void>((resolve) => {
+    signalBlocked = resolve
+  })
+
+  setTraceAppendBeforeWriteHookForTests(async () => {
+    setTraceAppendBeforeWriteHookForTests(null)
+    signalBlocked()
+    await blockedWrite
+  })
+
+  return { releaseWrite, writeBlocked }
+}
+
+async function settlesBeforeBlockedTraceWrite<T>(promise: Promise<T>): Promise<T | null> {
+  return Promise.race([
+    promise,
+    // The trace hook is already blocked, so this timeout is only a failure
+    // bound. Keep it generous enough that a busy CI worker cannot masquerade
+    // as response/trace coupling.
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 1_000)),
+  ])
+}
+
 // =============================================================================
 // ProviderService
 // =============================================================================
@@ -98,7 +153,7 @@ describe('ProviderService', () => {
       expect(result).toEqual({
         providers: [],
         activeId: null,
-        providerOrder: ['claude-official', 'openai-official'],
+        providerOrder: ['claude-official', 'openai-official', 'grok-official'],
       })
     })
 
@@ -113,7 +168,7 @@ describe('ProviderService', () => {
       expect(result).toEqual({
         providers: [],
         activeId: null,
-        providerOrder: ['claude-official', 'openai-official'],
+        providerOrder: ['claude-official', 'openai-official', 'grok-official'],
       })
       expect(files.some((name) => name.startsWith('providers.json.invalid-'))).toBe(true)
     })
@@ -203,7 +258,7 @@ describe('ProviderService', () => {
       await expect(fs.readFile(path.join(tmpDir, 'cc-haha', 'settings.json'), 'utf-8')).rejects.toThrow()
     })
 
-    test('custom providers declare thinking and effort capability passthrough for user-defined models', async () => {
+    test('custom providers keep thinking compatibility without narrowing CLI effort', async () => {
       const svc = new ProviderService()
       const provider = await svc.addProvider(sampleInput({
         models: {
@@ -220,17 +275,17 @@ describe('ProviderService', () => {
       const env = settings.env as Record<string, string>
       expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('deepseek-ai/DeepSeek-V4-Pro')
       expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES).toBe(
-        'thinking,effort,adaptive_thinking,max_effort',
+        'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
       )
       expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES).toBe(
-        'thinking,effort,adaptive_thinking,max_effort',
+        'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
       )
       expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES).toBe(
-        'thinking,effort,adaptive_thinking,max_effort',
+        'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
       )
     })
 
-    test('Xiaomi MiMo custom providers declare thinking without effort passthrough', async () => {
+    test('Xiaomi MiMo custom Anthropic providers keep the compatibility effort fallback', async () => {
       const svc = new ProviderService()
       const provider = await svc.addProvider(sampleInput({
         name: 'Xiaomi MiMo Custom',
@@ -247,9 +302,15 @@ describe('ProviderService', () => {
 
       const settings = await readSettings()
       const env = settings.env as Record<string, string>
-      expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES).toBe('thinking')
-      expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES).toBe('thinking')
-      expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES).toBe('thinking')
+      expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES).toBe(
+        'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
+      )
+      expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES).toBe(
+        'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
+      )
+      expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES).toBe(
+        'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
+      )
     })
 
     test('custom providers can mark main and role models as 1M-capable', async () => {
@@ -305,13 +366,13 @@ describe('ProviderService', () => {
       const env = settings.env as Record<string, string>
       expect(env.CC_HAHA_SEND_DISABLED_THINKING).toBeUndefined()
       expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES).toBe(
-        'thinking,effort,adaptive_thinking,max_effort',
+        'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
       )
       expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES).toBe(
-        'thinking,effort,adaptive_thinking,max_effort',
+        'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
       )
       expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES).toBe(
-        'thinking,effort,adaptive_thinking,max_effort',
+        'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
       )
     })
 
@@ -352,6 +413,26 @@ describe('ProviderService', () => {
         'model-main': 300000,
         'model-haiku': 128000,
       })
+    })
+
+    test('should persist an optional image provider without placing it in the skill', async () => {
+      const svc = new ProviderService()
+      const provider = await svc.addProvider(sampleInput({
+        imageGeneration: {
+          model: 'image-model',
+          baseUrl: 'https://images.example.test/v1',
+          apiKey: 'image-secret',
+        },
+      }))
+
+      expect(provider.imageGeneration).toEqual({
+        model: 'image-model',
+        baseUrl: 'https://images.example.test/v1',
+        apiKey: 'image-secret',
+      })
+      const config = await readProvidersConfig()
+      expect((config.providers as Array<{ imageGeneration?: unknown }>)[0]?.imageGeneration)
+        .toEqual(provider.imageGeneration)
     })
   })
 
@@ -395,10 +476,10 @@ describe('ProviderService', () => {
           apiFormat: 'openai_responses',
           runtimeKind: 'openai_oauth',
           models: {
-            main: 'gpt-5.3-codex',
-            haiku: 'gpt-5.4-mini',
-            sonnet: 'gpt-5.4',
-            opus: 'gpt-5.3-codex',
+            main: 'gpt-5.6-sol',
+            haiku: 'gpt-5.6-luna',
+            sonnet: 'gpt-5.6-terra',
+            opus: 'gpt-5.6-sol',
           },
         })
       })
@@ -416,12 +497,15 @@ describe('ProviderService', () => {
         expect(env.OPENAI_CODEX_OAUTH_FILE).toBe(
           path.join(tmpDir, 'cc-haha', 'openai-oauth.json'),
         )
-        expect(env.ANTHROPIC_MODEL).toBe('gpt-5.3-codex')
-        expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('gpt-5.4-mini')
-        expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('gpt-5.4')
-        expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('gpt-5.3-codex')
+        expect(env.ANTHROPIC_MODEL).toBe('gpt-5.6-sol')
+        expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('gpt-5.6-luna')
+        expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('gpt-5.6-terra')
+        expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('gpt-5.6-sol')
         expect(typeof env.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS).toBe('string')
         expect(JSON.parse(env.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS)).toEqual({
+          'gpt-5.6-sol': 353_400,
+          'gpt-5.6-terra': 353_400,
+          'gpt-5.6-luna': 353_400,
           'gpt-5.3-codex': 258_400,
           'gpt-5.4': 950_000,
           'gpt-5.5': 258_400,
@@ -484,6 +568,29 @@ describe('ProviderService', () => {
         })
       })
 
+      test('auth status reports Claude Official from the desktop Claude token file', async () => {
+        await fs.mkdir(path.join(tmpDir, 'cc-haha'), { recursive: true })
+        await fs.writeFile(
+          path.join(tmpDir, 'cc-haha', 'oauth.json'),
+          JSON.stringify({
+            accessToken: 'claude-access',
+            refreshToken: 'claude-refresh',
+            expiresAt: Date.now() + 60 * 60_000,
+            scopes: [],
+            subscriptionType: 'pro',
+          }),
+          'utf-8',
+        )
+
+        const svc = new ProviderService()
+
+        await expect(svc.checkAuthStatus()).resolves.toMatchObject({
+          hasAuth: true,
+          source: 'claude-oauth',
+          activeProvider: 'Claude Official',
+        })
+      })
+
       test('auth status reports ChatGPT Official as unauthenticated when the OpenAI token file is missing', async () => {
         const svc = new ProviderService()
         await svc.activateProvider('openai-official')
@@ -507,6 +614,104 @@ describe('ProviderService', () => {
         expect(env.OPENAI_CODEX_OAUTH_FILE).toBeUndefined()
         expect(env.ANTHROPIC_BASE_URL).toBe('https://api.example.com')
         expect(env.ANTHROPIC_AUTH_TOKEN).toBe('sk-test-key-123')
+      })
+    })
+
+    describe('Grok Official provider metadata', () => {
+      test('normalizes the built-in Grok provider and appends it to legacy provider order', async () => {
+        await fs.mkdir(path.join(tmpDir, 'cc-haha'), { recursive: true })
+        await fs.writeFile(
+          path.join(tmpDir, 'cc-haha', 'providers.json'),
+          JSON.stringify({
+            activeId: 'grok-official',
+            providers: [],
+            providerOrder: ['claude-official', 'openai-official'],
+          }),
+          'utf-8',
+        )
+
+        const svc = new ProviderService()
+        const result = await svc.listProviders()
+
+        expect(result.activeId).toBe('grok-official')
+        expect(result.providers).toEqual([])
+        expect(result.providerOrder).toEqual([
+          'claude-official',
+          'openai-official',
+          'grok-official',
+        ])
+      })
+
+      test('returns and activates built-in Grok metadata while clearing OpenAI OAuth runtime env', async () => {
+        const svc = new ProviderService()
+        const provider = await svc.getProvider('grok-official')
+
+        expect(provider).toMatchObject({
+          id: 'grok-official',
+          presetId: 'grok-official',
+          name: 'Grok Official',
+          apiKey: '',
+          apiFormat: 'openai_chat',
+          runtimeKind: 'grok_oauth',
+          models: {
+            main: 'grok-4.6',
+            haiku: 'grok-4.6',
+            sonnet: 'grok-4.6',
+            opus: 'grok-4.6',
+          },
+        })
+
+        await svc.activateProvider('openai-official')
+        await svc.activateProvider('grok-official')
+
+        const config = await readProvidersConfig()
+        const env = (await readSettings()).env as Record<string, string>
+        expect(config.activeId).toBe('grok-official')
+        expect(env.CC_HAHA_GROK_OAUTH_PROVIDER).toBe('1')
+        expect(env.GROK_OAUTH_FILE).toBe(
+          path.join(tmpDir, 'cc-haha', 'grok-oauth.json'),
+        )
+        expect(env.ANTHROPIC_MODEL).toBe('grok-4.6')
+        expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('grok-4.6')
+        expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('grok-4.6')
+        expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('grok-4.6')
+        expect(env.CC_HAHA_OPENAI_OAUTH_PROVIDER).toBeUndefined()
+        expect(env.OPENAI_CODEX_OAUTH_FILE).toBeUndefined()
+      })
+
+      test('auth status reports Grok Official from the isolated Grok token file', async () => {
+        await fs.mkdir(path.join(tmpDir, 'cc-haha'), { recursive: true })
+        await fs.writeFile(
+          path.join(tmpDir, 'cc-haha', 'grok-oauth.json'),
+          JSON.stringify({
+            accessToken: 'grok-access',
+            refreshToken: 'grok-refresh',
+            expiresAt: Date.now() + 60 * 60_000,
+            email: 'grok@example.com',
+            clientId: 'grok-client',
+          }),
+          'utf-8',
+        )
+
+        const svc = new ProviderService()
+        await svc.activateProvider('grok-official')
+
+        await expect(svc.checkAuthStatus()).resolves.toMatchObject({
+          hasAuth: true,
+          source: 'grok-oauth',
+          activeProvider: 'Grok Official',
+        })
+      })
+
+      test('auth status reports Grok Official as unauthenticated without an isolated token file', async () => {
+        const svc = new ProviderService()
+        await svc.activateProvider('grok-official')
+
+        await expect(svc.checkAuthStatus()).resolves.toMatchObject({
+          hasAuth: false,
+          source: 'none',
+          activeProvider: 'Grok Official',
+        })
       })
     })
 
@@ -643,6 +848,36 @@ describe('ProviderService', () => {
       env = settings.env as Record<string, string>
       expect(env.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS).toBeUndefined()
     })
+
+    test('updating an active provider drives image routing in both directions', async () => {
+      const svc = new ProviderService()
+      const added = await svc.addProvider(sampleInput())
+      await svc.activateProvider(added.id)
+
+      await svc.updateProvider(added.id, {
+        imageGeneration: {
+          model: 'image-model',
+          baseUrl: 'https://images.example.test/v1',
+          apiKey: 'image-secret',
+        },
+      })
+      let settings = await readSettings()
+      let env = settings.env as Record<string, string>
+      expect(env).toMatchObject({
+        CC_HAHA_IMAGE_PROVIDER_KIND: 'openai_images',
+        CC_HAHA_IMAGE_PROVIDER_ID: added.id,
+        CC_HAHA_IMAGE_BASE_URL: 'https://images.example.test/v1',
+        CC_HAHA_IMAGE_API_KEY: 'image-secret',
+        CC_HAHA_IMAGE_MODEL: 'image-model',
+      })
+
+      const updated = await svc.updateProvider(added.id, { imageGeneration: null })
+      expect(updated.imageGeneration).toBeUndefined()
+      settings = await readSettings()
+      env = settings.env as Record<string, string>
+      expect(env.CC_HAHA_IMAGE_PROVIDER_KIND).toBeUndefined()
+      expect(env.CC_HAHA_IMAGE_API_KEY).toBeUndefined()
+    })
   })
 
   // ─── deleteProvider ──────────────────────────────────────────────────────
@@ -713,16 +948,40 @@ describe('ProviderService', () => {
       const a = await svc.addProvider(sampleInput({ name: 'A' }))
       const b = await svc.addProvider(sampleInput({ name: 'B' }))
 
-      const result = await svc.reorderProviders(['openai-official', b.id, 'claude-official', a.id])
+      const result = await svc.reorderProviders([
+        'openai-official',
+        b.id,
+        'claude-official',
+        a.id,
+        'grok-official',
+      ])
 
-      expect(result.providerOrder).toEqual(['openai-official', b.id, 'claude-official', a.id])
+      expect(result.providerOrder).toEqual([
+        'openai-official',
+        b.id,
+        'claude-official',
+        a.id,
+        'grok-official',
+      ])
       expect(result.providers.map((p) => p.id)).toEqual([b.id, a.id])
 
       const listed = await svc.listProviders()
-      expect(listed.providerOrder).toEqual(['openai-official', b.id, 'claude-official', a.id])
+      expect(listed.providerOrder).toEqual([
+        'openai-official',
+        b.id,
+        'claude-official',
+        a.id,
+        'grok-official',
+      ])
 
       const config = await readProvidersConfig()
-      expect(config.providerOrder).toEqual(['openai-official', b.id, 'claude-official', a.id])
+      expect(config.providerOrder).toEqual([
+        'openai-official',
+        b.id,
+        'claude-official',
+        a.id,
+        'grok-official',
+      ])
     })
 
     test('should not change activeId when reordering', async () => {
@@ -821,7 +1080,8 @@ describe('ProviderService', () => {
       expect(env.ANTHROPIC_BASE_URL).toBe('https://second-api.example.com')
       expect(env.ANTHROPIC_AUTH_TOKEN).toBe('sk-second-key')
       expect(env.ANTHROPIC_API_KEY).toBe('')
-      expect(env.ENABLE_TOOL_SEARCH).toBe('true')
+      expect(second.toolSearchEnabled).toBe(false)
+      expect(env.ENABLE_TOOL_SEARCH).toBe('false')
       expect(env.ANTHROPIC_MODEL).toBe('model-main')
       expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('model-haiku')
       expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('model-sonnet')
@@ -830,20 +1090,20 @@ describe('ProviderService', () => {
       expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined()
     })
 
-    test('should persist disabled tool search for native Anthropic providers', async () => {
+    test('should persist explicitly enabled tool search for native Anthropic providers', async () => {
       const svc = new ProviderService()
       const provider = await svc.addProvider(sampleInput({
-        toolSearchEnabled: false,
+        toolSearchEnabled: true,
       }))
 
       await svc.activateProvider(provider.id)
 
       const settings = await readSettings()
       const env = settings.env as Record<string, string>
-      expect(env.ENABLE_TOOL_SEARCH).toBe('false')
+      expect(env.ENABLE_TOOL_SEARCH).toBe('true')
 
       const runtimeEnv = await svc.getProviderRuntimeEnv(provider.id)
-      expect(runtimeEnv.ENABLE_TOOL_SEARCH).toBe('false')
+      expect(runtimeEnv.ENABLE_TOOL_SEARCH).toBe('true')
     })
 
     test('should persist disabled experimental betas on activation and runtime env', async () => {
@@ -935,20 +1195,34 @@ describe('ProviderService', () => {
       expect(dummyRuntimeEnv.ANTHROPIC_AUTH_TOKEN).toBe('dummy')
     })
 
-    test('proxy providers keep proxy-managed auth regardless of auth strategy', async () => {
-      const svc = new ProviderService()
-      const provider = await svc.addProvider(sampleInput({
-        apiFormat: 'openai_chat',
-        authStrategy: 'auth_token',
-      }))
+    test('proxy providers keep transient desktop auth out of persisted settings', async () => {
+      const originalLocalAccessToken = process.env.CC_HAHA_LOCAL_ACCESS_TOKEN
+      process.env.CC_HAHA_LOCAL_ACCESS_TOKEN = 'desktop-local-secret'
 
-      await svc.activateProvider(provider.id)
+      try {
+        const svc = new ProviderService()
+        for (const apiFormat of ['openai_chat', 'openai_responses'] as const) {
+          const provider = await svc.addProvider(sampleInput({
+            apiFormat,
+            authStrategy: 'auth_token',
+          }))
 
-      const settings = await readSettings()
-      const env = settings.env as Record<string, string>
-      expect(env.ANTHROPIC_API_KEY).toBe('proxy-managed')
-      expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
-      expect(env.ENABLE_TOOL_SEARCH).toBeUndefined()
+          await svc.activateProvider(provider.id)
+
+          const settings = await readSettings()
+          const env = settings.env as Record<string, string>
+          expect(env.ANTHROPIC_API_KEY).toBe('proxy-managed')
+          expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+          expect(env.ENABLE_TOOL_SEARCH).toBeUndefined()
+          expect(JSON.stringify(settings)).not.toContain('desktop-local-secret')
+        }
+      } finally {
+        if (originalLocalAccessToken === undefined) {
+          delete process.env.CC_HAHA_LOCAL_ACCESS_TOKEN
+        } else {
+          process.env.CC_HAHA_LOCAL_ACCESS_TOKEN = originalLocalAccessToken
+        }
+      }
     })
 
     test('should include preset default env on activation and runtime env', async () => {
@@ -1127,6 +1401,14 @@ describe('ProviderService', () => {
       expect(active).toBeNull()
     })
 
+    test('should return null for explicit Grok Official proxy lookup', async () => {
+      const svc = new ProviderService()
+
+      const active = await svc.getProviderForProxy('grok-official')
+
+      expect(active).toBeNull()
+    })
+
     test('should return the active provider proxy config', async () => {
       const svc = new ProviderService()
       const provider = await svc.addProvider(sampleInput())
@@ -1147,12 +1429,23 @@ describe('ProviderService', () => {
 
       expect(active).toBeNull()
     })
+
+    test('should return null when Grok Official is the active provider', async () => {
+      const svc = new ProviderService()
+      await svc.activateProvider('grok-official')
+
+      const active = await svc.getProviderForProxy()
+
+      expect(active).toBeNull()
+    })
   })
 
   describe('handleProxyRequest', () => {
     test('records a session trace for proxied OpenAI Chat calls', async () => {
       const originalFetch = globalThis.fetch
-      globalThis.fetch = mock(async () => {
+      const upstreamHeaders: Headers[] = []
+      globalThis.fetch = mock(async (_input: string | URL | Request, init?: RequestInit) => {
+        upstreamHeaders.push(new Headers(init?.headers))
         return new Response(JSON.stringify({
           id: 'chatcmpl-trace',
           object: 'chat.completion',
@@ -1175,6 +1468,7 @@ describe('ProviderService', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
+            Authorization: 'Bearer desktop-local-secret',
             'X-Claude-Code-Session-Id': 'session-proxy-trace',
           },
           body: JSON.stringify({
@@ -1185,7 +1479,7 @@ describe('ProviderService', () => {
         })
 
         const res = await handleProxyRequest(req, new URL(req.url))
-        const trace = await traceCaptureService.getSessionTrace('session-proxy-trace')
+        const trace = await waitForCompletedProxyTrace('session-proxy-trace')
 
         expect(res.status).toBe(200)
         expect(trace.summary.apiCalls).toBe(1)
@@ -1200,7 +1494,126 @@ describe('ProviderService', () => {
         })
         expect(trace.calls[0].request.body.preview).toContain('capture this call')
         expect(trace.calls[0].response.body.preview).toContain('chatcmpl-trace')
+        expect(upstreamHeaders[0].get('Authorization')).toBe('Bearer sk-test-key-123')
+        expect(upstreamHeaders[0].get('Authorization')).not.toContain('desktop-local-secret')
       } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+
+    test('returns a non-streaming proxy response before trace persistence finishes', async () => {
+      const originalFetch = globalThis.fetch
+      globalThis.fetch = mock(async () => new Response(JSON.stringify({
+        id: 'chatcmpl-trace-background',
+        object: 'chat.completion',
+        created: 0,
+        model: 'gpt-4',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'background trace ok' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })) as typeof fetch
+
+      const svc = new ProviderService()
+      const provider = await svc.addProvider(sampleInput({ apiFormat: 'openai_chat' }))
+      await svc.activateProvider(provider.id)
+      const { releaseWrite, writeBlocked } = blockNextTraceAppend()
+      let released = false
+      let responsePromise: Promise<Response> | undefined
+
+      try {
+        const req = new Request('http://localhost:3456/proxy/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Claude-Code-Session-Id': 'session-non-stream-background-trace',
+          },
+          body: JSON.stringify({
+            model: 'gpt-4',
+            max_tokens: 64,
+            messages: [{ role: 'user', content: 'return before trace persistence' }],
+          }),
+        })
+
+        responsePromise = handleProxyRequest(req, new URL(req.url))
+        await writeBlocked
+        const response = await settlesBeforeBlockedTraceWrite(responsePromise)
+        expect(response).not.toBeNull()
+        expect(response?.status).toBe(200)
+        await expect(response?.json()).resolves.toMatchObject({
+          content: [{ text: 'background trace ok' }],
+        })
+
+        releaseWrite()
+        released = true
+        const trace = await waitForCompletedProxyTrace('session-non-stream-background-trace')
+        expect(trace.calls[0]?.response?.body.preview).toContain('chatcmpl-trace-background')
+        expect(trace.events.at(-1)?.phase).toBe('upstream_fetch_completed')
+      } finally {
+        if (!released) releaseWrite()
+        await responsePromise?.catch(() => undefined)
+        globalThis.fetch = originalFetch
+      }
+    })
+
+    test('delivers streaming EOF before trace persistence finishes', async () => {
+      const originalFetch = globalThis.fetch
+      const encoder = new TextEncoder()
+      globalThis.fetch = mock(async () => new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode([
+            'data: {"id":"chatcmpl-stream-trace","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"role":"assistant","content":"streamed"},"finish_reason":null}]}',
+            '',
+            'data: {"id":"chatcmpl-stream-trace","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}',
+            '',
+            'data: [DONE]',
+            '',
+          ].join('\n')))
+          controller.close()
+        },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      })) as typeof fetch
+
+      const svc = new ProviderService()
+      const provider = await svc.addProvider(sampleInput({ apiFormat: 'openai_chat' }))
+      await svc.activateProvider(provider.id)
+      const { releaseWrite, writeBlocked } = blockNextTraceAppend()
+      let released = false
+      let bodyPromise: Promise<string> | undefined
+
+      try {
+        const req = new Request('http://localhost:3456/proxy/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Claude-Code-Session-Id': 'session-stream-background-trace',
+          },
+          body: JSON.stringify({
+            model: 'gpt-4',
+            max_tokens: 64,
+            stream: true,
+            messages: [{ role: 'user', content: 'finish before trace persistence' }],
+          }),
+        })
+
+        const response = await handleProxyRequest(req, new URL(req.url))
+        bodyPromise = response.text()
+        await writeBlocked
+        const body = await settlesBeforeBlockedTraceWrite(bodyPromise)
+        expect(body).not.toBeNull()
+        expect(body).toContain('message_stop')
+
+        releaseWrite()
+        released = true
+        const trace = await waitForCompletedProxyTrace('session-stream-background-trace')
+        expect(trace.calls[0]?.response?.body.preview).toContain('message_stop')
+        expect(trace.events.at(-1)?.phase).toBe('upstream_fetch_completed')
+      } finally {
+        if (!released) releaseWrite()
+        await bodyPromise?.catch(() => undefined)
         globalThis.fetch = originalFetch
       }
     })
@@ -1235,7 +1648,7 @@ describe('ProviderService', () => {
             model: 'gpt-4',
             max_tokens: 64,
             system: [
-              { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.92.693; cc_entrypoint=cli; cch=00000;' },
+              { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.220.693; cc_entrypoint=cli; cch=00000;' },
               { type: 'text', text: 'You are a helpful assistant.' },
             ],
             messages: [{ role: 'user', content: 'hello from proxy' }],
@@ -1258,9 +1671,12 @@ describe('ProviderService', () => {
 
     test('forwards a stable prompt_cache_key from client session metadata for OpenAI Responses upstreams', async () => {
       const originalFetch = globalThis.fetch
-      const calls: Array<{ body: Record<string, unknown> }> = []
+      const calls: Array<{ body: Record<string, unknown>; headers: Headers }> = []
       globalThis.fetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
-        calls.push({ body: JSON.parse(String(init?.body)) as Record<string, unknown> })
+        calls.push({
+          body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+          headers: new Headers(init?.headers),
+        })
         return new Response(JSON.stringify({
           id: 'resp-1',
           object: 'response',
@@ -1282,7 +1698,10 @@ describe('ProviderService', () => {
 
         const req = new Request('http://localhost:3456/proxy/v1/messages', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: 'Bearer desktop-local-secret',
+          },
           body: JSON.stringify({
             model: 'gpt-5.4',
             max_tokens: 64,
@@ -1294,6 +1713,8 @@ describe('ProviderService', () => {
         const res = await handleProxyRequest(req, new URL(req.url))
         expect(res.status).toBe(200)
         expect(calls[0].body.prompt_cache_key).toBe('sess-42aa')
+        expect(calls[0].headers.get('Authorization')).toBe('Bearer sk-test-key-123')
+        expect(calls[0].headers.get('Authorization')).not.toContain('desktop-local-secret')
       } finally {
         globalThis.fetch = originalFetch
       }
@@ -1437,6 +1858,114 @@ describe('ProviderService', () => {
         expect(result.connectivity.success).toBe(true)
         expect(calls[0].headers.Authorization).toBe('Bearer lmstudio')
         expect(calls[0].headers['x-api-key']).toBeUndefined()
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+
+    test('rejects destination and auth overrides before testing with a saved key', async () => {
+      const originalFetch = globalThis.fetch
+      const calls: string[] = []
+      globalThis.fetch = mock(async (url: string | URL | Request) => {
+        calls.push(String(url))
+        return new Response('{}', { status: 200 })
+      }) as typeof fetch
+
+      try {
+        const svc = new ProviderService()
+        const provider = await svc.addProvider(sampleInput())
+        const { req, url, segments } = makeRequest(
+          'POST',
+          `/api/providers/${provider.id}/test`,
+          {
+            baseUrl: 'https://override.example.com',
+            apiFormat: 'openai_chat',
+            authStrategy: 'auth_token',
+          },
+        )
+
+        const response = await handleProvidersApi(req, url, segments)
+
+        expect(response.status).toBe(400)
+        expect(calls).toEqual([])
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+
+    test('accepts a model-only override without changing a saved provider destination', async () => {
+      const originalFetch = globalThis.fetch
+      const calls: string[] = []
+      globalThis.fetch = mock(async (url: string | URL | Request) => {
+        calls.push(String(url))
+        return new Response(JSON.stringify({
+          type: 'message',
+          model: 'alternate-model',
+          content: [],
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }) as typeof fetch
+
+      try {
+        const svc = new ProviderService()
+        const provider = await svc.addProvider(sampleInput({
+          baseUrl: 'https://saved.example.com',
+        }))
+        const { req, url, segments } = makeRequest(
+          'POST',
+          `/api/providers/${provider.id}/test`,
+          { modelId: 'alternate-model' },
+        )
+
+        const response = await handleProvidersApi(req, url, segments)
+
+        expect(response.status).toBe(200)
+        expect(calls[0]).toContain('https://saved.example.com')
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+
+    test('keeps explicit draft provider tests independent from saved credentials', async () => {
+      const originalFetch = globalThis.fetch
+      const calls: Array<{ url: string; authorization: string | null }> = []
+      globalThis.fetch = mock(async (url: string | URL | Request, init?: RequestInit) => {
+        calls.push({
+          url: String(url),
+          authorization: new Headers(init?.headers).get('authorization'),
+        })
+        return new Response(JSON.stringify({
+          type: 'message',
+          model: 'draft-model',
+          content: [],
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }) as typeof fetch
+
+      try {
+        const { req, url, segments } = makeRequest(
+          'POST',
+          '/api/providers/test',
+          {
+            baseUrl: 'https://draft.example.com',
+            apiKey: 'draft-explicit-key',
+            modelId: 'draft-model',
+            apiFormat: 'anthropic',
+            authStrategy: 'auth_token',
+          },
+        )
+
+        const response = await handleProvidersApi(req, url, segments)
+
+        expect(response.status).toBe(200)
+        expect(calls).toEqual([{
+          url: 'https://draft.example.com/v1/messages',
+          authorization: 'Bearer draft-explicit-key',
+        }])
       } finally {
         globalThis.fetch = originalFetch
       }
@@ -1858,7 +2387,13 @@ describe('Providers API', () => {
     expect(res.status).toBe(200)
     const body = (await res.json()) as { providers: { name: string }[]; providerOrder: string[] }
     expect(body.providers.map((p) => p.name)).toEqual(['B', 'A'])
-    expect(body.providerOrder).toEqual([b.id, a.id, 'claude-official', 'openai-official'])
+    expect(body.providerOrder).toEqual([
+      b.id,
+      a.id,
+      'claude-official',
+      'openai-official',
+      'grok-official',
+    ])
   })
 
   test('PUT /api/providers/reorder should return 400 for a non-permutation', async () => {

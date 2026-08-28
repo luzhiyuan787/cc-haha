@@ -7,6 +7,10 @@ import {
 
 describe('model context windows', () => {
   test('recognizes updated domestic coding model context windows', () => {
+    expect(getConfiguredOrBuiltInModelContextWindow('k3')).toBe(262_144)
+    expect(getConfiguredOrBuiltInModelContextWindow('k3[1m]')).toBe(262_144)
+    expect(getConfiguredOrBuiltInModelContextWindow('kimi-for-coding')).toBe(262_144)
+    expect(getConfiguredOrBuiltInModelContextWindow('kimi-for-coding-highspeed')).toBe(262_144)
     expect(getConfiguredOrBuiltInModelContextWindow('kimi-k2.7-code')).toBe(262_144)
     expect(getConfiguredOrBuiltInModelContextWindow('kimi-k2.7-code-highspeed')).toBe(262_144)
     expect(getConfiguredOrBuiltInModelContextWindow('glm-5.2')).toBe(1_000_000)
@@ -16,6 +20,7 @@ describe('model context windows', () => {
     expect(getConfiguredOrBuiltInModelContextWindow('qwen3.7-plus-2026-02-15')).toBe(1_000_000)
     expect(getConfiguredOrBuiltInModelContextWindow('qwen3-coder-plus')).toBe(1_000_000)
     expect(getConfiguredOrBuiltInModelContextWindow('qwen3-coder-next')).toBe(262_144)
+    expect(getConfiguredOrBuiltInModelContextWindow('deepseek-ai/deepseek-v4-pro')).toBe(1_000_000)
   })
 
   test('matches configured base model windows for Claude Code 1m aliases', () => {

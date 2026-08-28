@@ -1,25 +1,162 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../api/client'
+import type { Locale } from '../i18n/locale'
 import { browserHost } from '../lib/desktopHost/browserHost'
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
+function mockSystemLanguages(languages: string[], language = languages[0] ?? '') {
+  vi.spyOn(window.navigator, 'languages', 'get').mockReturnValue(languages)
+  vi.spyOn(window.navigator, 'language', 'get').mockReturnValue(language)
+}
 
 describe('settingsStore locale defaults', () => {
   beforeEach(() => {
+    vi.restoreAllMocks()
     vi.resetModules()
     window.localStorage.clear()
   })
 
-  it('defaults to Chinese when no locale is stored', async () => {
-    const { useSettingsStore } = await import('./settingsStore')
-
-    expect(useSettingsStore.getState().locale).toBe('zh')
+  afterEach(() => {
+    delete window.desktopHost
   })
 
-  it('keeps a stored locale override', async () => {
-    window.localStorage.setItem('cc-haha-locale', 'en')
+  it.each([
+    ['en-GB', 'en'],
+    ['zh-CN', 'zh'],
+    ['zh-SG', 'zh'],
+    ['zh-Hant', 'zh-TW'],
+    ['zh-HK', 'zh-TW'],
+    ['ja-JP', 'jp'],
+    ['ko-KR', 'kr'],
+  ] as const)('maps the system language %s to %s', async (systemLanguage, expectedLocale) => {
+    mockSystemLanguages([systemLanguage])
+
+    const { useSettingsStore } = await import('./settingsStore')
+
+    expect(useSettingsStore.getState().locale).toBe(expectedLocale)
+  })
+
+  it('uses the first supported language in the system preference list', async () => {
+    mockSystemLanguages(['fr-FR', 'ja-JP', 'en-US'])
+
+    const { useSettingsStore } = await import('./settingsStore')
+
+    expect(useSettingsStore.getState().locale).toBe('jp')
+  })
+
+  it('defaults to English when no system language is supported', async () => {
+    mockSystemLanguages(['fr-FR', 'de-DE'])
 
     const { useSettingsStore } = await import('./settingsStore')
 
     expect(useSettingsStore.getState().locale).toBe('en')
+  })
+
+  it('keeps a stored locale override', async () => {
+    mockSystemLanguages(['en-US'])
+    window.localStorage.setItem('cc-haha-locale', 'zh-TW')
+
+    const { useSettingsStore } = await import('./settingsStore')
+
+    expect(useSettingsStore.getState().locale).toBe('zh-TW')
+    expect(document.documentElement.lang).toBe('zh-TW')
+
+    useSettingsStore.getState().setLocale('jp')
+
+    expect(window.localStorage.getItem('cc-haha-locale')).toBe('jp')
+    expect(document.documentElement.lang).toBe('ja')
+  })
+
+  it('persists a manual desktop choice and restores it after a simulated restart', async () => {
+    mockSystemLanguages(['zh-CN'])
+    const setLocalePreference = vi.fn().mockResolvedValue(undefined)
+    window.desktopHost = {
+      ...browserHost,
+      kind: 'electron',
+      isDesktop: true,
+      app: {
+        ...browserHost.app,
+        setLocalePreference,
+      },
+    }
+
+    const firstLoad = await import('./settingsStore')
+    firstLoad.useSettingsStore.getState().setLocale('jp')
+
+    await vi.waitFor(() => {
+      expect(setLocalePreference).toHaveBeenCalledWith('jp')
+    })
+    expect(window.localStorage.getItem('cc-haha-locale')).toBe('jp')
+
+    vi.resetModules()
+    mockSystemLanguages(['ko-KR'])
+    const restarted = await import('./settingsStore')
+
+    expect(restarted.useSettingsStore.getState().locale).toBe('jp')
+    expect(document.documentElement.lang).toBe('ja')
+  })
+
+  it('keeps the local choice when desktop persistence fails', async () => {
+    mockSystemLanguages(['en-US'])
+    const persistenceError = new Error('disk unavailable')
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    window.desktopHost = {
+      ...browserHost,
+      kind: 'electron',
+      isDesktop: true,
+      app: {
+        ...browserHost.app,
+        setLocalePreference: vi.fn().mockRejectedValue(persistenceError),
+      },
+    }
+
+    const { useSettingsStore } = await import('./settingsStore')
+    useSettingsStore.getState().setLocale('kr')
+
+    await vi.waitFor(() => {
+      expect(consoleError).toHaveBeenCalledWith(
+        '[desktop] Failed to persist locale preference',
+        persistenceError,
+      )
+    })
+    expect(useSettingsStore.getState().locale).toBe('kr')
+    expect(window.localStorage.getItem('cc-haha-locale')).toBe('kr')
+  })
+
+  it('applies a locale event from another desktop window', async () => {
+    mockSystemLanguages(['en-US'])
+    let emitLocale: ((locale: Locale) => void) | undefined
+    window.desktopHost = {
+      ...browserHost,
+      kind: 'electron',
+      isDesktop: true,
+      app: {
+        ...browserHost.app,
+        getLocalePreference: vi.fn().mockResolvedValue('en'),
+        onLocaleChanged: vi.fn(async (handler) => {
+          emitLocale = handler
+          return () => {}
+        }),
+      },
+    }
+
+    const { useSettingsStore } = await import('./settingsStore')
+    const { initializeLocale } = await import('../i18n/locale')
+    await initializeLocale(window.desktopHost.app)
+
+    emitLocale?.('zh-TW')
+
+    expect(useSettingsStore.getState().locale).toBe('zh-TW')
+    expect(document.documentElement.lang).toBe('zh-TW')
   })
 })
 
@@ -61,6 +198,33 @@ describe('settingsStore UI zoom', () => {
       expect(window.localStorage.getItem('cc-haha-app-zoom')).toBe('2')
     })
     expect(useSettingsStore.getState().uiZoom).toBe(2)
+  })
+})
+
+describe('settingsStore Auto mode consent', () => {
+  beforeEach(() => {
+    vi.resetModules()
+    vi.clearAllMocks()
+  })
+
+  it('persists first-use Auto consent in user settings', async () => {
+    const updateUser = vi.fn().mockResolvedValue({})
+    vi.doMock('../api/settings', () => ({
+      settingsApi: {
+        getUser: vi.fn(),
+        updateUser,
+        getPermissionMode: vi.fn(),
+        setPermissionMode: vi.fn(),
+        getCliLauncherStatus: vi.fn(),
+      },
+    }))
+
+    const { useSettingsStore } = await import('./settingsStore')
+
+    await useSettingsStore.getState().acceptAutoModeOptIn()
+
+    expect(updateUser).toHaveBeenCalledWith({ skipAutoPermissionPrompt: true })
+    expect(useSettingsStore.getState().autoModeOptInAccepted).toBe(true)
   })
 })
 
@@ -174,7 +338,7 @@ describe('settingsStore network persistence', () => {
     window.localStorage.clear()
   })
 
-  it('defaults old user settings to 600s direct network settings', async () => {
+  it('defaults old user settings to 600s system network settings', async () => {
     vi.doMock('../api/settings', () => ({
       settingsApi: {
         getUser: vi.fn().mockResolvedValue({}),
@@ -217,8 +381,66 @@ describe('settingsStore network persistence', () => {
     expect(useSettingsStore.getState().network).toEqual({
       aiRequestTimeoutMs: 600_000,
       proxy: {
-        mode: 'direct',
+        mode: 'system',
         url: '',
+      },
+    })
+  })
+
+  it('persists explicit system network mode without a stale manual URL', async () => {
+    const updateUser = vi.fn().mockResolvedValue({})
+    vi.doMock('../api/settings', () => ({
+      settingsApi: {
+        getUser: vi.fn(),
+        updateUser,
+        getPermissionMode: vi.fn(),
+        setPermissionMode: vi.fn(),
+        getCliLauncherStatus: vi.fn(),
+      },
+    }))
+    vi.doMock('../api/models', () => ({
+      modelsApi: {
+        list: vi.fn(),
+        getCurrent: vi.fn(),
+        setCurrent: vi.fn(),
+        getEffort: vi.fn(),
+        setEffort: vi.fn(),
+      },
+    }))
+    vi.doMock('../api/h5Access', () => ({
+      h5AccessApi: {
+        get: vi.fn(),
+        enable: vi.fn(),
+        disable: vi.fn(),
+        regenerate: vi.fn(),
+        update: vi.fn(),
+      },
+    }))
+
+    const { useSettingsStore } = await import('./settingsStore')
+
+    await useSettingsStore.getState().setNetwork({
+      aiRequestTimeoutMs: 600_000,
+      proxy: {
+        mode: 'system',
+        url: '  http://stale.example:8080  ',
+      },
+    })
+
+    expect(useSettingsStore.getState().network).toEqual({
+      aiRequestTimeoutMs: 600_000,
+      proxy: {
+        mode: 'system',
+        url: '',
+      },
+    })
+    expect(updateUser).toHaveBeenCalledWith({
+      network: {
+        aiRequestTimeoutMs: 600_000,
+        proxy: {
+          mode: 'system',
+          url: '',
+        },
       },
     })
   })
@@ -418,74 +640,26 @@ describe('settingsStore app mode', () => {
   it('hydrates app mode from the Electron desktop host', async () => {
     const getAppMode = vi.fn().mockResolvedValue({
       mode: 'portable',
-      portableDir: 'C:\\cc-haha\\CLAUDE_CONFIG_DIR',
-      defaultPortableDir: 'C:\\cc-haha\\CLAUDE_CONFIG_DIR',
-    })
-    installElectronAppModeHost({ get: getAppMode })
-
-    const { useSettingsStore } = await import('./settingsStore')
-
-    await useSettingsStore.getState().fetchAppMode()
-
-    expect(getAppMode).toHaveBeenCalledTimes(1)
-    expect(useSettingsStore.getState().appMode).toEqual({
-      mode: 'portable',
-      portableDir: 'C:\\cc-haha\\CLAUDE_CONFIG_DIR',
-      defaultPortableDir: 'C:\\cc-haha\\CLAUDE_CONFIG_DIR',
-    })
-  })
-
-  it('hydrates app mode from an injected desktop host', async () => {
-    const getAppMode = vi.fn().mockResolvedValue({
-      mode: 'portable',
-      portableDir: 'D:\\cc-haha\\data',
-      defaultPortableDir: 'D:\\cc-haha\\data',
-    })
-    installElectronAppModeHost({ get: getAppMode })
-
-    const { useSettingsStore } = await import('./settingsStore')
-
-    await useSettingsStore.getState().fetchAppMode()
-
-    expect(getAppMode).toHaveBeenCalledTimes(1)
-    expect(useSettingsStore.getState().appMode).toEqual({
-      mode: 'portable',
-      portableDir: 'D:\\cc-haha\\data',
-      defaultPortableDir: 'D:\\cc-haha\\data',
-    })
-  })
-
-  it('persists app mode through the Electron desktop host and marks restart required', async () => {
-    const setAppMode = vi.fn().mockResolvedValue(undefined)
-    installElectronAppModeHost({ set: setAppMode })
-
-    const { useSettingsStore } = await import('./settingsStore')
-    useSettingsStore.setState({
-      appMode: {
-        mode: 'default',
-        portableDir: null,
-        defaultPortableDir: 'C:\\cc-haha\\CLAUDE_CONFIG_DIR',
-      },
-      appModeRequiresRestart: false,
-    })
-
-    await useSettingsStore.getState().setAppMode('portable')
-
-    expect(setAppMode).toHaveBeenCalledWith({
-      mode: 'portable',
-      portableDir: 'C:\\cc-haha\\CLAUDE_CONFIG_DIR',
-    })
-    expect(useSettingsStore.getState().appMode).toEqual({
-      mode: 'portable',
-      portableDir: 'C:\\cc-haha\\CLAUDE_CONFIG_DIR',
-      defaultPortableDir: 'C:\\cc-haha\\CLAUDE_CONFIG_DIR',
-      activeConfigDir: 'C:\\cc-haha\\CLAUDE_CONFIG_DIR',
+      portableDir: 'D:\\cc-haha-data',
+      activeConfigDir: 'D:\\cc-haha-data',
       configDirSource: 'portable',
     })
-    expect(useSettingsStore.getState().appModeRequiresRestart).toBe(true)
+    installElectronAppModeHost({ get: getAppMode })
+
+    const { useSettingsStore } = await import('./settingsStore')
+
+    await useSettingsStore.getState().fetchAppMode()
+
+    expect(getAppMode).toHaveBeenCalledTimes(1)
+    expect(useSettingsStore.getState().appMode).toEqual({
+      mode: 'portable',
+      portableDir: 'D:\\cc-haha-data',
+      activeConfigDir: 'D:\\cc-haha-data',
+      configDirSource: 'portable',
+    })
   })
 
-  it('persists app mode through an injected desktop host', async () => {
+  it('requires an explicit custom directory instead of inventing a default portable path', async () => {
     const setAppMode = vi.fn().mockResolvedValue(undefined)
     installElectronAppModeHost({ set: setAppMode })
 
@@ -494,21 +668,18 @@ describe('settingsStore app mode', () => {
       appMode: {
         mode: 'default',
         portableDir: null,
-        defaultPortableDir: 'D:\\cc-haha\\data',
+        activeConfigDir: 'C:\\Users\\test\\.claude',
+        configDirSource: 'system',
       },
       appModeRequiresRestart: false,
     })
 
-    await useSettingsStore.getState().setAppMode('portable')
-
-    expect(setAppMode).toHaveBeenCalledWith({
-      mode: 'portable',
-      portableDir: 'D:\\cc-haha\\data',
-    })
-    expect(useSettingsStore.getState().appModeRequiresRestart).toBe(true)
+    await expect(useSettingsStore.getState().setAppMode('portable')).rejects.toThrow('Choose an absolute custom data directory')
+    expect(setAppMode).not.toHaveBeenCalled()
+    expect(useSettingsStore.getState().appModeRequiresRestart).toBe(false)
   })
 
-  it('persists a user-selected portable directory', async () => {
+  it('persists a user-selected custom directory', async () => {
     const setAppMode = vi.fn().mockResolvedValue(undefined)
     installElectronAppModeHost({ set: setAppMode })
 
@@ -517,7 +688,8 @@ describe('settingsStore app mode', () => {
       appMode: {
         mode: 'default',
         portableDir: null,
-        defaultPortableDir: 'C:\\cc-haha\\CLAUDE_CONFIG_DIR',
+        activeConfigDir: 'C:\\Users\\test\\.claude',
+        configDirSource: 'system',
       },
       appModeRequiresRestart: false,
     })
@@ -531,9 +703,33 @@ describe('settingsStore app mode', () => {
     expect(useSettingsStore.getState().appMode).toMatchObject({
       mode: 'portable',
       portableDir: 'D:\\portable-data',
-      activeConfigDir: 'D:\\portable-data',
-      configDirSource: 'portable',
+      activeConfigDir: 'C:\\Users\\test\\.claude',
+      configDirSource: 'system',
     })
+    expect(useSettingsStore.getState().appModeRequiresRestart).toBe(true)
+  })
+
+  it('rolls back and surfaces app mode persistence failures', async () => {
+    const error = new Error('Data storage directory is not writable')
+    const setAppMode = vi.fn().mockRejectedValue(error)
+    installElectronAppModeHost({ set: setAppMode })
+
+    const { useSettingsStore } = await import('./settingsStore')
+    const prevAppMode = {
+      mode: 'default' as const,
+      portableDir: null,
+      activeConfigDir: 'C:\\Users\\test\\.claude',
+      configDirSource: 'system' as const,
+    }
+    useSettingsStore.setState({
+      appMode: prevAppMode,
+      appModeRequiresRestart: false,
+    })
+
+    await expect(useSettingsStore.getState().setAppMode('portable', 'D:\\blocked-data'))
+      .rejects.toThrow('Data storage directory is not writable')
+    expect(useSettingsStore.getState().appMode).toEqual(prevAppMode)
+    expect(useSettingsStore.getState().appModeRequiresRestart).toBe(false)
   })
 
   it('switches app mode back to the system data source', async () => {
@@ -545,7 +741,6 @@ describe('settingsStore app mode', () => {
       appMode: {
         mode: 'portable',
         portableDir: 'D:\\portable-data',
-        defaultPortableDir: 'C:\\cc-haha\\CLAUDE_CONFIG_DIR',
         activeConfigDir: 'D:\\portable-data',
         configDirSource: 'portable',
       },
@@ -561,9 +756,8 @@ describe('settingsStore app mode', () => {
     expect(useSettingsStore.getState().appMode).toEqual({
       mode: 'default',
       portableDir: null,
-      defaultPortableDir: 'C:\\cc-haha\\CLAUDE_CONFIG_DIR',
-      activeConfigDir: null,
-      configDirSource: 'system',
+      activeConfigDir: 'D:\\portable-data',
+      configDirSource: 'portable',
     })
     expect(useSettingsStore.getState().appModeRequiresRestart).toBe(true)
   })
@@ -811,6 +1005,82 @@ describe('settingsStore thinking persistence', () => {
   })
 })
 
+describe('settingsStore workflow keyword persistence', () => {
+  beforeEach(() => {
+    vi.resetModules()
+    vi.clearAllMocks()
+    window.localStorage.clear()
+  })
+
+  it('keeps the Ultracode trigger enabled for an old settings file with no field', async () => {
+    vi.doMock('../api/settings', () => ({
+      settingsApi: {
+        getUser: vi.fn().mockResolvedValue({}),
+        updateUser: vi.fn(),
+        getPermissionMode: vi.fn().mockResolvedValue({ mode: 'default' }),
+        setPermissionMode: vi.fn(),
+        getCliLauncherStatus: vi.fn(),
+      },
+    }))
+    vi.doMock('../api/models', () => ({
+      modelsApi: {
+        list: vi.fn().mockResolvedValue({ models: [] }),
+        getCurrent: vi.fn().mockResolvedValue({ model: null }),
+        setCurrent: vi.fn(),
+        getEffort: vi.fn().mockResolvedValue({ level: 'medium' }),
+        setEffort: vi.fn(),
+      },
+    }))
+    vi.doMock('../api/h5Access', () => ({
+      h5AccessApi: {
+        get: vi.fn().mockResolvedValue({
+          settings: {
+            enabled: false,
+            token: null,
+            tokenPreview: null,
+            allowedOrigins: [],
+            publicBaseUrl: null,
+            fixedPort: null,
+            disconnectGraceSeconds: null,
+          },
+        }),
+        enable: vi.fn(),
+        disable: vi.fn(),
+        regenerate: vi.fn(),
+        update: vi.fn(),
+      },
+    }))
+
+    const { useSettingsStore } = await import('./settingsStore')
+
+    await useSettingsStore.getState().fetchAll()
+
+    expect(useSettingsStore.getState().workflowKeywordTriggerEnabled).toBe(true)
+  })
+
+  it('persists both disabling and restoring the Ultracode trigger', async () => {
+    const updateUser = vi.fn().mockResolvedValue({})
+    vi.doMock('../api/settings', () => ({
+      settingsApi: {
+        getUser: vi.fn(),
+        updateUser,
+        getPermissionMode: vi.fn(),
+        setPermissionMode: vi.fn(),
+        getCliLauncherStatus: vi.fn(),
+      },
+    }))
+
+    const { useSettingsStore } = await import('./settingsStore')
+
+    await useSettingsStore.getState().setWorkflowKeywordTriggerEnabled(false)
+    await useSettingsStore.getState().setWorkflowKeywordTriggerEnabled(true)
+
+    expect(updateUser).toHaveBeenNthCalledWith(1, { workflowKeywordTriggerEnabled: false })
+    expect(updateUser).toHaveBeenNthCalledWith(2, { workflowKeywordTriggerEnabled: true })
+    expect(useSettingsStore.getState().workflowKeywordTriggerEnabled).toBe(true)
+  })
+})
+
 describe('settingsStore Auto-dream persistence', () => {
   beforeEach(() => {
     vi.resetModules()
@@ -1030,6 +1300,92 @@ describe('settingsStore desktop terminal shell persistence', () => {
       customShellPath: 'C:\\tools\\pwsh.exe',
     })
   })
+
+  it('does not let an older failed save roll back a newer successful selection', async () => {
+    const firstSave = createDeferred<Record<string, unknown>>()
+    const updateUser = vi.fn()
+      .mockImplementationOnce(() => firstSave.promise)
+      .mockResolvedValueOnce({ ok: true })
+
+    vi.doMock('../api/settings', () => ({
+      settingsApi: {
+        getUser: vi.fn(),
+        updateUser,
+        getPermissionMode: vi.fn(),
+        setPermissionMode: vi.fn(),
+        getCliLauncherStatus: vi.fn(),
+      },
+    }))
+
+    const { useSettingsStore } = await import('./settingsStore')
+    const oldRequest = useSettingsStore.getState().setDesktopTerminal({
+      startupShell: 'powershell',
+      customShellPath: '',
+    })
+    const oldRequestResult = oldRequest.catch((error) => error)
+    const newRequest = useSettingsStore.getState().setDesktopTerminal({
+      startupShell: 'pwsh',
+      customShellPath: '',
+    })
+
+    expect(useSettingsStore.getState().desktopTerminal).toEqual({
+      startupShell: 'pwsh',
+      customShellPath: '',
+    })
+    await vi.waitFor(() => {
+      expect(updateUser).toHaveBeenCalledTimes(1)
+    })
+
+    const saveError = new Error('first save failed')
+    firstSave.reject(saveError)
+
+    expect(await oldRequestResult).toBe(saveError)
+    await newRequest
+    expect(updateUser).toHaveBeenNthCalledWith(2, {
+      desktopTerminal: {
+        startupShell: 'pwsh',
+        customShellPath: '',
+      },
+    })
+    expect(useSettingsStore.getState().desktopTerminal).toEqual({
+      startupShell: 'pwsh',
+      customShellPath: '',
+    })
+  })
+
+  it('rolls back a latest failed save to the last successfully persisted terminal settings', async () => {
+    const updateUser = vi.fn()
+      .mockResolvedValueOnce({ ok: true })
+      .mockRejectedValueOnce(new Error('second save failed'))
+
+    vi.doMock('../api/settings', () => ({
+      settingsApi: {
+        getUser: vi.fn(),
+        updateUser,
+        getPermissionMode: vi.fn(),
+        setPermissionMode: vi.fn(),
+        getCliLauncherStatus: vi.fn(),
+      },
+    }))
+
+    const { useSettingsStore } = await import('./settingsStore')
+    const firstRequest = useSettingsStore.getState().setDesktopTerminal({
+      startupShell: 'powershell',
+      customShellPath: '',
+    })
+    const secondRequest = useSettingsStore.getState().setDesktopTerminal({
+      startupShell: 'pwsh',
+      customShellPath: '',
+    })
+
+    await firstRequest
+    await expect(secondRequest).rejects.toThrow('second save failed')
+
+    expect(useSettingsStore.getState().desktopTerminal).toEqual({
+      startupShell: 'powershell',
+      customShellPath: '',
+    })
+  })
 })
 
 describe('settingsStore theme persistence', () => {
@@ -1078,21 +1434,25 @@ describe('settingsStore theme persistence', () => {
     }))
 
     const { useSettingsStore } = await import('./settingsStore')
-    const { useUIStore } = await import('./uiStore')
+    const { useUIStore, initializeTheme, teardownTheme } = await import('./uiStore')
+    // The renderer bootstrap applies the theme; fetchAll must not disturb it.
+    initializeTheme()
 
     await useSettingsStore.getState().fetchAll()
 
-    expect(useSettingsStore.getState().theme).toBe('white')
     expect(useUIStore.getState().theme).toBe('white')
     expect(document.documentElement.getAttribute('data-theme')).toBe('white')
     expect(document.documentElement.style.colorScheme).toBe('light')
+    teardownTheme()
   })
 
-  it('hydrates the pure white theme from user settings', async () => {
+  it('keeps the desktop theme independent from the Claude user theme', async () => {
+    window.localStorage.setItem('cc-haha-theme', 'dark')
+    const updateUser = vi.fn()
     vi.doMock('../api/settings', () => ({
       settingsApi: {
-        getUser: vi.fn().mockResolvedValue({ theme: 'white' }),
-        updateUser: vi.fn(),
+        getUser: vi.fn().mockResolvedValue({ theme: 'light', unknownField: 'keep-me' }),
+        updateUser,
         getPermissionMode: vi.fn().mockResolvedValue({ mode: 'default' }),
         setPermissionMode: vi.fn(),
         getCliLauncherStatus: vi.fn(),
@@ -1125,14 +1485,21 @@ describe('settingsStore theme persistence', () => {
     }))
 
     const { useSettingsStore } = await import('./settingsStore')
-    const { useUIStore } = await import('./uiStore')
+    const { useUIStore, initializeTheme, teardownTheme } = await import('./uiStore')
+    // The renderer bootstrap applies the theme; fetchAll must not disturb it.
+    initializeTheme()
 
     await useSettingsStore.getState().fetchAll()
 
-    expect(useSettingsStore.getState().theme).toBe('white')
-    expect(useUIStore.getState().theme).toBe('white')
-    expect(document.documentElement.getAttribute('data-theme')).toBe('white')
-    expect(document.documentElement.style.colorScheme).toBe('light')
+    expect(useUIStore.getState().theme).toBe('dark')
+    expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+    expect(document.documentElement.style.colorScheme).toBe('dark')
+
+    await useSettingsStore.getState().setTheme('warm-classic')
+
+    expect(window.localStorage.getItem('cc-haha-theme')).toBe('warm-classic')
+    expect(updateUser).not.toHaveBeenCalled()
+    teardownTheme()
   })
 })
 

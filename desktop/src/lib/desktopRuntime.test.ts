@@ -113,6 +113,39 @@ describe('desktopRuntime browser H5 bootstrap', () => {
     expect(clientMocks.postVerify).not.toHaveBeenCalled()
   })
 
+  it('does not send a stored H5 token to a different query-selected server', async () => {
+    window.localStorage.setItem(H5_SERVER_URL_STORAGE_KEY, 'https://paired.example/app')
+    window.localStorage.setItem(H5_TOKEN_STORAGE_KEY, 'paired-server-token')
+    window.history.pushState({}, '', '/?serverUrl=https%3A%2F%2Fattacker.example%2Fapp')
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      healthOkResponse(),
+    ) as typeof fetch
+
+    await expect(initializeDesktopServerUrl()).rejects.toMatchObject({
+      name: 'H5ConnectionRequiredError',
+      serverUrl: 'https://attacker.example/app',
+      reason: 'missing-token',
+    } satisfies Partial<H5ConnectionRequiredError>)
+
+    expect(clientMocks.setAuthToken).toHaveBeenLastCalledWith(null)
+    expect(clientMocks.postVerify).not.toHaveBeenCalled()
+  })
+
+  it('reuses a stored H5 token only for its normalized server URL', async () => {
+    window.localStorage.setItem(H5_SERVER_URL_STORAGE_KEY, 'https://paired.example/app/')
+    window.localStorage.setItem(H5_TOKEN_STORAGE_KEY, 'paired-server-token')
+    window.history.pushState({}, '', '/?serverUrl=https%3A%2F%2Fpaired.example%2Fapp')
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      healthOkResponse(),
+    ) as typeof fetch
+    clientMocks.postVerify.mockResolvedValueOnce({ ok: true })
+
+    await expect(initializeDesktopServerUrl()).resolves.toBe('https://paired.example/app')
+
+    expect(clientMocks.setAuthToken).toHaveBeenLastCalledWith('paired-server-token')
+    expect(clientMocks.postVerify).toHaveBeenCalledWith('/api/h5-access/verify')
+  })
+
   it('uses the current browser origin when the H5 shell is served by the desktop server', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue(
       healthOkResponse(),
@@ -138,8 +171,7 @@ describe('desktopRuntime browser H5 bootstrap', () => {
       isDesktop: true,
       runtime: {
         getServerUrl: vi.fn().mockResolvedValue(serverUrl),
-        checkServerHealth: vi.fn().mockResolvedValue({ ok: true }),
-        httpRequest: vi.fn(),
+        getLocalAccessToken: vi.fn().mockResolvedValue('desktop-local-token'),
       },
     }
     globalThis.fetch = vi.fn().mockResolvedValue(
@@ -148,15 +180,40 @@ describe('desktopRuntime browser H5 bootstrap', () => {
 
     await expect(initializeDesktopServerUrl()).resolves.toBe(serverUrl)
 
-    const host = window.desktopHost
-    if (!host) throw new Error('desktopHost was not installed')
-    expect(host.runtime.getServerUrl).toHaveBeenCalledTimes(1)
-    expect(host.runtime.checkServerHealth).toHaveBeenCalledWith(serverUrl)
+    expect(window.desktopHost.runtime.getServerUrl).toHaveBeenCalledTimes(1)
     expect(clientMocks.setBaseUrl).toHaveBeenLastCalledWith(serverUrl)
-    expect(clientMocks.setAuthToken).toHaveBeenLastCalledWith(null)
-    expect(globalThis.fetch).toHaveBeenCalledWith(`${serverUrl}/api/status`, {
+    expect(clientMocks.setAuthToken).toHaveBeenLastCalledWith('desktop-local-token')
+    expect(globalThis.fetch).toHaveBeenCalledWith(`${serverUrl}/health`, {
       cache: 'no-store',
     })
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('still starts when the desktop host cannot resolve the local access token', async () => {
+    // The token only raises what the shell may do — loopback is trusted without
+    // it — so losing it must degrade rather than block startup.
+    const serverUrl = 'http://127.0.0.1:59232'
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    window.desktopHost = {
+      ...browserHost,
+      kind: 'electron',
+      isDesktop: true,
+      runtime: {
+        getServerUrl: vi.fn().mockResolvedValue(serverUrl),
+        getLocalAccessToken: vi.fn().mockRejectedValue(new Error('ipc channel missing')),
+      },
+    }
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      healthOkResponse(),
+    ) as typeof fetch
+
+    await expect(initializeDesktopServerUrl()).resolves.toBe(serverUrl)
+
+    expect(clientMocks.setBaseUrl).toHaveBeenLastCalledWith(serverUrl)
+    expect(clientMocks.setAuthToken).toHaveBeenLastCalledWith(null)
+    expect(consoleWarn).toHaveBeenCalled()
+
+    consoleWarn.mockRestore()
   })
 
   it('classifies browser H5 runtime using the desktop host boundary', () => {
@@ -182,8 +239,7 @@ describe('desktopRuntime browser H5 bootstrap', () => {
       isDesktop: true,
       runtime: {
         getServerUrl: vi.fn().mockRejectedValue(error),
-        checkServerHealth: vi.fn(),
-        httpRequest: vi.fn(),
+        getLocalAccessToken: vi.fn().mockResolvedValue('desktop-local-token'),
       },
     }
 

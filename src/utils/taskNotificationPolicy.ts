@@ -5,6 +5,7 @@ import {
   TASK_ID_TAG,
   TASK_TYPE_TAG,
   TOOL_USE_ID_TAG,
+  WORKFLOW_RUN_ID_TAG,
 } from '../constants/xml.js'
 
 type TaskNotificationStatus = 'completed' | 'failed' | 'stopped'
@@ -13,6 +14,7 @@ export type ParsedTaskNotification = {
   taskId: string
   toolUseId?: string
   taskType?: string
+  workflowRunId?: string
   outputFile: string
   status?: TaskNotificationStatus
   summary: string
@@ -46,6 +48,7 @@ export function parseTaskNotificationXml(text: string): ParsedTaskNotification {
     taskId: getTagValue(text, TASK_ID_TAG) ?? '',
     toolUseId: getTagValue(text, TOOL_USE_ID_TAG),
     taskType: getTagValue(text, TASK_TYPE_TAG),
+    workflowRunId: getTagValue(text, WORKFLOW_RUN_ID_TAG),
     outputFile: getTagValue(text, OUTPUT_FILE_TAG) ?? '',
     status: normalizeStatus(getTagValue(text, STATUS_TAG)),
     summary: getTagValue(text, SUMMARY_TAG) ?? '',
@@ -68,4 +71,33 @@ export function shouldForwardTaskNotificationToModel(
   if (!options.structuredOutput) return true
   if (!notification.status) return true
   return notification.taskType !== 'local_agent'
+}
+
+/**
+ * Collects structured-output local-agent completions until the whole active
+ * agent group settles. The CLI can then re-enter the model once with every
+ * result instead of once per agent (duplicate replies) or never (stalled
+ * coordinator turns).
+ */
+export class TaskNotificationFollowUpBatch {
+  private notifications: string[] = []
+
+  defer(notificationText: string): void {
+    if (notificationText.length > 0) {
+      this.notifications.push(notificationText)
+    }
+  }
+
+  hasPending(): boolean {
+    return this.notifications.length > 0
+  }
+
+  takeIfSettled(hasRunningBackgroundTasks: boolean): string | undefined {
+    if (hasRunningBackgroundTasks || this.notifications.length === 0) {
+      return undefined
+    }
+    const followUp = this.notifications.join('\n')
+    this.notifications = []
+    return followUp
+  }
 }

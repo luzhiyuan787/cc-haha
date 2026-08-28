@@ -5,7 +5,6 @@
  * then run: bun run whatsapp
  */
 
-import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import {
   normalizeMessageContent,
@@ -14,7 +13,7 @@ import {
 import { WsBridge, type ServerMessage, type AttachmentRef } from '../common/ws-bridge.js'
 import { MessageDedup } from '../common/message-dedup.js'
 import { enqueue } from '../common/chat-queue.js'
-import { getConfiguredWorkDir, loadConfig } from '../common/config.js'
+import { loadConfig } from '../common/config.js'
 import {
   formatImHelp,
   formatImStatus,
@@ -27,13 +26,14 @@ import {
   type PermissionDecision,
 } from '../common/permission.js'
 import { SessionStore } from '../common/session-store.js'
-import { AdapterHttpClient } from '../common/http-client.js'
+import { createAdapterClient } from '../common/adapter-client.js'
 import { restoreStoredSessionBinding } from '../common/session-recovery.js'
 import { isAllowedUser, tryPair } from '../common/pairing.js'
 import { AttachmentStore } from '../common/attachment/attachment-store.js'
 import { checkAttachmentLimit } from '../common/attachment/attachment-limits.js'
 import { ImageBlockWatcher } from '../common/attachment/image-block-watcher.js'
 import type { PendingUpload } from '../common/attachment/attachment-types.js'
+import { materializePendingUploadImage } from '../common/attachment/safe-remote-image.js'
 import {
   closeWhatsAppSocket,
   createWhatsAppSocket,
@@ -62,8 +62,7 @@ if (!hasWhatsAppAuth(authDir)) {
 const bridge = new WsBridge(config.serverUrl, 'whatsapp')
 const dedup = new MessageDedup()
 const sessionStore = new SessionStore()
-const defaultWorkDir = getConfiguredWorkDir(config, config.whatsapp)
-const httpClient = new AdapterHttpClient(config.serverUrl, { allowedProjectRoots: [defaultWorkDir] })
+const { httpClient, defaultWorkDir } = createAdapterClient(config, config.whatsapp)
 const attachmentStore = new AttachmentStore()
 attachmentStore.gc().catch((err) => {
   console.warn('[WhatsApp] AttachmentStore.gc failed:', err instanceof Error ? err.message : err)
@@ -247,25 +246,7 @@ async function showProjectPicker(chatId: string): Promise<void> {
 
 async function dispatchOutboundMedia(chatId: string, pending: PendingUpload): Promise<void> {
   try {
-    let buffer: Buffer
-    let mime = 'image/png'
-    switch (pending.source.kind) {
-      case 'base64':
-        buffer = Buffer.from(pending.source.data, 'base64')
-        mime = pending.source.mime
-        break
-      case 'path':
-        buffer = await fs.readFile(pending.source.path)
-        mime = pending.source.mime ?? 'image/png'
-        break
-      case 'url': {
-        const resp = await fetch(pending.source.url)
-        if (!resp.ok) throw new Error(`fetch ${pending.source.url} -> ${resp.status}`)
-        buffer = Buffer.from(await resp.arrayBuffer())
-        mime = pending.source.mime ?? resp.headers.get('content-type') ?? 'image/png'
-        break
-      }
-    }
+    const { buffer, mime } = await materializePendingUploadImage(pending.source)
     const check = checkAttachmentLimit('image', buffer.length, mime)
     if (!check.ok) {
       console.warn('[WhatsApp] Outbound image rejected:', check.hint)

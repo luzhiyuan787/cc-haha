@@ -3,11 +3,16 @@ import type { OpenAIReasoningEffort } from './types.js'
 export function normalizeOpenAIReasoningEffort(
   effort: unknown,
 ): OpenAIReasoningEffort | undefined {
-  if (effort === 'low' || effort === 'medium' || effort === 'high') {
+  if (
+    effort === 'none' ||
+    effort === 'minimal' ||
+    effort === 'low' ||
+    effort === 'medium' ||
+    effort === 'high' ||
+    effort === 'xhigh' ||
+    effort === 'max'
+  ) {
     return effort
-  }
-  if (effort === 'max') {
-    return 'high'
   }
   return undefined
 }

@@ -73,10 +73,14 @@ export type SkillSummary = {
 export class AdapterHttpClient {
   readonly httpBaseUrl: string
   private readonly allowedProjectRoots: string[]
+  private readonly localAccessToken: string | null
   /** Default timeout for HTTP requests (30 seconds) */
   private static readonly DEFAULT_TIMEOUT_MS = 30_000
 
-  constructor(wsUrl: string, options?: { allowedProjectRoots?: string[] }) {
+  constructor(
+    wsUrl: string,
+    options?: { allowedProjectRoots?: string[], localAccessToken?: string },
+  ) {
     this.httpBaseUrl = wsUrl
       .replace(/^ws:/, 'http:')
       .replace(/^wss:/, 'https:')
@@ -84,6 +88,17 @@ export class AdapterHttpClient {
     this.allowedProjectRoots = (options?.allowedProjectRoots ?? [])
       .map(resolveExistingProjectPath)
       .filter((value): value is string => Boolean(value))
+    this.localAccessToken = options?.localAccessToken?.trim() ||
+      process.env.CC_HAHA_LOCAL_ACCESS_TOKEN?.trim() ||
+      null
+  }
+
+  private request(pathname: string, init: RequestInit = {}): Promise<Response> {
+    const headers = new Headers(init.headers)
+    if (this.localAccessToken) {
+      headers.set('Authorization', `Bearer ${this.localAccessToken}`)
+    }
+    return fetch(`${this.httpBaseUrl}${pathname}`, { ...init, headers })
   }
 
   /** Create an AbortController with timeout */
@@ -97,12 +112,20 @@ export class AdapterHttpClient {
   }
 
   async createSession(workDir: string): Promise<string> {
+    const allowedWorkDir = this.resolveAllowedProjectPath(workDir)
+    if (!allowedWorkDir) {
+      throw new Error('Failed to create session: workDir is outside the configured project roots')
+    }
+
     const { controller, timer } = this.createTimeoutController()
     try {
-      const res = await fetch(`${this.httpBaseUrl}/api/sessions`, {
+      const res = await this.request('/api/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ workDir }),
+        // Omit permissionMode on purpose: the server falls back to the user's
+        // global default mode at launch (ws/handler.ts). Hardcoding a mode here
+        // would pin every IM-created session regardless of the user's setting.
+        body: JSON.stringify({ workDir: allowedWorkDir }),
         signal: controller.signal,
       })
       if (!res.ok) {
@@ -119,7 +142,7 @@ export class AdapterHttpClient {
   async sessionExists(sessionId: string): Promise<boolean> {
     const { controller, timer } = this.createTimeoutController()
     try {
-      const res = await fetch(`${this.httpBaseUrl}/api/sessions/${encodeURIComponent(sessionId)}`, {
+      const res = await this.request(`/api/sessions/${encodeURIComponent(sessionId)}`, {
         signal: controller.signal,
       })
       if (res.status === 404) return false
@@ -127,7 +150,13 @@ export class AdapterHttpClient {
         const err = await res.json().catch(() => ({ message: res.statusText }))
         throw new Error(`Failed to check session: ${(err as any).message}`)
       }
-      return true
+      const data = (await res.json()) as {
+        status?: {
+          workDir?: string
+          permissionMode?: string
+        }
+      }
+      return this.isSafeRemoteSession(data.status)
     } finally {
       clearTimeout(timer)
     }
@@ -136,14 +165,16 @@ export class AdapterHttpClient {
   async listRecentProjects(): Promise<RecentProject[]> {
     const { controller, timer } = this.createTimeoutController()
     try {
-      const res = await fetch(`${this.httpBaseUrl}/api/sessions/recent-projects`, {
+      const res = await this.request('/api/sessions/recent-projects', {
         signal: controller.signal,
       })
       if (!res.ok) {
         throw new Error(`Failed to list projects: ${res.statusText}`)
       }
       const data = (await res.json()) as { projects: RecentProject[] }
-      return data.projects
+      return data.projects.filter((project) =>
+        this.resolveAllowedProjectPath(project.realPath || project.projectPath),
+      )
     } finally {
       clearTimeout(timer)
     }
@@ -154,11 +185,10 @@ export class AdapterHttpClient {
    * Returns { project, ambiguous[] } — ambiguous is set when multiple projects match.
    */
   async matchProject(query: string): Promise<{ project?: RecentProject; ambiguous?: RecentProject[] }> {
-    const directPath = resolveExistingProjectPath(query)
-    if (directPath) {
-      if (!isPathWithinAllowedRoots(directPath, this.allowedProjectRoots)) {
-        return {}
-      }
+    const resolvedDirectPath = resolveExistingProjectPath(query)
+    if (resolvedDirectPath) {
+      const directPath = this.resolveAllowedProjectPath(resolvedDirectPath)
+      if (!directPath) return {}
 
       return {
         project: {
@@ -184,9 +214,12 @@ export class AdapterHttpClient {
 
     const q = query.toLowerCase()
 
-    // Exact project name match
-    const exact = projects.find(p => p.projectName.toLowerCase() === q)
-    if (exact) return { project: exact }
+    // Exact project name match. Different roots can contain repositories with
+    // the same basename, so an exact name is still ambiguous when it identifies
+    // more than one canonical project.
+    const exact = projects.filter(p => p.projectName.toLowerCase() === q)
+    if (exact.length === 1) return { project: exact[0] }
+    if (exact.length > 1) return { ambiguous: exact }
 
     // Fuzzy: name or path contains query
     const matches = projects.filter(p =>
@@ -202,7 +235,7 @@ export class AdapterHttpClient {
   async getGitInfo(sessionId: string): Promise<GitInfo> {
     const { controller, timer } = this.createTimeoutController()
     try {
-      const res = await fetch(`${this.httpBaseUrl}/api/sessions/${encodeURIComponent(sessionId)}/git-info`, {
+      const res = await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/git-info`, {
         signal: controller.signal,
       })
       if (!res.ok) {
@@ -218,7 +251,7 @@ export class AdapterHttpClient {
   async getTasksForSession(sessionId: string): Promise<SessionTask[]> {
     const { controller, timer } = this.createTimeoutController()
     try {
-      const res = await fetch(`${this.httpBaseUrl}/api/tasks/lists/${encodeURIComponent(sessionId)}`, {
+      const res = await this.request(`/api/tasks/lists/${encodeURIComponent(sessionId)}`, {
         signal: controller.signal,
       })
       if (!res.ok) {
@@ -238,6 +271,10 @@ export class AdapterHttpClient {
     limit?: number
     offset?: number
   }): Promise<{ sessions: SessionListItem[]; total: number }> {
+    if (options?.project && !this.resolveAllowedProjectPath(options.project)) {
+      return { sessions: [], total: 0 }
+    }
+
     const params = new URLSearchParams()
     if (options?.project) params.set('project', options.project)
     if (options?.limit !== undefined) params.set('limit', String(options.limit))
@@ -246,14 +283,19 @@ export class AdapterHttpClient {
 
     const { controller, timer } = this.createTimeoutController()
     try {
-      const res = await fetch(`${this.httpBaseUrl}/api/sessions${suffix}`, {
+      const res = await this.request(`/api/sessions${suffix}`, {
         signal: controller.signal,
       })
       if (!res.ok) {
         const err = await res.json().catch(() => ({ message: res.statusText }))
         throw new Error(`Failed to list sessions: ${(err as any).message}`)
       }
-      return (await res.json()) as { sessions: SessionListItem[]; total: number }
+      const data = (await res.json()) as { sessions: SessionListItem[]; total: number }
+      const sessions = data.sessions.filter((session) => this.isSafeRemoteSession({
+        workDir: session.workDir,
+        permissionMode: session.permissionMode,
+      }))
+      return { sessions, total: sessions.length }
     } finally {
       clearTimeout(timer)
     }
@@ -262,7 +304,7 @@ export class AdapterHttpClient {
   async listProviders(): Promise<{ providers: ProviderSummary[]; activeId: string | null }> {
     const { controller, timer } = this.createTimeoutController()
     try {
-      const res = await fetch(`${this.httpBaseUrl}/api/providers`, {
+      const res = await this.request('/api/providers', {
         signal: controller.signal,
       })
       if (!res.ok) {
@@ -286,7 +328,7 @@ export class AdapterHttpClient {
   async listModels(): Promise<{ models: ModelSummary[]; provider: { id: string; name: string } | null }> {
     const { controller, timer } = this.createTimeoutController()
     try {
-      const res = await fetch(`${this.httpBaseUrl}/api/models`, {
+      const res = await this.request('/api/models', {
         signal: controller.signal,
       })
       if (!res.ok) {
@@ -302,7 +344,7 @@ export class AdapterHttpClient {
   async getCurrentModel(): Promise<{ model: ModelSummary }> {
     const { controller, timer } = this.createTimeoutController()
     try {
-      const res = await fetch(`${this.httpBaseUrl}/api/models/current`, {
+      const res = await this.request('/api/models/current', {
         signal: controller.signal,
       })
       if (!res.ok) {
@@ -320,10 +362,15 @@ export class AdapterHttpClient {
   }
 
   async listSkills(cwd: string): Promise<{ skills: SkillSummary[] }> {
-    const params = new URLSearchParams({ cwd })
+    const allowedCwd = this.resolveAllowedProjectPath(cwd)
+    if (!allowedCwd) {
+      throw new Error('Failed to list skills: cwd is outside the configured project roots')
+    }
+
+    const params = new URLSearchParams({ cwd: allowedCwd })
     const { controller, timer } = this.createTimeoutController()
     try {
-      const res = await fetch(`${this.httpBaseUrl}/api/skills?${params.toString()}`, {
+      const res = await this.request(`/api/skills?${params.toString()}`, {
         signal: controller.signal,
       })
       if (!res.ok) {
@@ -339,7 +386,7 @@ export class AdapterHttpClient {
   private async postJson(pathname: string): Promise<void> {
     const { controller, timer } = this.createTimeoutController()
     try {
-      const res = await fetch(`${this.httpBaseUrl}${pathname}`, {
+      const res = await this.request(pathname, {
         method: 'POST',
         signal: controller.signal,
       })
@@ -355,7 +402,7 @@ export class AdapterHttpClient {
   private async putJson(pathname: string, body: Record<string, unknown>): Promise<void> {
     const { controller, timer } = this.createTimeoutController()
     try {
-      const res = await fetch(`${this.httpBaseUrl}${pathname}`, {
+      const res = await this.request(pathname, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -368,6 +415,24 @@ export class AdapterHttpClient {
     } finally {
       clearTimeout(timer)
     }
+  }
+
+  private resolveAllowedProjectPath(value: string | null | undefined): string | null {
+    if (!value) return null
+    const resolved = resolveExistingProjectPath(value)
+    if (!resolved || !isPathWithinAllowedRoots(resolved, this.allowedProjectRoots)) {
+      return null
+    }
+    return resolved
+  }
+
+  private isSafeRemoteSession(
+    status: { workDir?: string | null; permissionMode?: string } | undefined,
+  ): boolean {
+    if (!status?.workDir || status.permissionMode === 'bypassPermissions') {
+      return false
+    }
+    return Boolean(this.resolveAllowedProjectPath(status.workDir))
   }
 }
 

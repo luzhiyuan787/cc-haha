@@ -1,6 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useDismissable } from '@/hooks/useDismissable'
+import { BrandSeal } from '@/components/composite/BrandSeal'
+import { Button } from '@/components/ui/Button'
+import { IconButton } from '@/components/ui/IconButton'
 import { ApiError } from '../api/client'
 import { agentsApi } from '../api/agents'
+import { providersApi } from '../api/providers'
 import { skillsApi } from '../api/skills'
 import { useTranslation } from '../i18n'
 import { useSessionStore } from '../stores/sessionStore'
@@ -11,7 +16,7 @@ import { useSessionRuntimeStore, DRAFT_RUNTIME_SELECTION_KEY } from '../stores/s
 import { useSettingsStore } from '../stores/settingsStore'
 import { useUIStore } from '../stores/uiStore'
 import { SETTINGS_TAB_ID, useTabStore } from '../stores/tabStore'
-import { RepositoryLaunchControls } from '../components/shared/RepositoryLaunchControls'
+import { RepositoryLaunchControls } from '@/components/chat/RepositoryLaunchControls'
 import { PermissionModeSelector } from '../components/controls/PermissionModeSelector'
 import { ModelSelector, type ModelSelectorHandle } from '../components/controls/ModelSelector'
 import { AttachmentGallery } from '../components/chat/AttachmentGallery'
@@ -19,23 +24,37 @@ import { ComposerDropOverlay } from '../components/chat/ComposerDropOverlay'
 import { ContextUsageIndicator } from '../components/chat/ContextUsageIndicator'
 import { FileSearchMenu, type FileSearchMenuHandle } from '../components/chat/FileSearchMenu'
 import { LocalSlashCommandPanel, type LocalSlashCommandName } from '../components/chat/LocalSlashCommandPanel'
+import {
+  getSlashCommandOptionId,
+  SlashCommandMenu,
+} from '../components/chat/SlashCommandMenu'
 import { useMobileViewport } from '../hooks/useMobileViewport'
 import { isDesktopRuntime } from '../lib/desktopRuntime'
-import { publicAssetPath } from '../lib/publicAsset'
-import { resolveActiveProviderRuntimeSelection } from '../lib/runtimeSelection'
+import {
+  normalizeRuntimeSelection,
+  resolveActiveProviderRuntimeSelection,
+} from '../lib/runtimeSelection'
 import {
   filesToComposerAttachments,
+  getDataTransferFiles,
   selectNativeFileAttachments,
   type ComposerAttachment,
 } from '../lib/composerAttachments'
 import { useComposerFileDrop } from '../components/chat/useComposerFileDrop'
 import { shouldSubmitOnEnter } from '../components/chat/sendShortcut'
+import { MentionComposer, type MentionComposerHandle } from '../components/chat/MentionComposer'
+import {
+  findMentionRanges,
+  insertMentionIntoText,
+  type ComposerMention,
+} from '../lib/composerMentions'
 import {
   appendAgentSlashCommands,
   buildAgentSlashCommands,
   getLocalizedFallbackCommands,
   filterSlashCommands,
   findSlashToken,
+  groupSlashCommands,
   insertSlashTrigger,
   mergeSlashCommands,
   replaceSlashCommand,
@@ -88,6 +107,7 @@ function resolveCreateSessionErrorMessage(error: unknown, t: Translate): string 
 export function EmptySession() {
   const t = useTranslation()
   const [input, setInput] = useState('')
+  const [mentions, setMentions] = useState<ComposerMention[]>([])
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [workDir, setWorkDir] = useState('')
   const [selectedBranch, setSelectedBranch] = useState<string | null>(null)
@@ -104,14 +124,16 @@ export function EmptySession() {
   const [slashSelectedIndex, setSlashSelectedIndex] = useState(0)
   const [slashCommands, setSlashCommands] = useState<SlashCommandOption[]>([])
   const [agentSlashCommands, setAgentSlashCommands] = useState<SlashCommandOption[]>([])
-  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const composerRef = useRef<MentionComposerHandle>(null)
+  const composerContainerRef = useRef<HTMLDivElement>(null)
   const panelRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const modelSelectorRef = useRef<ModelSelectorHandle>(null)
   const plusMenuRef = useRef<HTMLDivElement>(null)
   const slashMenuRef = useRef<HTMLDivElement>(null)
   const fileSearchRef = useRef<FileSearchMenuHandle>(null)
-  const slashItemRefs = useRef<(HTMLButtonElement | null)[]>([])
+  const slashItemRefs = useRef<(HTMLElement | null)[]>([])
+  const slashMenuId = useId()
   const createSession = useSessionStore((state) => state.createSession)
   const sendMessage = useChatStore((state) => state.sendMessage)
   const connectToSession = useChatStore((state) => state.connectToSession)
@@ -119,6 +141,7 @@ export function EmptySession() {
   const addToast = useUIStore((state) => state.addToast)
   const currentModel = useSettingsStore((state) => state.currentModel)
   const activeProviderName = useSettingsStore((state) => state.activeProviderName)
+  const effortLevel = useSettingsStore((state) => state.effortLevel)
   const chatSendBehavior = useSettingsStore((state) => state.chatSendBehavior)
   const defaultPermissionMode = useSettingsStore((state) => state.permissionMode)
   const providers = useProviderStore((state) => state.providers)
@@ -133,68 +156,39 @@ export function EmptySession() {
   const isMobileComposer = useMobileViewport() && !isDesktopRuntime()
 
   useEffect(() => {
-    textareaRef.current?.focus()
+    composerRef.current?.focus()
   }, [])
 
-  useEffect(() => {
-    if (!plusMenuOpen) return
-    const handleClick = (event: MouseEvent) => {
-      if (plusMenuRef.current && !plusMenuRef.current.contains(event.target as Node)) {
-        setPlusMenuOpen(false)
-      }
-    }
-    document.addEventListener('mousedown', handleClick)
-    return () => document.removeEventListener('mousedown', handleClick)
-  }, [plusMenuOpen])
+  useDismissable({
+    open: plusMenuOpen,
+    refs: [plusMenuRef],
+    onDismiss: () => setPlusMenuOpen(false),
+  })
 
-  useEffect(() => {
-    if (!slashMenuOpen) return
-    const handleClick = (event: MouseEvent) => {
-      if (
-        slashMenuRef.current &&
-        !slashMenuRef.current.contains(event.target as Node) &&
-        textareaRef.current &&
-        !textareaRef.current.contains(event.target as Node)
-      ) {
-        setSlashMenuOpen(false)
-      }
-    }
-    document.addEventListener('mousedown', handleClick)
-    return () => document.removeEventListener('mousedown', handleClick)
-  }, [slashMenuOpen])
+  useDismissable({
+    open: slashMenuOpen,
+    refs: [slashMenuRef, composerContainerRef],
+    onDismiss: () => setSlashMenuOpen(false),
+  })
 
-  useEffect(() => {
-    if (!localSlashPanel) return
-    const handleClick = (event: MouseEvent) => {
-      if (
-        slashMenuRef.current &&
-        !slashMenuRef.current.contains(event.target as Node) &&
-        textareaRef.current &&
-        !textareaRef.current.contains(event.target as Node)
-      ) {
-        setLocalSlashPanel(null)
-      }
-    }
-    document.addEventListener('mousedown', handleClick)
-    return () => document.removeEventListener('mousedown', handleClick)
-  }, [localSlashPanel])
+  useDismissable({
+    open: !!localSlashPanel,
+    refs: [slashMenuRef, composerContainerRef],
+    onDismiss: () => setLocalSlashPanel(null),
+  })
 
-  useEffect(() => {
-    if (!fileSearchOpen) return
-    const handleClick = (event: MouseEvent) => {
+  useDismissable({
+    open: fileSearchOpen,
+    refs: [composerContainerRef],
+    onDismiss: () => setFileSearchOpen(false),
+    // See ChatInput: this menu is found by id, and its absence used to mean
+    // "ignore the press".
+    isExempt: (target) => {
       const menu = document.getElementById('file-search-menu')
-      if (
-        menu &&
-        !menu.contains(event.target as Node) &&
-        textareaRef.current &&
-        !textareaRef.current.contains(event.target as Node)
-      ) {
-        setFileSearchOpen(false)
-      }
-    }
-    document.addEventListener('mousedown', handleClick)
-    return () => document.removeEventListener('mousedown', handleClick)
-  }, [fileSearchOpen])
+      if (!menu) return true
+      return target instanceof Node && menu.contains(target)
+    },
+  })
 
   useEffect(() => {
     let cancelled = false
@@ -210,6 +204,10 @@ export function EmptySession() {
             .map((skill) => ({
               name: skill.name,
               description: skill.description,
+              kind: 'skill' as const,
+              ...(skill.source === 'user' || skill.source === 'project' || skill.source === 'plugin'
+                ? { source: skill.source }
+                : {}),
             })),
         )
       })
@@ -259,9 +257,11 @@ export function EmptySession() {
     setRepositoryLaunchReady(!newWorkDir)
   }
 
-  const filteredCommands = useMemo(() => {
-    return filterSlashCommands(allSlashCommands, slashFilter)
+  const filteredCommandGroups = useMemo(() => {
+    return groupSlashCommands(filterSlashCommands(allSlashCommands, slashFilter))
   }, [allSlashCommands, slashFilter])
+  const filteredCommands = filteredCommandGroups.ordered
+  const isSlashMenuVisible = slashMenuOpen && filteredCommands.length > 0
 
   const exactSlashCommand = useMemo(() => {
     const normalized = slashFilter.trim().toLowerCase()
@@ -293,6 +293,7 @@ export function EmptySession() {
     if (slashUiAction?.type === 'panel') {
       setLocalSlashPanel(slashUiAction.command as LocalSlashCommandName)
       setInput('')
+      setMentions([])
       setSlashMenuOpen(false)
       setFileSearchOpen(false)
       setPlusMenuOpen(false)
@@ -303,6 +304,7 @@ export function EmptySession() {
       useUIStore.getState().setPendingSettingsTab(slashUiAction.tab)
       useTabStore.getState().openTab(SETTINGS_TAB_ID, 'Settings', 'settings')
       setInput('')
+      setMentions([])
       setSlashMenuOpen(false)
       setFileSearchOpen(false)
       setPlusMenuOpen(false)
@@ -312,6 +314,7 @@ export function EmptySession() {
     if (slashUiAction?.type === 'model') {
       modelSelectorRef.current?.open()
       setInput('')
+      setMentions([])
       setSlashMenuOpen(false)
       setFileSearchOpen(false)
       setPlusMenuOpen(false)
@@ -320,6 +323,13 @@ export function EmptySession() {
 
     setIsSubmitting(true)
     try {
+      const authStatus = await providersApi.authStatus()
+      if (!authStatus.hasAuth) {
+        useUIStore.getState().setPendingSettingsTab('providers')
+        useTabStore.getState().openTab(SETTINGS_TAB_ID, t('sidebar.settings'), 'settings')
+        return
+      }
+
       const runtimeStore = useSessionRuntimeStore.getState()
       const explicitDraftSelection = runtimeStore.selections[DRAFT_RUNTIME_SELECTION_KEY]
       const defaultActiveProviderSelection = explicitDraftSelection
@@ -330,7 +340,28 @@ export function EmptySession() {
           providers,
           currentModel?.id,
         )
-      const runtimeSelection = explicitDraftSelection ?? defaultActiveProviderSelection ?? undefined
+      const activeCustomProvider = defaultActiveProviderSelection
+        ? providers.find((provider) => provider.id === defaultActiveProviderSelection.providerId)
+        : undefined
+      const defaultRuntimeSelection = defaultActiveProviderSelection && activeCustomProvider
+        ? normalizeRuntimeSelection(
+          { ...defaultActiveProviderSelection, effortLevel },
+          activeCustomProvider.apiFormat,
+        )
+        : defaultActiveProviderSelection
+      const claudeOAuthRuntimeSelection = !explicitDraftSelection &&
+        authStatus.source === 'claude-oauth' &&
+        activeProviderId === null &&
+        currentModel?.id
+        ? {
+            providerId: null,
+            modelId: currentModel.id,
+            effortLevel,
+          }
+        : undefined
+      const runtimeSelection = explicitDraftSelection
+        ?? defaultRuntimeSelection
+        ?? claudeOAuthRuntimeSelection
       const sessionId = await createSession(
         workDir || undefined,
         {
@@ -356,10 +387,14 @@ export function EmptySession() {
         data: attachment.data,
         mimeType: attachment.mimeType,
       }))
-      if (text || attachmentPayload.length > 0) {
-        sendMessage(sessionId, text, attachmentPayload)
+      // Inline @-mentions go out as the `@"absolute path"` text the CLI parses,
+      // serialized from the live document; the bubble keeps the pill text.
+      const serializedText = (composerRef.current?.getModelContent() ?? input).trim()
+      if (serializedText || attachmentPayload.length > 0) {
+        sendMessage(sessionId, serializedText, attachmentPayload, { displayContent: text })
       }
       setInput('')
+      setMentions([])
       setAttachments([])
     } catch (error) {
       addToast({
@@ -371,8 +406,10 @@ export function EmptySession() {
     }
   }
 
-  const handleInputChange = (value: string, cursorPos: number) => {
+  const handleComposerChange = (value: string, nextMentions: ComposerMention[]) => {
     setInput(value)
+    setMentions(nextMentions)
+    const cursorPos = composerRef.current?.getSelectionOffsets().start ?? value.length
     const token = findSlashToken(value, cursorPos)
     if (!token) {
       setSlashMenuOpen(false)
@@ -381,7 +418,8 @@ export function EmptySession() {
       setSlashMenuOpen(true)
     }
 
-    // Detect @ trigger for file search
+    // Detect @ trigger for file search, skipping an `@` that belongs to an
+    // existing mention pill.
     const textBeforeCursor = value.slice(0, cursorPos)
     let pos = -1
     for (let i = textBeforeCursor.length - 1; i >= 0; i--) {
@@ -397,6 +435,9 @@ export function EmptySession() {
         break
       }
     }
+    if (pos >= 0 && findMentionRanges(value, nextMentions).some((range) => pos >= range.start && pos < range.end)) {
+      pos = -1
+    }
     if (pos < 0) {
       setFileSearchOpen(false)
       setAtFilter('')
@@ -409,9 +450,9 @@ export function EmptySession() {
     }
   }
 
-  const handleKeyDown = (event: React.KeyboardEvent) => {
+  const handleComposerKeyDown = (event: KeyboardEvent): boolean => {
     // Ignore key events during IME composition (e.g. Chinese input method)
-    if (event.nativeEvent.isComposing) return
+    if (event.isComposing || event.keyCode === 229) return false
 
     // Route file search navigation keys to FileSearchMenu
     if (fileSearchOpen) {
@@ -422,24 +463,24 @@ export function EmptySession() {
           setFileSearchOpen(false)
           setAtFilter('')
           setAtCursorPos(-1)
-          return
+          return true
         }
-        fileSearchRef.current?.handleKeyDown(event.nativeEvent)
-        return
+        fileSearchRef.current?.handleKeyDown(event)
+        return true
       }
-      return
+      return false
     }
 
     if (slashMenuOpen && filteredCommands.length > 0) {
       if (event.key === 'ArrowDown') {
         event.preventDefault()
         setSlashSelectedIndex((prev) => (prev + 1) % filteredCommands.length)
-        return
+        return true
       }
       if (event.key === 'ArrowUp') {
         event.preventDefault()
         setSlashSelectedIndex((prev) => (prev - 1 + filteredCommands.length) % filteredCommands.length)
-        return
+        return true
       }
       if (event.key === 'Enter' || event.key === 'Tab') {
         const selected = filteredCommands[slashSelectedIndex]
@@ -452,57 +493,41 @@ export function EmptySession() {
         ) {
           event.preventDefault()
           void handleSubmit()
-          return
+          return true
         }
         event.preventDefault()
         if (selected) selectSlashCommand(selected.name)
-        return
+        return true
       }
       if (event.key === 'Escape') {
         event.preventDefault()
         setSlashMenuOpen(false)
-        return
+        return true
       }
     }
 
     if (shouldSubmitOnEnter(event, chatSendBehavior)) {
       event.preventDefault()
-      handleSubmit()
+      void handleSubmit()
+      return true
     }
+    return false
   }
 
-  const handlePaste = (event: React.ClipboardEvent) => {
-    const items = event.clipboardData?.items
-    if (!items) return
+  const handleComposerPaste = (event: ClipboardEvent): boolean => {
+    const files = event.clipboardData ? getDataTransferFiles(event.clipboardData) : []
+    if (files.length === 0) return false
 
-    let hasImage = false
-    for (let i = 0; i < items.length; i += 1) {
-      const item = items[i]
-      if (!item || !item.type.startsWith('image/')) continue
-
-      hasImage = true
-      event.preventDefault()
-      const file = item.getAsFile()
-      if (!file) continue
-      const id = `att-${Date.now()}-${Math.random().toString(36).slice(2)}`
-      const reader = new FileReader()
-      reader.onload = () => {
-        setAttachments((prev) => [
-          ...prev,
-          {
-            id,
-            name: `pasted-image-${Date.now()}.png`,
-            type: 'image',
-            mimeType: file.type || undefined,
-            previewUrl: reader.result as string,
-            data: reader.result as string,
-          },
-        ])
-      }
-      reader.readAsDataURL(file)
-    }
-
-    if (!hasImage) return
+    event.preventDefault()
+    void filesToComposerAttachments(files)
+      .then((nextAttachments) => {
+        if (nextAttachments.length === 0) return
+        setAttachments((prev) => [...prev, ...nextAttachments])
+      })
+      .catch((error) => {
+        console.warn('[attachments] Failed to read pasted files', error)
+      })
+    return true
   }
 
   const appendFiles = useCallback((files: FileList | File[]) => {
@@ -561,57 +586,50 @@ export function EmptySession() {
   }
 
   const selectSlashCommand = (command: string) => {
-    const el = textareaRef.current
-    if (!el) return
-    const cursorPos = el.selectionStart ?? input.length
+    const cursorPos = composerRef.current?.getSelectionOffsets().start ?? input.length
     const replacement = replaceSlashCommand(input, cursorPos, command)
     if (!replacement) return
     setInput(replacement.value)
     setSlashMenuOpen(false)
     requestAnimationFrame(() => {
-      el.focus()
-      el.setSelectionRange(replacement.cursorPos, replacement.cursorPos)
+      composerRef.current?.focus()
+      composerRef.current?.setSelectionOffsets(replacement.cursorPos)
     })
   }
 
   const insertSlashCommand = () => {
-    const el = textareaRef.current
-    const cursorPos = el?.selectionStart ?? input.length
+    const cursorPos = composerRef.current?.getSelectionOffsets().start ?? input.length
     const replacement = insertSlashTrigger(input, cursorPos)
     setInput(replacement.value)
     setPlusMenuOpen(false)
     setSlashFilter('')
     setSlashMenuOpen(true)
     requestAnimationFrame(() => {
-      textareaRef.current?.focus()
-      textareaRef.current?.setSelectionRange(replacement.cursorPos, replacement.cursorPos)
+      composerRef.current?.focus()
+      composerRef.current?.setSelectionOffsets(replacement.cursorPos)
     })
   }
 
   return (
     <div className="relative flex flex-1 flex-col overflow-hidden bg-[var(--color-surface)]">
-      <div className={`flex flex-1 flex-col items-center justify-center ${
+      <div className={`brand-seal-glow flex flex-1 flex-col items-center justify-center ${
         isMobileComposer ? 'px-6 pb-[230px] pt-10' : 'p-8 pb-32'
       }`}>
         <div className={`flex flex-col items-center text-center ${
-          isMobileComposer ? 'max-w-[300px]' : 'max-w-md'
+          isMobileComposer ? 'max-w-[300px] gap-3' : 'max-w-[420px] gap-[13px]'
         }`}>
-          <img
-            src={publicAssetPath('app-icon.png')}
-            alt="Claude Code Haha"
-            className={isMobileComposer ? 'mb-4 h-16 w-16' : 'mb-6 h-24 w-24'}
-          />
+          <BrandSeal size={isMobileComposer ? 'lg' : 'xl'} />
           <h1
-            className={`mb-2 font-extrabold tracking-tight text-[var(--color-text-primary)] ${
-              isMobileComposer ? 'text-2xl' : 'text-3xl'
+            className={`font-bold tracking-tight text-[var(--color-text-primary)] ${
+              isMobileComposer ? 'text-2xl' : 'text-[27px]'
             }`}
             style={{ fontFamily: 'var(--font-headline)' }}
           >
             {t('empty.title')}
           </h1>
           <p
-            className={`mx-auto text-[var(--color-text-secondary)] ${
-              isMobileComposer ? 'max-w-[280px] text-sm leading-6' : 'max-w-xs'
+            className={`mx-auto -mt-1 text-[var(--color-text-secondary)] ${
+              isMobileComposer ? 'max-w-[280px] text-sm leading-6' : 'text-[15px] leading-[1.7]'
             }`}
             style={{ fontFamily: 'var(--font-body)' }}
           >
@@ -622,7 +640,7 @@ export function EmptySession() {
 
       <div
         data-testid="empty-session-composer-shell"
-        className={`absolute left-0 right-0 z-30 flex justify-center ${
+        className={`absolute left-0 right-0 z-[var(--z-nav)] flex justify-center ${
         isMobileComposer
           ? 'bottom-0 px-3 pb-[calc(env(safe-area-inset-bottom)+10px)]'
           : 'bottom-4 px-8'
@@ -632,8 +650,8 @@ export function EmptySession() {
           <div
             ref={panelRef}
             data-testid="empty-session-composer-panel"
-            className={`glass-panel relative flex flex-col gap-3 overflow-visible ${
-              isMobileComposer ? 'rounded-2xl p-3 shadow-[0_-12px_36px_rgba(54,35,28,0.12)]' : 'rounded-xl p-0'
+            className={`glass-panel glass-panel--composer relative flex flex-col gap-3 overflow-visible rounded-[var(--radius-2xl)] ${
+              isMobileComposer ? 'p-3' : 'p-0'
             } ${isDragActive ? 'composer-drop-target-active' : ''}`}
             {...dragHandlers}
           >
@@ -660,37 +678,28 @@ export function EmptySession() {
                     setInput(newValue)
                     setAtFilter(relativePath)
                     requestAnimationFrame(() => {
-                      textareaRef.current?.focus()
-                      textareaRef.current?.setSelectionRange(newCursorPos, newCursorPos)
+                      composerRef.current?.focus()
+                      composerRef.current?.setSelectionOffsets(newCursorPos)
                     })
                   }}
-                  onSelect={(path, name) => {
-                    if (atCursorPos >= 0) {
-                      const attachmentName = name.split('/').filter(Boolean).pop() ?? name
-                      const tokenEnd = atCursorPos + 1 + atFilter.length
-                      const beforeToken = input.slice(0, atCursorPos)
-                      const afterToken = beforeToken ? input.slice(tokenEnd) : input.slice(tokenEnd).replace(/^\s+/, '')
-                      const spacer = beforeToken && afterToken && !/\s$/.test(beforeToken) && !/^\s/.test(afterToken) ? ' ' : ''
-                      const newValue = `${beforeToken}${spacer}${afterToken}`
-                      const newCursorPos = atCursorPos + spacer.length
-                      setAttachments((prev) => [
-                        ...prev,
-                        {
-                          id: `att-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-                          name: attachmentName,
-                          type: 'file',
-                          path,
-                        },
-                      ])
-                      setInput(newValue)
-                      setFileSearchOpen(false)
-                      setAtFilter('')
-                      setAtCursorPos(-1)
-                      void textareaRef.current?.focus()
-                      requestAnimationFrame(() => {
-                        textareaRef.current?.setSelectionRange(newCursorPos, newCursorPos)
-                      })
-                    }
+                  onSelect={(path, name, isDirectory) => {
+                    if (atCursorPos < 0) return
+                    const referenceName = name.split('/').filter(Boolean).pop() ?? name
+                    const tokenEnd = atCursorPos + 1 + atFilter.length
+                    const inserted = insertMentionIntoText(input, mentions, atCursorPos, tokenEnd, {
+                      label: isDirectory ? `${referenceName}/` : referenceName,
+                      path,
+                      isDirectory,
+                    })
+                    setInput(inserted.text)
+                    setMentions(inserted.mentions)
+                    setFileSearchOpen(false)
+                    setAtFilter('')
+                    setAtCursorPos(-1)
+                    void composerRef.current?.focus()
+                    requestAnimationFrame(() => {
+                      composerRef.current?.setSelectionOffsets(inserted.cursorPos)
+                    })
                   }}
                 />
               )}
@@ -706,35 +715,17 @@ export function EmptySession() {
                 </div>
               )}
 
-              {slashMenuOpen && filteredCommands.length > 0 && (
-                <div
+              {isSlashMenuVisible && (
+                <SlashCommandMenu
                   ref={slashMenuRef}
-                  className="absolute bottom-full left-0 right-0 z-50 mb-2 overflow-hidden rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] shadow-[var(--shadow-dropdown)]"
-                >
-                  <div className="max-h-[260px] overflow-y-auto py-1">
-                    {filteredCommands.map((command, index) => (
-                      <button
-                        key={command.name}
-                        ref={(el) => { slashItemRefs.current[index] = el }}
-                        onClick={() => selectSlashCommand(command.name)}
-                        onMouseEnter={() => setSlashSelectedIndex(index)}
-                        className={`flex w-full items-center gap-3 px-4 py-2.5 text-left transition-colors ${
-                          index === slashSelectedIndex ? 'bg-[var(--color-surface-hover)]' : 'hover:bg-[var(--color-surface-hover)]'
-                        }`}
-                      >
-                        <span className="flex min-w-0 max-w-[52%] shrink-0 items-baseline gap-1.5">
-                          <span className="shrink-0 text-sm font-semibold text-[var(--color-text-primary)]">/{command.name}</span>
-                          {command.argumentHint ? (
-                            <span className="min-w-0 truncate font-mono text-[11px] text-[var(--color-text-tertiary)]">
-                              {command.argumentHint}
-                            </span>
-                          ) : null}
-                        </span>
-                        <span className="min-w-0 flex-1 truncate text-xs text-[var(--color-text-tertiary)]">{command.description}</span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
+                  id={slashMenuId}
+                  groups={filteredCommandGroups}
+                  selectedIndex={slashSelectedIndex}
+                  itemRefs={slashItemRefs}
+                  onSelect={selectSlashCommand}
+                  onHighlight={setSlashSelectedIndex}
+                  showKeyboardHints={!isMobileComposer}
+                />
               )}
 
               {attachments.length > 0 && (
@@ -742,38 +733,49 @@ export function EmptySession() {
               )}
 
               <div className="flex items-start gap-3">
-                <textarea
-                  ref={textareaRef}
+                <MentionComposer
+                  ref={composerRef}
+                  rootRef={composerContainerRef}
                   value={input}
-                  onChange={(event) => handleInputChange(event.target.value, event.target.selectionStart ?? event.target.value.length)}
-                  onKeyDown={handleKeyDown}
-                  onPaste={handlePaste}
-                  className={`flex-1 resize-none border-none bg-transparent leading-relaxed text-[var(--color-text-primary)] outline-none placeholder:text-[var(--color-text-tertiary)] ${
-                    isMobileComposer ? 'max-h-[132px] min-h-[72px] py-1.5 text-base' : 'py-2'
-                  }`}
-                  style={{ fontFamily: 'var(--font-body)' }}
+                  mentions={mentions}
+                  onChange={handleComposerChange}
+                  onKeyDown={handleComposerKeyDown}
+                  onPaste={handleComposerPaste}
                   placeholder={t('empty.placeholder')}
-                  rows={2}
+                  className="flex-1"
+                  editorClassName={`overflow-y-auto leading-relaxed text-[var(--color-text-primary)] ${
+                    isMobileComposer ? 'max-h-[132px] min-h-[72px] py-1.5 text-base' : 'max-h-[200px] py-2'
+                  }`}
+                  aria={{
+                    role: isSlashMenuVisible ? 'combobox' : 'textbox',
+                    'aria-autocomplete': isSlashMenuVisible ? 'list' : undefined,
+                    'aria-expanded': isSlashMenuVisible ? 'true' : undefined,
+                    'aria-controls': isSlashMenuVisible ? slashMenuId : undefined,
+                    'aria-activedescendant': isSlashMenuVisible
+                      ? getSlashCommandOptionId(slashMenuId, slashSelectedIndex)
+                      : undefined,
+                  }}
                 />
               </div>
 
               <div className={`border-t border-[var(--color-border-separator)] pt-3 ${
                 isMobileComposer ? 'flex flex-wrap items-center gap-2' : 'flex items-center justify-between'
               }`}>
-                <div className="flex shrink-0 items-center gap-2">
-                  <div ref={plusMenuRef} className="relative">
-                    <button
+                <div className="flex min-w-0 shrink items-center gap-2">
+                  <div ref={plusMenuRef} className="relative shrink-0">
+                    <IconButton
+                      icon="add"
+                      label={t('chat.composerTools')}
+                      showTooltip={false}
+                      tone="secondary"
+                      size={isMobileComposer ? 'xl' : 'md'}
+                      className={isMobileComposer ? 'h-11 w-11' : undefined}
+                      aria-expanded={plusMenuOpen}
                       onClick={() => setPlusMenuOpen((prev) => !prev)}
-                      aria-label="Open composer tools"
-                      className={`text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface-hover)] ${
-                        isMobileComposer ? 'inline-flex h-11 w-11 items-center justify-center rounded-xl' : 'rounded-lg p-1.5'
-                      }`}
-                    >
-                      <span className="material-symbols-outlined text-[18px]">add</span>
-                    </button>
+                    />
 
                     {plusMenuOpen && (
-                      <div className={`absolute bottom-full left-0 mb-2 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] py-1 shadow-[var(--shadow-dropdown)] ${
+                      <div className={`absolute bottom-full left-0 mb-2 rounded-[var(--radius-xl)] border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] py-1 shadow-[var(--shadow-dropdown)] ${
                         isMobileComposer ? 'w-[min(240px,calc(100vw-32px))]' : 'w-[240px]'
                       }`}>
                         <button
@@ -800,9 +802,23 @@ export function EmptySession() {
                     value={draftPermissionMode}
                     onChange={setDraftPermissionMode}
                   />
+
+                  {!isMobileComposer && (
+                    <RepositoryLaunchControls
+                      workDir={workDir}
+                      onWorkDirChange={handleWorkDirChange}
+                      branch={selectedBranch}
+                      onBranchChange={setSelectedBranch}
+                      useWorktree={useWorktree}
+                      onUseWorktreeChange={setUseWorktree}
+                      onLaunchReadyChange={setRepositoryLaunchReady}
+                      disabled={isSubmitting}
+                      placement="toolbar"
+                    />
+                  )}
                 </div>
 
-                <div className={`${isMobileComposer ? 'flex min-w-0 flex-1 items-center justify-end gap-2' : 'flex items-center gap-3'}`}>
+                <div className={`${isMobileComposer ? 'flex min-w-0 flex-1 items-center justify-end gap-2' : 'flex shrink-0 items-center gap-3'}`}>
                   <ContextUsageIndicator
                     chatState="idle"
                     messageCount={0}
@@ -812,35 +828,24 @@ export function EmptySession() {
                     compact={isMobileComposer}
                   />
                   <ModelSelector ref={modelSelectorRef} runtimeKey={DRAFT_RUNTIME_SELECTION_KEY} disabled={isSubmitting} compact={isMobileComposer} />
-                  <button
+                  {/* Kept identical to ChatInput's send button — same
+                      component, shape, size and icon. See the note there for
+                      why the label went away. */}
+                  <Button
+                    variant="primary"
+                    size="base"
+                    shape="circle"
                     onClick={handleSubmit}
                     disabled={!canSubmit}
                     aria-label={t('common.run')}
-                    title={isMobileComposer ? t('common.run') : undefined}
-                    className={`flex shrink-0 items-center justify-center gap-1 rounded-lg bg-[image:var(--gradient-btn-primary)] text-xs font-semibold text-[var(--color-btn-primary-fg)] shadow-[var(--shadow-button-primary)] transition-all hover:brightness-105 disabled:opacity-30 ${
-                      isMobileComposer ? 'h-11 w-11 rounded-xl px-0 py-0' : 'w-[112px] px-3 py-1.5'
-                    }`}
-                  >
-                    {!isMobileComposer && t('common.run')}
-                    <span className="material-symbols-outlined text-[14px]">arrow_forward</span>
-                  </button>
+                    title={t('common.run')}
+                    className={`shrink-0 ${isMobileComposer ? 'h-11 w-11' : ''}`}
+                    icon={<span className="material-symbols-outlined text-[18px]">arrow_upward</span>}
+                  />
                 </div>
               </div>
             </div>
 
-            {!isMobileComposer && (
-              <RepositoryLaunchControls
-                workDir={workDir}
-                onWorkDirChange={handleWorkDirChange}
-                branch={selectedBranch}
-                onBranchChange={setSelectedBranch}
-                useWorktree={useWorktree}
-                onUseWorktreeChange={setUseWorktree}
-                onLaunchReadyChange={setRepositoryLaunchReady}
-                disabled={isSubmitting}
-                placement="composer"
-              />
-            )}
           </div>
 
           {isMobileComposer && (

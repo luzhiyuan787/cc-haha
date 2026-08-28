@@ -18,7 +18,7 @@ import { writeFileSyncAndFlush_DEPRECATED } from '../file.js'
 import { readFileSync } from '../fileRead.js'
 import { getFsImplementation, safeResolvePath } from '../fsOperations.js'
 import { addFileGlobRuleToGitignore } from '../git/gitignore.js'
-import { safeParseJSON } from '../json.js'
+import { safeParseJSON, safeParseJSONWithoutCache } from '../json.js'
 import { logError } from '../log.js'
 import { getPlatform } from '../platform.js'
 import { clone, jsonStringify } from '../slowOperations.js'
@@ -210,11 +210,11 @@ function parseSettingsFileUncached(path: string): {
       return { settings: {}, errors: [] }
     }
 
-    const data = safeParseJSON(content, false)
+    const rawData = safeParseJSON(content, false)
 
     // Filter invalid permission rules before schema validation so one bad
     // rule doesn't cause the entire settings file to be rejected.
-    const ruleWarnings = filterInvalidPermissionRules(data, path)
+    const { data, warnings: ruleWarnings } = filterInvalidPermissionRules(rawData, path)
 
     const result = SettingsSchema().safeParse(data)
 
@@ -236,14 +236,17 @@ function parseSettingsFileUncached(path: string): {
  * @param source The source of the settings
  * @returns The root path of the settings file
  */
-export function getSettingsRootPathForSource(source: SettingSource): string {
+export function getSettingsRootPathForSource(
+  source: SettingSource,
+  projectRootOverride?: string,
+): string {
   switch (source) {
     case 'userSettings':
       return resolve(getClaudeConfigHomeDir())
     case 'policySettings':
     case 'projectSettings':
     case 'localSettings': {
-      return resolve(getOriginalCwd())
+      return resolve(projectRootOverride ?? getOriginalCwd())
     }
     case 'flagSettings': {
       const path = getFlagSettingsPath()
@@ -273,17 +276,18 @@ function getUserSettingsFilePath(): string {
 
 export function getSettingsFilePathForSource(
   source: SettingSource,
+  projectRootOverride?: string,
 ): string | undefined {
   switch (source) {
     case 'userSettings':
       return join(
-        getSettingsRootPathForSource(source),
+        getSettingsRootPathForSource(source, projectRootOverride),
         getUserSettingsFilePath(),
       )
     case 'projectSettings':
     case 'localSettings': {
       return join(
-        getSettingsRootPathForSource(source),
+        getSettingsRootPathForSource(source, projectRootOverride),
         getRelativeSettingsFilePathForSource(source),
       )
     }
@@ -308,7 +312,11 @@ export function getRelativeSettingsFilePathForSource(
 
 export function getSettingsForSource(
   source: SettingSource,
+  projectRootOverride?: string,
 ): SettingsJson | null {
+  if (projectRootOverride) {
+    return getSettingsForSourceUncached(source, projectRootOverride)
+  }
   const cached = getCachedSettingsForSource(source)
   if (cached !== undefined) return cached
   const result = getSettingsForSourceUncached(source)
@@ -318,6 +326,7 @@ export function getSettingsForSource(
 
 function getSettingsForSourceUncached(
   source: SettingSource,
+  projectRootOverride?: string,
 ): SettingsJson | null {
   // For policySettings: first source wins (remote > HKLM/plist > file > HKCU)
   if (source === 'policySettings') {
@@ -344,7 +353,10 @@ function getSettingsForSourceUncached(
     return null
   }
 
-  const settingsFilePath = getSettingsFilePathForSource(source)
+  const settingsFilePath = getSettingsFilePathForSource(
+    source,
+    projectRootOverride,
+  )
   const { settings: fileSettings } = settingsFilePath
     ? parseSettingsFile(settingsFilePath)
     : { settings: null }
@@ -416,6 +428,7 @@ export function getPolicySettingsOrigin():
 export function updateSettingsForSource(
   source: EditableSettingSource,
   settings: SettingsJson,
+  projectRootOverride?: string,
 ): { error: Error | null } {
   if (
     (source as unknown) === 'policySettings' ||
@@ -425,7 +438,7 @@ export function updateSettingsForSource(
   }
 
   // Create the folder if needed
-  const filePath = getSettingsFilePathForSource(source)
+  const filePath = getSettingsFilePathForSource(source, projectRootOverride)
   if (!filePath) {
     return { error: null }
   }
@@ -437,7 +450,10 @@ export function updateSettingsForSource(
     // cache — mergeWith below mutates its target (including nested refs),
     // and mutating the cached object would leak unpersisted state if the
     // write fails before resetSettingsCache().
-    let existingSettings = getSettingsForSourceUncached(source)
+    let existingSettings = getSettingsForSourceUncached(
+      source,
+      projectRootOverride,
+    )
 
     // If validation failed, check if file exists with a JSON syntax error
     if (!existingSettings) {
@@ -451,7 +467,11 @@ export function updateSettingsForSource(
         // File doesn't exist — fall through to merge with empty settings
       }
       if (content !== null) {
-        const rawData = safeParseJSON(content)
+        // Must be an uncached parse: the mergeWith below mutates this object
+        // (including nested refs), and editing a shared safeParseJSON cache
+        // entry would corrupt every later parse of byte-identical settings
+        // content (same bug family as GH #1126).
+        const rawData = safeParseJSONWithoutCache(content)
         if (rawData === null) {
           // JSON syntax error - return validation error instead of overwriting
           // safeParseJSON will already log the error, so we'll just return the error here
@@ -509,7 +529,7 @@ export function updateSettingsForSource(
       // Okay to add to gitignore async without awaiting
       void addFileGlobRuleToGitignore(
         getRelativeSettingsFilePathForSource('localSettings'),
-        getOriginalCwd(),
+        projectRootOverride ?? getOriginalCwd(),
       )
     }
   } catch (e) {
@@ -896,14 +916,12 @@ export function hasSkipDangerousModePermissionPrompt(): boolean {
 export function hasAutoModeOptIn(): boolean {
   if (feature('TRANSCRIPT_CLASSIFIER')) {
     const user = getSettingsForSource('userSettings')?.skipAutoPermissionPrompt
-    const local =
-      getSettingsForSource('localSettings')?.skipAutoPermissionPrompt
     const flag = getSettingsForSource('flagSettings')?.skipAutoPermissionPrompt
     const policy =
       getSettingsForSource('policySettings')?.skipAutoPermissionPrompt
-    const result = !!(user || local || flag || policy)
+    const result = !!(user || flag || policy)
     logForDebugging(
-      `[auto-mode] hasAutoModeOptIn=${result} skipAutoPermissionPrompt: user=${user} local=${local} flag=${flag} policy=${policy}`,
+      `[auto-mode] hasAutoModeOptIn=${result} skipAutoPermissionPrompt: user=${user} flag=${flag} policy=${policy}`,
     )
     return result
   }
@@ -934,19 +952,33 @@ export function getUseAutoModeDuringPlan(): boolean {
  * otherwise inject classifier allow/deny rules (RCE risk).
  */
 export function getAutoModeConfig():
-  | { allow?: string[]; soft_deny?: string[]; environment?: string[] }
+  | {
+      allow?: string[]
+      soft_deny?: string[]
+      hard_deny?: string[]
+      environment?: string[]
+      classifyAllShell?: boolean
+    }
   | undefined {
   if (feature('TRANSCRIPT_CLASSIFIER')) {
     const schema = z.object({
       allow: z.array(z.string()).optional(),
       soft_deny: z.array(z.string()).optional(),
+      hard_deny: z.array(z.string()).optional(),
       deny: z.array(z.string()).optional(),
       environment: z.array(z.string()).optional(),
+      classifyAllShell: z.boolean().optional(),
     })
 
     const allow: string[] = []
     const soft_deny: string[] = []
+    const hard_deny: string[] = []
     const environment: string[] = []
+    let allowConfigured = false
+    let softDenyConfigured = false
+    let hardDenyConfigured = false
+    let environmentConfigured = false
+    let classifyAllShell: boolean | undefined
 
     for (const source of [
       'userSettings',
@@ -960,21 +992,47 @@ export function getAutoModeConfig():
         (settings as Record<string, unknown>).autoMode,
       )
       if (result.success) {
-        if (result.data.allow) allow.push(...result.data.allow)
-        if (result.data.soft_deny) soft_deny.push(...result.data.soft_deny)
-        if (process.env.USER_TYPE === 'ant') {
-          if (result.data.deny) soft_deny.push(...result.data.deny)
+        if (result.data.allow !== undefined) {
+          allowConfigured = true
+          allow.push(...result.data.allow)
         }
-        if (result.data.environment)
+        if (result.data.soft_deny !== undefined) {
+          softDenyConfigured = true
+          soft_deny.push(...result.data.soft_deny)
+        }
+        if (result.data.hard_deny !== undefined) {
+          hardDenyConfigured = true
+          hard_deny.push(...result.data.hard_deny)
+        }
+        if (process.env.USER_TYPE === 'ant') {
+          if (result.data.deny !== undefined) {
+            softDenyConfigured = true
+            soft_deny.push(...result.data.deny)
+          }
+        }
+        if (result.data.environment !== undefined) {
+          environmentConfigured = true
           environment.push(...result.data.environment)
+        }
+        if (result.data.classifyAllShell !== undefined) {
+          classifyAllShell = result.data.classifyAllShell
+        }
       }
     }
 
-    if (allow.length > 0 || soft_deny.length > 0 || environment.length > 0) {
+    if (
+      allowConfigured ||
+      softDenyConfigured ||
+      hardDenyConfigured ||
+      environmentConfigured ||
+      classifyAllShell !== undefined
+    ) {
       return {
-        ...(allow.length > 0 && { allow }),
-        ...(soft_deny.length > 0 && { soft_deny }),
-        ...(environment.length > 0 && { environment }),
+        ...(allowConfigured && { allow }),
+        ...(softDenyConfigured && { soft_deny }),
+        ...(hardDenyConfigured && { hard_deny }),
+        ...(environmentConfigured && { environment }),
+        ...(classifyAllShell !== undefined && { classifyAllShell }),
       }
     }
   }

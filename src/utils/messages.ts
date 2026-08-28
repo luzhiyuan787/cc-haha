@@ -1,3 +1,10 @@
+import { describeWorkflowSizeGuideline } from './workflows/enabled.js'
+import {
+  ULTRACODE_ENTER_REMINDER,
+  ULTRACODE_EXIT_REMINDER,
+  ULTRACODE_STILL_ON_REMINDER,
+  WORKFLOW_KEYWORD_REMINDER,
+} from './workflows/ultracode.js'
 import { feature } from 'bun:bundle'
 import type { BetaUsage as Usage } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
 import type {
@@ -22,7 +29,11 @@ import {
 import { sanitizeToolNameForAnalytics } from 'src/services/analytics/metadata.js'
 import type { AgentId } from 'src/types/ids.js'
 import { companionIntroText } from '../buddy/prompt.js'
-import { NO_CONTENT_MESSAGE } from '../constants/messages.js'
+import {
+  NO_CONTENT_MESSAGE,
+  REJECT_MESSAGE,
+  REJECT_MESSAGE_WITH_REASON_PREFIX,
+} from '../constants/messages.js'
 import { OUTPUT_STYLE_CONFIG } from '../constants/outputStyles.js'
 import {
   type BusinessErrorCode,
@@ -161,6 +172,10 @@ import { safeParseJSON } from './json.js'
 import { logError, logMCPDebug } from './log.js'
 import { normalizeLegacyToolName } from './permissions/permissionRuleParser.js'
 import {
+  normalizeModelStringForAPI,
+  parseUserSpecifiedModel,
+} from './model/model.js'
+import {
   getPlanModeV2AgentCount,
   getPlanModeV2ExploreAgentCount,
   isPlanModeInterviewPhaseEnabled,
@@ -215,10 +230,7 @@ export const INTERRUPT_MESSAGE_FOR_TOOL_USE =
   '[Request interrupted by user for tool use]'
 export const CANCEL_MESSAGE =
   "The user doesn't want to take this action right now. STOP what you are doing and wait for the user to tell you how to proceed."
-export const REJECT_MESSAGE =
-  "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed."
-export const REJECT_MESSAGE_WITH_REASON_PREFIX =
-  "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). To tell you how to proceed, the user said:\n"
+export { REJECT_MESSAGE, REJECT_MESSAGE_WITH_REASON_PREFIX }
 export const SUBAGENT_REJECT_MESSAGE =
   'Permission for this tool use was denied. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). Try a different approach or report the limitation to complete your task.'
 export const SUBAGENT_REJECT_MESSAGE_WITH_REASON_PREFIX =
@@ -2082,6 +2094,8 @@ export function normalizeMessagesForAPI(
   }
 
   const result: (UserMessage | AssistantMessage)[] = []
+  const assistantIndexByMessageId = new Map<string, number>()
+  let indexedResultLength = 0
   reorderedMessages
     .filter(
       (
@@ -2271,33 +2285,57 @@ export function normalizeMessagesForAPI(
             },
           }
 
-          // Find a previous assistant message with the same message ID and merge.
-          // Walk backwards, skipping tool results and different-ID assistants,
-          // since concurrent agents (teammates) can interleave streaming content
-          // blocks from multiple API responses with different message IDs.
-          for (let i = result.length - 1; i >= 0; i--) {
-            const msg = result[i]!
-
-            if (msg.type !== 'assistant' && !isToolResultMessage(msg)) {
-              break
+          // Index each result message once so interleaved assistant fragments
+          // can be merged without repeatedly scanning the full tool-result chain.
+          // A normal user message is a hard turn boundary, matching the previous
+          // backward scan's stopping condition.
+          for (; indexedResultLength < result.length; indexedResultLength++) {
+            const indexedMessage = result[indexedResultLength]!
+            if (indexedMessage.type === 'assistant') {
+              assistantIndexByMessageId.set(
+                indexedMessage.message.id,
+                indexedResultLength,
+              )
+            } else if (!isToolResultMessage(indexedMessage)) {
+              assistantIndexByMessageId.clear()
             }
+          }
 
-            if (msg.type === 'assistant') {
-              if (msg.message.id === normalizedMessage.message.id) {
-                result[i] = mergeAssistantMessages(msg, normalizedMessage)
-                return
-              }
-              continue
-            }
+          const existingIndex = assistantIndexByMessageId.get(
+            normalizedMessage.message.id,
+          )
+          const existingMessage =
+            existingIndex === undefined ? undefined : result[existingIndex]
+          if (
+            existingIndex !== undefined &&
+            existingMessage?.type === 'assistant'
+          ) {
+            result[existingIndex] = mergeAssistantMessages(
+              existingMessage,
+              normalizedMessage,
+            )
+            return
           }
 
           result.push(normalizedMessage)
           return
         }
         case 'attachment': {
-          const rawAttachmentMessage = normalizeAttachmentForAPI(
-            message.attachment,
-          )
+          let rawAttachmentMessage: UserMessage[]
+          try {
+            rawAttachmentMessage = normalizeAttachmentForAPI(message.attachment)
+          } catch (error) {
+            const attachmentType = (message as {
+              attachment?: { type?: unknown }
+            }).attachment?.type
+            logForDebugging(
+              `Dropping malformed attachment during API normalization: ${
+                typeof attachmentType === 'string' ? attachmentType : 'unknown'
+              }: ${error instanceof Error ? error.message : String(error)}`,
+              { level: 'warn' },
+            )
+            return
+          }
           const attachmentMessage = checkStatsigFeatureGate_CACHED_MAY_BE_STALE(
             'tengu_chair_sermon',
           )
@@ -4292,6 +4330,43 @@ You have exited auto mode. The user may now want to interact more directly. You 
         }),
       ])
     }
+    case 'workflow_keyword_request': {
+      return wrapMessagesInSystemReminder([
+        createUserMessage({
+          content: WORKFLOW_KEYWORD_REMINDER,
+          isMeta: true,
+        }),
+      ])
+    }
+    case 'ultra_effort_enter': {
+      return wrapMessagesInSystemReminder([
+        createUserMessage({
+          content:
+            attachment.reminderType === 'full'
+              ? ULTRACODE_ENTER_REMINDER
+              : ULTRACODE_STILL_ON_REMINDER,
+          isMeta: true,
+        }),
+      ])
+    }
+    case 'ultra_effort_exit': {
+      return wrapMessagesInSystemReminder([
+        createUserMessage({
+          content: ULTRACODE_EXIT_REMINDER,
+          isMeta: true,
+        }),
+      ])
+    }
+    case 'workflow_size_guideline_change': {
+      return wrapMessagesInSystemReminder([
+        createUserMessage({
+          content: describeWorkflowSizeGuideline(
+            attachment.size as Parameters<typeof describeWorkflowSizeGuideline>[0],
+          ),
+          isMeta: true,
+        }),
+      ])
+    }
     case 'deferred_tools_delta': {
       const parts: string[] = []
       if (attachment.addedLines.length > 0) {
@@ -4723,12 +4798,12 @@ export type StreamingFallbackCause =
   | 'watchdog'
   | 'stream_error'
   | '404_stream_creation'
+  | 'stream_retry'
 
 /**
- * Marks the switch from a failed streaming request to the non-streaming
- * fallback. The fallback response arrives in one piece after a potentially
- * long wait with zero incremental output, so UIs surface this as a lightweight
- * active-turn status (level info — an expected state, not an error).
+ * Marks recovery from a failed streaming attempt. Most causes switch to the
+ * non-streaming fallback; stream_retry starts a new bounded streaming attempt.
+ * UIs surface this as an active-turn status rather than a terminal error.
  */
 export function createSystemStreamingFallbackMessage(
   cause: StreamingFallbackCause,
@@ -4737,7 +4812,9 @@ export function createSystemStreamingFallbackMessage(
     type: 'system',
     subtype: 'streaming_fallback',
     level: 'info',
-    content: `Streaming request failed (${cause.replace(/_/g, ' ')}); retrying in non-streaming mode`,
+    content: cause === 'stream_retry'
+      ? 'Provider stream stalled before a tool side effect; retrying safely'
+      : `Streaming request failed (${cause.replace(/_/g, ' ')}); retrying in non-streaming mode`,
     cause,
     timestamp: new Date().toISOString(),
     uuid: randomUUID(),
@@ -5238,6 +5315,35 @@ export function stripSignatureBlocks(messages: Message[]): Message[] {
   })
 
   return changed ? result : messages
+}
+
+/**
+ * Protected thinking signatures are model-bound. When a resumed session moves
+ * to another model, replaying those blocks can either fail signature validation
+ * or send a block type the new provider does not implement. Keep the transcript
+ * intact and clean only the in-memory request history.
+ */
+export function stripSignatureBlocksAfterModelChange(
+  messages: Message[],
+  currentModel: string,
+): Message[] {
+  const signatureSource = messages.findLast(msg => (
+    msg.type === 'assistant' &&
+    msg.message.model !== SYNTHETIC_MODEL &&
+    msg.message.content.some(isThinkingBlock)
+  ))
+  if (signatureSource?.type !== 'assistant' || !signatureSource.message.model) {
+    return messages
+  }
+
+  const normalize = (model: string) => normalizeModelStringForAPI(
+    parseUserSpecifiedModel(model),
+  ).trim().toLowerCase()
+
+  if (normalize(signatureSource.message.model) === normalize(currentModel)) {
+    return messages
+  }
+  return stripSignatureBlocks(messages)
 }
 
 /**

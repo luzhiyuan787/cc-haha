@@ -1,4 +1,8 @@
 import { formatImHelp } from '../common/format.js'
+import {
+  formatPermissionDecisionStatus,
+  type PermissionDecision,
+} from '../common/permission.js'
 import type {
   AdapterHttpClient,
   ProviderSummary,
@@ -16,7 +20,7 @@ import {
 export const TELEGRAM_SELECTION_TTL_MS = 15 * 60 * 1000
 export const OFFICIAL_PROVIDER_VALUE = 'official'
 export const OPENAI_OFFICIAL_PROVIDER_ID = 'openai-official'
-export const OFFICIAL_DEFAULT_MODEL_ID = 'claude-opus-4-7'
+export const OFFICIAL_DEFAULT_MODEL_ID = 'claude-opus-4-8'
 export const OPENAI_OFFICIAL_DEFAULT_MODEL_ID = 'gpt-5.3-codex'
 
 type TelegramSendApi = {
@@ -31,7 +35,7 @@ type TelegramInlineKeyboardMarkup = {
   inline_keyboard: Array<Array<{ text: string; callback_data: string }>>
 }
 
-type TelegramCommandContext = {
+export type TelegramCommandContext = {
   chat?: { id: string | number; type?: string }
   from?: { id: number }
   match?: string | RegExpMatchArray
@@ -71,13 +75,139 @@ export type TelegramCommandControllerDeps = {
   connectBridgeSession: (chatId: string, sessionId: string) => void
   onBridgeServerMessage: (chatId: string) => void
   waitForBridgeOpen: (chatId: string) => Promise<boolean>
+  sendUserMessage: (chatId: string, content: string) => boolean
   setRuntimeModel: RuntimeModelSetter
 }
 
 export type TelegramCommandController = ReturnType<typeof createTelegramCommandController>
+export type TelegramRuntimeCommandController = TelegramCommandController & {
+  handlePermissionCallback: (
+    ctx: TelegramCommandContext,
+    decision: PermissionDecision,
+    pendingPermissions: Map<string, Set<string>>,
+    onResolved: (chatId: string) => void,
+  ) => Promise<TelegramPermissionCallbackResult>
+}
+export type TelegramPermissionCallbackResult =
+  | 'sent'
+  | 'unauthorized'
+  | 'not_pending'
+  | 'send_failed'
+
+export function telegramMessageDedupKey(chatId: string, messageId: number): string {
+  return `telegram:${chatId}:${messageId}`
+}
+
+export function shouldProcessTelegramMessage(
+  dedup: { tryRecord: (key: string) => boolean },
+  chatId: string,
+  messageId: number | undefined,
+): boolean {
+  return messageId !== undefined &&
+    dedup.tryRecord(telegramMessageDedupKey(chatId, messageId))
+}
 
 export type TelegramCommandRegistrar = {
   command: (command: string, handler: (ctx: TelegramCommandContext) => unknown) => unknown
+}
+
+export async function ensureAuthorizedTelegramPrivateChat(
+  ctx: TelegramCommandContext,
+  isAllowedUser: (userId: number) => boolean,
+): Promise<boolean> {
+  if (!ctx.from || ctx.chat?.type !== 'private') return false
+  if (isAllowedUser(ctx.from.id)) return true
+  await ctx.reply('🔒 未授权。请在 Claude Code 桌面端生成配对码后发送给我。')
+  return false
+}
+
+export function registerAuthorizedTelegramCommand(
+  bot: TelegramCommandRegistrar,
+  command: string,
+  isAllowedUser: (userId: number) => boolean,
+  handler: (ctx: TelegramCommandContext) => unknown | Promise<unknown>,
+): void {
+  bot.command(command, (ctx) => void (async () => {
+    if (!await ensureAuthorizedTelegramPrivateChat(ctx, isAllowedUser)) return
+    await handler(ctx)
+  })())
+}
+
+export function resolveTelegramPermissionCallback(params: {
+  chatId: string
+  userId: number
+  decision: PermissionDecision
+  pendingRequestIds?: Set<string>
+  isAllowedUser: (userId: number) => boolean
+  sendPermissionResponse: (
+    chatId: string,
+    requestId: string,
+    allowed: boolean,
+    rule?: string,
+  ) => boolean
+}): TelegramPermissionCallbackResult {
+  if (!params.isAllowedUser(params.userId)) return 'unauthorized'
+  if (!params.pendingRequestIds?.has(params.decision.requestId)) return 'not_pending'
+
+  const sent = params.sendPermissionResponse(
+    params.chatId,
+    params.decision.requestId,
+    params.decision.allowed,
+    params.decision.rule,
+  )
+  if (!sent) return 'send_failed'
+
+  params.pendingRequestIds.delete(params.decision.requestId)
+  return 'sent'
+}
+
+async function handleTelegramPermissionCallback(
+  ctx: TelegramCommandContext,
+  decision: PermissionDecision,
+  deps: Pick<TelegramRuntimeCommandControllerDeps, 'isAllowedUser'> & {
+    pendingPermissions: Map<string, Set<string>>
+    sendPermissionResponse: (
+      chatId: string,
+      requestId: string,
+      allowed: boolean,
+      rule?: string,
+    ) => boolean
+    onResolved: (chatId: string) => void
+  },
+): Promise<TelegramPermissionCallbackResult> {
+  const callbackChatId = ctx.callbackQuery?.message?.chat.id
+  const callbackUserId = ctx.from?.id
+  if (callbackChatId === undefined || callbackUserId === undefined) {
+    await ctx.answerCallbackQuery('未授权').catch(() => {})
+    return 'unauthorized'
+  }
+
+  const chatId = String(callbackChatId)
+  const result = resolveTelegramPermissionCallback({
+    chatId,
+    userId: callbackUserId,
+    decision,
+    pendingRequestIds: deps.pendingPermissions.get(chatId),
+    isAllowedUser: deps.isAllowedUser,
+    sendPermissionResponse: deps.sendPermissionResponse,
+  })
+  if (result !== 'sent') {
+    const message = result === 'unauthorized'
+      ? '未授权'
+      : result === 'not_pending'
+        ? '权限请求已失效'
+        : '权限响应发送失败'
+    await ctx.answerCallbackQuery(message).catch(() => {})
+    return result
+  }
+
+  deps.onResolved(chatId)
+  const statusText = formatPermissionDecisionStatus(decision)
+  await ctx.editMessageText(
+    `${ctx.callbackQuery?.message?.text ?? ''}\n\n${statusText}`,
+  ).catch(() => {})
+  await ctx.answerCallbackQuery(statusText)
+  return 'sent'
 }
 
 export type TelegramRuntimeCommandControllerDeps = {
@@ -89,6 +219,13 @@ export type TelegramRuntimeCommandControllerDeps = {
     connectSession: (chatId: string, sessionId: string) => void
     onServerMessage: (chatId: string, handler: (msg: unknown) => void | Promise<void>) => void
     waitForOpen: (chatId: string) => Promise<boolean>
+    sendUserMessage: (chatId: string, content: string) => boolean
+    sendPermissionResponse: (
+      chatId: string,
+      requestId: string,
+      allowed: boolean,
+      rule?: string,
+    ) => boolean
   }
   sessionStore: {
     set: (chatId: string, sessionId: string, workDir: string) => void
@@ -103,8 +240,8 @@ export type TelegramRuntimeCommandControllerDeps = {
 
 export function createTelegramRuntimeCommandController(
   deps: TelegramRuntimeCommandControllerDeps,
-): TelegramCommandController {
-  return createTelegramCommandController({
+): TelegramRuntimeCommandController {
+  const controller = createTelegramCommandController({
     api: deps.botApi,
     httpClient: deps.httpClient,
     defaultWorkDir: deps.defaultWorkDir,
@@ -120,8 +257,23 @@ export function createTelegramRuntimeCommandController(
       (msg) => deps.handleServerMessage(chatId, msg),
     ),
     waitForBridgeOpen: (chatId) => deps.bridge.waitForOpen(chatId),
+    sendUserMessage: (chatId, content) => deps.bridge.sendUserMessage(chatId, content),
     setRuntimeModel: deps.setRuntimeModel,
   })
+  return {
+    ...controller,
+    handlePermissionCallback: (ctx, decision, pendingPermissions, onResolved) => handleTelegramPermissionCallback(
+      ctx,
+      decision,
+      {
+        isAllowedUser: deps.isAllowedUser,
+        pendingPermissions,
+        sendPermissionResponse: (chatId, requestId, allowed, rule) =>
+          deps.bridge.sendPermissionResponse(chatId, requestId, allowed, rule),
+        onResolved,
+      },
+    ),
+  }
 }
 
 export function registerTelegramExtendedCommands(
@@ -166,13 +318,6 @@ export function createTelegramCommandController(deps: TelegramCommandControllerD
     } catch {
       await deps.api.sendMessage(Number(chatId), view.text, { reply_markup: view.replyMarkup })
     }
-  }
-
-  const ensureAuthorizedPrivateChat = async (ctx: TelegramCommandContext): Promise<boolean> => {
-    if (!ctx.from || ctx.chat?.type !== 'private') return false
-    if (deps.isAllowedUser(ctx.from.id)) return true
-    await ctx.reply('🔒 未授权。请在 Claude Code 桌面端生成配对码后发送给我。')
-    return false
   }
 
   const showProviderPicker = async (chatId: string): Promise<void> => {
@@ -222,7 +367,7 @@ export function createTelegramCommandController(deps: TelegramCommandControllerD
   }
 
   const handleProviderCommand = async (ctx: TelegramCommandContext): Promise<void> => {
-    if (!await ensureAuthorizedPrivateChat(ctx)) return
+    if (!await ensureAuthorizedTelegramPrivateChat(ctx, deps.isAllowedUser)) return
     const chatId = String(ctx.chat!.id)
     const query = getCommandMatchText(ctx)
     if (!query) {
@@ -290,7 +435,7 @@ export function createTelegramCommandController(deps: TelegramCommandControllerD
   }
 
   const handleModelCommand = async (ctx: TelegramCommandContext): Promise<void> => {
-    if (!await ensureAuthorizedPrivateChat(ctx)) return
+    if (!await ensureAuthorizedTelegramPrivateChat(ctx, deps.isAllowedUser)) return
     const chatId = String(ctx.chat!.id)
     const modelId = getCommandMatchText(ctx)
     if (modelId) {
@@ -349,7 +494,7 @@ export function createTelegramCommandController(deps: TelegramCommandControllerD
   }
 
   const handleSkillsCommand = async (ctx: TelegramCommandContext): Promise<void> => {
-    if (!await ensureAuthorizedPrivateChat(ctx)) return
+    if (!await ensureAuthorizedTelegramPrivateChat(ctx, deps.isAllowedUser)) return
     await showSkills(String(ctx.chat!.id))
   }
 
@@ -359,12 +504,27 @@ export function createTelegramCommandController(deps: TelegramCommandControllerD
   ): Promise<void> => {
     const chatId = getCallbackChatId(ctx)
     if (!chatId) return
+
+    const stored = await deps.ensureExistingSession(chatId)
+    if (!stored) {
+      pendingSelections.delete(chatId)
+      await ctx.editMessageText('⚠️ 会话已失效，请发送 /new 重新选择项目后再调用 Skill。')
+      return
+    }
+
+    const invocation = `/${item.value}`
+    if (!deps.sendUserMessage(chatId, invocation)) {
+      await ctx.editMessageText('⚠️ Skill 发送失败，连接可能已断开。请发送 /new 重新连接会话。')
+      return
+    }
+
     pendingSelections.delete(chatId)
     await ctx.editMessageText([
-      `Skill：${item.label}`,
+      `✅ 已调用 Skill：${item.label}`,
+      invocation,
       item.description,
       '',
-      '可以直接描述任务让 Agent 自动选择，也可以在桌面端 /skills 查看详情。',
+      '任务已发送给当前 Agent，会继续使用这条会话的上下文、工具和权限设置。',
     ].filter(Boolean).join('\n'))
   }
 
@@ -392,7 +552,7 @@ export function createTelegramCommandController(deps: TelegramCommandControllerD
   }
 
   const handleResumeCommand = async (ctx: TelegramCommandContext): Promise<void> => {
-    if (!await ensureAuthorizedPrivateChat(ctx)) return
+    if (!await ensureAuthorizedTelegramPrivateChat(ctx, deps.isAllowedUser)) return
     await showResumeProjectPicker(String(ctx.chat!.id))
   }
 

@@ -11,7 +11,7 @@ import { WsBridge, type ServerMessage } from '../common/ws-bridge.js'
 import { MessageBuffer } from '../common/message-buffer.js'
 import { MessageDedup } from '../common/message-dedup.js'
 import { enqueue } from '../common/chat-queue.js'
-import { getConfiguredWorkDir, loadConfig } from '../common/config.js'
+import { loadConfig } from '../common/config.js'
 import {
   formatImStatus,
   formatPermissionRequest,
@@ -31,7 +31,7 @@ import {
   type PermissionDecision,
 } from '../common/permission.js'
 import { SessionStore } from '../common/session-store.js'
-import { AdapterHttpClient } from '../common/http-client.js'
+import { createAdapterClient } from '../common/adapter-client.js'
 import { restoreStoredSessionBinding } from '../common/session-recovery.js'
 import { isAllowedUser, tryPair } from '../common/pairing.js'
 import { TelegramMediaService } from './media.js'
@@ -40,9 +40,9 @@ import { checkAttachmentLimit } from '../common/attachment/attachment-limits.js'
 import type { AttachmentRef } from '../common/ws-bridge.js'
 import { ImageBlockWatcher } from '../common/attachment/image-block-watcher.js'
 import type { PendingUpload } from '../common/attachment/attachment-types.js'
-import * as fs from 'node:fs/promises'
+import { sendSafeOutboundImage } from '../common/attachment/outbound-image.js'
 import { syncTelegramBotCommands } from './menu.js'
-import { createTelegramRuntimeCommandController, registerTelegramExtendedCommands, tryHandleTelegramSelectionCallback } from './commands.js'
+import { createTelegramRuntimeCommandController, registerAuthorizedTelegramCommand, registerTelegramExtendedCommands, shouldProcessTelegramMessage, tryHandleTelegramSelectionCallback } from './commands.js'
 
 const TELEGRAM_TEXT_LIMIT = 4000 // leave margin below 4096
 const TELEGRAM_STREAMING_TEXT_LIMIT = TELEGRAM_TEXT_LIMIT - 2 // reserve room for cursor
@@ -59,8 +59,7 @@ const bot = new Bot(config.telegram.botToken)
 const bridge = new WsBridge(config.serverUrl, 'tg')
 const dedup = new MessageDedup()
 const sessionStore = new SessionStore()
-const defaultWorkDir = getConfiguredWorkDir(config, config.telegram)
-const httpClient = new AdapterHttpClient(config.serverUrl, { allowedProjectRoots: [defaultWorkDir] })
+const { httpClient, defaultWorkDir } = createAdapterClient(config, config.telegram)
 const attachmentStore = new AttachmentStore()
 const media = new TelegramMediaService(bot, attachmentStore)
 attachmentStore.gc().catch((err) => {
@@ -352,35 +351,8 @@ async function showProjectPicker(chatId: string): Promise<void> {
 async function dispatchOutboundMedia(chatId: string, pending: PendingUpload): Promise<void> {
   const numericChatId = Number(chatId)
   try {
-    let buffer: Buffer
-    let mime = 'image/png'
-    switch (pending.source.kind) {
-      case 'base64': {
-        buffer = Buffer.from(pending.source.data, 'base64')
-        mime = pending.source.mime
-        break
-      }
-      case 'path': {
-        buffer = await fs.readFile(pending.source.path)
-        mime = pending.source.mime ?? 'image/png'
-        break
-      }
-      case 'url': {
-        const resp = await fetch(pending.source.url)
-        if (!resp.ok) {
-          throw new Error(`fetch ${pending.source.url} -> ${resp.status}`)
-        }
-        buffer = Buffer.from(await resp.arrayBuffer())
-        mime = pending.source.mime ?? resp.headers.get('content-type') ?? 'image/png'
-        break
-      }
-    }
-    const check = checkAttachmentLimit('image', buffer.length, mime)
-    if (!check.ok) {
-      console.warn('[Telegram] Outbound image rejected:', check.hint)
-      return
-    }
-    await media.sendPhoto(numericChatId, buffer, pending.alt)
+    const loaded = await sendSafeOutboundImage(pending, sessionStore.get(chatId)?.workDir, (buffer) => media.sendPhoto(numericChatId, buffer, pending.alt))
+    if (!loaded.ok) console.warn('[Telegram] Outbound image rejected:', loaded.reason)
   } catch (err) {
     console.error(
       '[Telegram] dispatchOutboundMedia failed:',
@@ -613,17 +585,20 @@ async function startNewSession(chatId: string, query?: string): Promise<void> {
   }
 }
 
-bot.command('new', async (ctx) => {
+const isAuthorizedTelegramUser = (userId: number) => isAllowedUser('telegram', userId)
+
+registerAuthorizedTelegramCommand(bot, 'new', isAuthorizedTelegramUser, async (ctx) => {
   const chatId = String(ctx.chat.id)
-  await startNewSession(chatId, ctx.match?.trim() || undefined)
+  const query = typeof ctx.match === 'string' ? ctx.match.trim() : undefined
+  await startNewSession(chatId, query || undefined)
 })
 
-bot.command('projects', async (ctx) => {
+registerAuthorizedTelegramCommand(bot, 'projects', isAuthorizedTelegramUser, async (ctx) => {
   const chatId = String(ctx.chat.id)
   await showProjectPicker(chatId)
 })
 
-bot.command('stop', (ctx) => {
+registerAuthorizedTelegramCommand(bot, 'stop', isAuthorizedTelegramUser, (ctx) => {
   const chatId = String(ctx.chat.id)
   void (async () => {
     const stored = await ensureExistingSession(chatId)
@@ -636,12 +611,12 @@ bot.command('stop', (ctx) => {
   })()
 })
 
-bot.command('status', async (ctx) => {
+registerAuthorizedTelegramCommand(bot, 'status', isAuthorizedTelegramUser, async (ctx) => {
   const chatId = String(ctx.chat.id)
   await ctx.reply(await buildStatusText(chatId))
 })
 
-bot.command('clear', (ctx) => {
+registerAuthorizedTelegramCommand(bot, 'clear', isAuthorizedTelegramUser, (ctx) => {
   const chatId = String(ctx.chat.id)
   void (async () => {
     const stored = await ensureExistingSession(chatId)
@@ -674,9 +649,9 @@ async function routeUserMessage(
   attachments: AttachmentRef[],
 ): Promise<void> {
   if (!ctx.from || ctx.chat?.type !== 'private') return
-  if (!dedup.tryRecord(String(ctx.message?.message_id))) return
-
   const chatId = String(ctx.chat.id)
+  if (!shouldProcessTelegramMessage(dedup, chatId, ctx.message?.message_id)) return
+
   const userId = ctx.from.id
 
   if (!isAllowedUser('telegram', userId)) {
@@ -810,28 +785,14 @@ bot.on('callback_query:data', async (ctx) => {
 
   const decision = parsePermitCallbackData(data)
   if (!decision) return
-  const chatId = String(ctx.callbackQuery.message?.chat.id)
-
-  bridge.sendPermissionResponse(chatId, decision.requestId, decision.allowed, decision.rule)
-  const runtime = getRuntimeState(chatId)
-  runtime.pendingPermissionCount = Math.max(0, runtime.pendingPermissionCount - 1)
-  pendingPermissions.get(chatId)?.delete(decision.requestId)
-
-  const statusText = formatPermissionDecisionStatus(decision)
-  try {
-    await ctx.editMessageText(
-      ctx.callbackQuery.message?.text + `\n\n${statusText}`,
-    )
-  } catch { /* ignore */ }
-
-  await ctx.answerCallbackQuery(statusText)
+  await commandController.handlePermissionCallback(ctx, decision, pendingPermissions, (chatId) => getRuntimeState(chatId).pendingPermissionCount = Math.max(0, getRuntimeState(chatId).pendingPermissionCount - 1))
 })
 
 // ---------- start ----------
 
 console.log('[Telegram] Starting bot...')
 console.log(`[Telegram] Server: ${config.serverUrl}`)
-console.log(`[Telegram] Allowed users: ${config.telegram.allowedUsers.length === 0 ? 'all' : config.telegram.allowedUsers.join(', ')}`)
+console.log(`[Telegram] Allowed users: ${config.telegram.allowedUsers.length === 0 ? 'paired users only' : config.telegram.allowedUsers.join(', ')}`)
 
 void syncTelegramBotCommands(bot.api).then(() => console.log('[Telegram] Command menu synced')).catch((err) => console.warn('[Telegram] Command menu sync failed:', err instanceof Error ? err.message : err))
 

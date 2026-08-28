@@ -3,12 +3,16 @@ import { useTabStore } from '../../stores/tabStore'
 import { EmptySession } from '../../pages/EmptySession'
 import { ActiveSession } from '../../pages/ActiveSession'
 import { ScheduledTasks } from '../../pages/ScheduledTasks'
+import { Market } from '../../pages/Market'
 import { Settings } from '../../pages/Settings'
 import { TerminalSettings } from '../../pages/TerminalSettings'
 import { TraceList } from '../../pages/TraceList'
 import { TraceSession } from '../../pages/TraceSession'
+import { SubagentRunPage, TeamMemberRunPage } from '../../pages/SubagentRunPage'
 import { WorkbenchTab } from '../workbench/WorkbenchTab'
+import { AgentTeamsWorkbenchTab } from '../agentTeams/AgentTeamsWorkbenchTab'
 import { previewBridge } from '../../lib/previewBridge'
+import { returnToTraceList } from '../../lib/traceNavigation'
 
 export function ContentRouter() {
   const activeTabId = useTabStore((s) => s.activeTabId)
@@ -28,15 +32,49 @@ export function ContentRouter() {
     page = <Settings />
   } else if (activeTabType === 'scheduled') {
     page = <ScheduledTasks />
+  } else if (activeTabType === 'market') {
+    page = <Market />
   } else if (activeTabType === 'trace') {
-    const traceSessionId = tabs.find((t) => t.sessionId === activeTabId)?.traceSessionId
-    page = traceSessionId ? <TraceSession sessionId={traceSessionId} /> : <EmptySession />
+    const traceTabId = activeTabId
+    const traceSessionId = tabs.find((t) => t.sessionId === traceTabId)?.traceSessionId
+    page = traceSessionId
+      ? <TraceSession sessionId={traceSessionId} onBack={() => returnToTraceList(traceTabId)} />
+      : <EmptySession />
   } else if (activeTabType === 'traces') {
     page = <TraceList />
+  } else if (activeTabType === 'subagent') {
+    const subagentTab = tabs.find((t) => t.sessionId === activeTabId)
+    page = subagentTab?.sourceSessionId && subagentTab.subagentToolUseId
+      ? (
+        <SubagentRunPage
+          sourceSessionId={subagentTab.sourceSessionId}
+          toolUseId={subagentTab.subagentToolUseId}
+          taskId={subagentTab.subagentTaskId}
+          title={subagentTab.title}
+        />
+      )
+      : <EmptySession />
+  } else if (activeTabType === 'team-member') {
+    const memberTab = tabs.find((tab) => tab.sessionId === activeTabId)
+    page = memberTab?.teamLeadSessionId && memberTab.teamMemberAgentId
+      ? (
+        <TeamMemberRunPage
+          tabId={activeTabId}
+          leadSessionId={memberTab.teamLeadSessionId}
+          agentId={memberTab.teamMemberAgentId}
+          title={memberTab.title}
+        />
+      )
+      : <EmptySession />
   } else if (activeTabType === 'workbench') {
     const workbenchTab = tabs.find((t) => t.sessionId === activeTabId)
     page = workbenchTab?.workbenchSessionId
       ? <WorkbenchTab tabId={activeTabId} sessionId={workbenchTab.workbenchSessionId} />
+      : <EmptySession />
+  } else if (activeTabType === 'team') {
+    const teamTab = tabs.find((t) => t.sessionId === activeTabId)
+    page = teamTab?.teamLeadSessionId
+      ? <AgentTeamsWorkbenchTab tabId={activeTabId} leadSessionId={teamTab.teamLeadSessionId} />
       : <EmptySession />
   } else if (activeTabType !== 'terminal') {
     page = <ActiveSession />

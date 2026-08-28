@@ -6,6 +6,7 @@ import type {
   NotificationPermissionState,
 } from './types'
 import { buildTraceWindowUrl } from '../traceLaunch'
+import { readBrowserLanguages } from '../../i18n/locale'
 
 const browserCapabilities: DesktopHostCapabilities = {
   appMode: false,
@@ -31,7 +32,6 @@ function noopUnlisten(): void {
 const defaultAppMode: AppModeConfig = {
   mode: 'default',
   portableDir: null,
-  defaultPortableDir: null,
 }
 
 const defaultPermissionState: NotificationPermissionState = 'default'
@@ -44,58 +44,25 @@ export const browserHost: DesktopHost = {
     async getServerUrl() {
       unsupported('Resolving the bundled server URL')
     },
-    async checkServerHealth(serverUrl) {
-      // Browser runtime has no IPC fallback; use fetch directly. This path is
-      // only hit when running the renderer in a plain browser (dev), so it is
-      // not subject to the Electron-session proxy quirks that motivated the
-      // IPC version.
-      try {
-        const response = await fetch(`${serverUrl.replace(/\/+$/, '')}/health`, {
-          cache: 'no-store',
-        })
-        if (!response.ok) {
-          return { ok: false as const, reason: `healthcheck returned ${response.status}` }
-        }
-        const contentType = response.headers.get('content-type') ?? ''
-        if (!contentType.toLowerCase().includes('application/json')) {
-          return { ok: false as const, reason: 'healthcheck returned non-JSON response' }
-        }
-        const body = await response.json().catch(() => null)
-        if (!body || typeof body !== 'object' || !('status' in body) || body.status !== 'ok') {
-          return { ok: false as const, reason: 'healthcheck returned invalid response' }
-        }
-        return { ok: true as const }
-      } catch (error) {
-        return {
-          ok: false as const,
-          reason: error instanceof Error ? error.message : String(error),
-        }
-      }
-    },
-    async httpRequest(payload) {
-      try {
-        const response = await fetch(payload.url, {
-          method: payload.method ?? 'GET',
-          headers: payload.headers,
-          body: payload.body,
-        })
-        const headers: Record<string, string> = {}
-        response.headers.forEach((value, key) => { headers[key] = value })
-        const body = await response.text()
-        return { status: response.status, statusText: response.statusText, headers, body }
-      } catch (error) {
-        return {
-          status: 0,
-          statusText: error instanceof Error ? error.message : String(error),
-          headers: {},
-          body: '',
-        }
-      }
+    async getLocalAccessToken() {
+      unsupported('Resolving the bundled server access token')
     },
   },
   app: {
     async getVersion() {
       return '0.1.0'
+    },
+    async getLocalePreference() {
+      return null
+    },
+    async setLocalePreference() {
+      // Browser/H5 preferences stay in renderer localStorage.
+    },
+    async getPreferredSystemLanguages() {
+      return readBrowserLanguages()
+    },
+    async onLocaleChanged() {
+      return noopUnlisten
     },
   },
   commands: {
@@ -116,6 +83,12 @@ export const browserHost: DesktopHost = {
         return
       }
       unsupported('Writing clipboard text')
+    },
+  },
+  files: {
+    getPathForFile(file) {
+      const legacyPath = (file as File & { path?: unknown }).path
+      return typeof legacyPath === 'string' ? legacyPath : ''
     },
   },
   events: {
@@ -147,6 +120,59 @@ export const browserHost: DesktopHost = {
         return
       }
       unsupported('Opening trace windows')
+    },
+  },
+  pets: {
+    async list() {
+      unsupported('Custom pets')
+    },
+    async createFromImage() {
+      unsupported('Creating custom pets')
+    },
+    async createFromAtlas() {
+      unsupported('Creating custom pets')
+    },
+    async pickSourceSheet() {
+      unsupported('Creating custom pets')
+    },
+    async createFromAtlasBytes() {
+      unsupported('Creating custom pets')
+    },
+    async openFolder() {
+      unsupported('Opening the custom pets folder')
+    },
+    async show() {
+      unsupported('Showing the companion pet')
+    },
+    async hide() {
+      unsupported('Hiding the companion pet')
+    },
+    async showContextMenu() {
+      unsupported('Showing the companion pet context menu')
+    },
+    async dragWindow() {
+      unsupported('Dragging the companion pet window')
+    },
+    async setIgnoreMouseEvents() {
+      unsupported('Changing companion pet mouse passthrough')
+    },
+    async setInteractiveRegions() {
+      unsupported('Changing companion pet interaction regions')
+    },
+    async focusMainWindow() {
+      unsupported('Focusing the main desktop window')
+    },
+    async focusSession() {
+      unsupported('Focusing a pet session')
+    },
+    async onPanelPlacementChanged() {
+      return noopUnlisten
+    },
+    async onNavigateSession() {
+      return noopUnlisten
+    },
+    async onVisibilityChanged() {
+      return noopUnlisten
     },
   },
   dialogs: {
@@ -288,9 +314,6 @@ export const browserHost: DesktopHost = {
     async set() {
       unsupported('Desktop app mode')
     },
-    async detectPortableDir() {
-      return null
-    },
     async prepareRestart() {
       unsupported('Desktop app restart')
     },
@@ -307,5 +330,10 @@ export const browserHost: DesktopHost = {
     async set() {
       unsupported('Native app zoom')
     },
+  },
+  appearance: {
+    // No native chrome to keep in sync in a browser tab; the CSS theme is the
+    // whole story there, so reporting it is a no-op rather than an error.
+    async setApplied() {},
   },
 }

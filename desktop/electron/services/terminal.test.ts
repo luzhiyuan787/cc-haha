@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -16,6 +17,7 @@ import {
   terminalConfigPath,
   type TerminalPtyFactory,
   type TerminalPtyProcess,
+  type TerminalWebContentsLike,
 } from './terminal'
 
 class FakePty implements TerminalPtyProcess {
@@ -54,6 +56,20 @@ class FakePty implements TerminalPtyProcess {
   }
 }
 
+class FakeWebContents extends EventEmitter implements TerminalWebContentsLike {
+  destroyed = false
+  readonly send = vi.fn()
+
+  isDestroyed() {
+    return this.destroyed
+  }
+
+  destroy() {
+    this.destroyed = true
+    this.emit('destroyed')
+  }
+}
+
 const tempDirs: string[] = []
 const itOnDarwin = process.platform === 'darwin' ? it : it.skip
 
@@ -71,11 +87,39 @@ afterEach(() => {
 })
 
 describe('Electron terminal service', () => {
-  it('uses the portable terminal config path before app userData', () => {
-    const app = { getPath: vi.fn(() => '/app/user-data') }
+  it('uses the custom terminal config path before the standard ~/.claude path', () => {
+    const app = { getPath: vi.fn(() => '/Users/test') }
 
-    expect(terminalConfigPath(app, { CLAUDE_CONFIG_DIR: '/portable' })).toBe('/portable/terminal-config.json')
-    expect(terminalConfigPath(app, {})).toBe('/app/user-data/terminal-config.json')
+    expect(terminalConfigPath(app, { CLAUDE_CONFIG_DIR: '/portable' }))
+      .toBe(path.join('/portable', 'terminal-config.json'))
+    expect(terminalConfigPath(app, {}))
+      .toBe(path.join('/Users/test', '.claude', 'terminal-config.json'))
+  })
+
+  it('reads an old userData terminal config but writes future changes to ~/.claude', () => {
+    const root = tempDir()
+    const home = path.join(root, 'home')
+    const userData = path.join(root, 'user-data')
+    const legacyBash = path.join(root, 'legacy-bash.exe')
+    const newBash = path.join(root, 'new-bash.exe')
+    fs.mkdirSync(userData, { recursive: true })
+    fs.writeFileSync(legacyBash, '')
+    fs.writeFileSync(newBash, '')
+    fs.writeFileSync(path.join(userData, 'terminal-config.json'), JSON.stringify({ bash_path: legacyBash }))
+    const service = new ElectronTerminalService({
+      app: { getPath: name => name === 'home' ? home : userData },
+      env: {},
+      isFile: filePath => filePath === legacyBash || filePath === newBash,
+    })
+
+    expect(service.getBashPath()).toBe(legacyBash)
+    service.setBashPath(newBash)
+    expect(JSON.parse(fs.readFileSync(path.join(home, '.claude', 'terminal-config.json'), 'utf8'))).toEqual({
+      bash_path: newBash,
+    })
+    expect(JSON.parse(fs.readFileSync(path.join(userData, 'terminal-config.json'), 'utf8'))).toEqual({
+      bash_path: legacyBash,
+    })
   })
 
   it('persists the legacy bash path config and validates saved paths', () => {
@@ -121,13 +165,49 @@ describe('Electron terminal service', () => {
       JSON.stringify({ desktopTerminal: { startupShell: 'cmd' } }),
     )
 
+    const ignoredHome = tempDir()
     const service = new ElectronTerminalService({
-      env: { HOME: dir, COMSPEC: 'powershell.exe' },
+      env: { HOME: ignoredHome, USERPROFILE: dir, COMSPEC: 'powershell.exe' },
       platform: 'win32',
     })
 
-    expect(desktopTerminalSettingsPath({ HOME: dir })).toBe(path.join(dir, '.claude', 'settings.json'))
+    expect(desktopTerminalSettingsPath({ HOME: ignoredHome, USERPROFILE: dir }, 'win32'))
+      .toBe(path.join(dir, '.claude', 'settings.json'))
+    expect(desktopTerminalSettingsPath({ HOME: dir }, 'darwin'))
+      .toBe(path.join(dir, '.claude', 'settings.json'))
     expect(service.resolveShell()).toBe('cmd.exe')
+  })
+
+  it('falls back safely when persisted terminal settings have malformed runtime shapes', () => {
+    const dir = tempDir()
+    const settingsPath = path.join(dir, 'settings.json')
+    const terminalPath = path.join(dir, 'terminal-config.json')
+    const malformedSettings = JSON.stringify({ desktopTerminal: { startupShell: 42, customShellPath: {} } })
+    const malformedTerminal = JSON.stringify({ bash_path: { bad: true }, preserved: 'value' })
+    fs.writeFileSync(settingsPath, malformedSettings)
+    fs.writeFileSync(terminalPath, malformedTerminal)
+
+    const service = new ElectronTerminalService({
+      env: { CLAUDE_CONFIG_DIR: dir, COMSPEC: 'powershell.exe' },
+      platform: 'win32',
+    })
+
+    expect(service.getBashPath()).toBeNull()
+    expect(service.resolveShell()).toBe('powershell.exe')
+    expect(fs.readFileSync(settingsPath, 'utf8')).toBe(malformedSettings)
+    expect(fs.readFileSync(terminalPath, 'utf8')).toBe(malformedTerminal)
+
+    fs.writeFileSync(
+      settingsPath,
+      JSON.stringify({ desktopTerminal: { startupShell: 'custom', customShellPath: { bad: true } } }),
+    )
+    expect(service.resolveShell()).toBe('powershell.exe')
+
+    fs.writeFileSync(
+      settingsPath,
+      JSON.stringify({ desktopTerminal: { startupShell: 'future-shell' } }),
+    )
+    expect(service.resolveShell()).toBe('powershell.exe')
   })
 
   it('normalizes terminal environment data to UTF-8 locale', () => {
@@ -151,8 +231,10 @@ describe('Electron terminal service', () => {
 
     expect(prepareNodePtyRuntime(source, cache)).toBe(cache)
     expect(fs.existsSync(path.join(cache, 'index.js'))).toBe(true)
-    expect(fs.statSync(cache).mode & 0o077).toBe(0)
-    expect(fs.statSync(path.join(cache, 'prebuilds', 'darwin-arm64', 'spawn-helper')).mode & 0o777).toBe(0o500)
+    if (process.platform !== 'win32') {
+      expect(fs.statSync(cache).mode & 0o077).toBe(0)
+      expect(fs.statSync(path.join(cache, 'prebuilds', 'darwin-arm64', 'spawn-helper')).mode & 0o777).toBe(0o500)
+    }
     expect(fs.existsSync(path.join(cache, '.cc-haha-node-pty-manifest.json'))).toBe(true)
   })
 
@@ -200,10 +282,12 @@ describe('Electron terminal service', () => {
       ptyFactory: { spawn } satisfies TerminalPtyFactory,
       fileExists: filePath => filePath === '/bin/test-shell',
     })
+    const owner = new FakeWebContents()
+    owner.send.mockImplementation((channel, payload) => sent.push({ channel, payload }))
 
     const session = await service.spawn(
       { cols: 10, rows: 4, cwd: dir },
-      { send: (channel, payload) => sent.push({ channel, payload }) },
+      owner,
     )
 
     expect(session).toEqual({ session_id: 1, shell: '/bin/test-shell', cwd: dir })
@@ -218,8 +302,8 @@ describe('Electron terminal service', () => {
       }),
     }))
 
-    service.write(1, 'echo hello\r')
-    service.resize(1, 12, 6)
+    service.write(1, 'echo hello\r', owner)
+    service.resize(1, 12, 6, owner)
     fakePty.emitData('hello\r\n')
     fakePty.emitExit({ exitCode: 0 })
 
@@ -235,7 +319,7 @@ describe('Electron terminal service', () => {
         payload: { session_id: 1, code: 0, signal: null },
       },
     ])
-    expect(() => service.write(1, 'after exit')).toThrow('terminal session is not running')
+    expect(() => service.write(1, 'after exit', owner)).toThrow('terminal session is not running')
   })
 
   it('kills a running PTY session without failing when the session is already gone', async () => {
@@ -246,11 +330,202 @@ describe('Electron terminal service', () => {
       platform: 'linux',
       ptyFactory: { spawn: vi.fn(() => fakePty) },
     })
+    const owner = new FakeWebContents()
 
-    await service.spawn({ cols: 80, rows: 24, cwd: dir }, { send: vi.fn() })
-    service.kill(1)
-    service.kill(1)
+    await service.spawn({ cols: 80, rows: 24, cwd: dir }, owner)
+    service.kill(1, owner)
+    service.kill(1, owner)
 
     expect(fakePty.killed).toBe(true)
+  })
+
+  it('binds a PTY session to the renderer that created it', async () => {
+    const dir = tempDir()
+    const fakePty = new FakePty()
+    const service = new ElectronTerminalService({
+      env: { HOME: dir, SHELL: '/bin/test-shell' },
+      platform: 'linux',
+      ptyFactory: { spawn: vi.fn(() => fakePty) },
+    })
+    const owner = new FakeWebContents()
+    const otherRenderer = new FakeWebContents()
+
+    await service.spawn({ cols: 80, rows: 24, cwd: dir }, owner)
+
+    expect(() => service.write(1, 'foreign input', otherRenderer)).toThrow('owned by another renderer')
+    expect(() => service.resize(1, 120, 40, otherRenderer)).toThrow('owned by another renderer')
+    expect(() => service.kill(1, otherRenderer)).toThrow('owned by another renderer')
+    expect(fakePty.killed).toBe(false)
+    service.write(1, 'owner input', owner)
+    expect(fakePty.writes).toEqual(['owner input'])
+  })
+
+  it('does not create a PTY when its renderer is destroyed before or during factory loading', async () => {
+    const dir = tempDir()
+    const factorySpawn = vi.fn(() => new FakePty())
+    let resolveFactory: ((factory: TerminalPtyFactory) => void) | undefined
+    const factoryPromise = new Promise<TerminalPtyFactory>((resolve) => {
+      resolveFactory = resolve
+    })
+    const service = new ElectronTerminalService({
+      env: { HOME: dir, SHELL: '/bin/test-shell' },
+      platform: 'linux',
+      ptyFactory: () => factoryPromise,
+    })
+    const destroyedBefore = new FakeWebContents()
+    destroyedBefore.destroy()
+
+    await expect(service.spawn({ cols: 80, rows: 24, cwd: dir }, destroyedBefore))
+      .rejects.toThrow('terminal renderer is destroyed')
+
+    const destroyedDuring = new FakeWebContents()
+    const spawning = service.spawn({ cols: 80, rows: 24, cwd: dir }, destroyedDuring)
+    destroyedDuring.destroy()
+    resolveFactory?.({ spawn: factorySpawn })
+
+    await expect(spawning).rejects.toThrow('terminal renderer is destroyed')
+    expect(factorySpawn).not.toHaveBeenCalled()
+  })
+
+  it('kills a PTY when its renderer is destroyed during spawn or after startup', async () => {
+    const dir = tempDir()
+    const ptyDestroyedDuringSpawn = new FakePty()
+    const ownerDestroyedDuringSpawn = new FakeWebContents()
+    const spawnWhileDestroying = vi.fn(() => {
+      ownerDestroyedDuringSpawn.destroy()
+      return ptyDestroyedDuringSpawn
+    })
+    const serviceDestroyedDuringSpawn = new ElectronTerminalService({
+      env: { HOME: dir, SHELL: '/bin/test-shell' },
+      platform: 'linux',
+      ptyFactory: { spawn: spawnWhileDestroying },
+    })
+
+    await expect(serviceDestroyedDuringSpawn.spawn(
+      { cols: 80, rows: 24, cwd: dir },
+      ownerDestroyedDuringSpawn,
+    )).rejects.toThrow('terminal renderer is destroyed')
+    expect(ptyDestroyedDuringSpawn.killed).toBe(true)
+
+    const activePty = new FakePty()
+    const activeOwner = new FakeWebContents()
+    const activeService = new ElectronTerminalService({
+      env: { HOME: dir, SHELL: '/bin/test-shell' },
+      platform: 'linux',
+      ptyFactory: { spawn: vi.fn(() => activePty) },
+    })
+    await activeService.spawn({ cols: 80, rows: 24, cwd: dir }, activeOwner)
+
+    activeOwner.destroy()
+
+    expect(activePty.killed).toBe(true)
+    expect(() => activeService.write(1, 'after destroy', activeOwner))
+      .toThrow('terminal session is not running')
+    expect(() => activePty.emitData('late output')).not.toThrow()
+    expect(() => activePty.emitExit({ exitCode: 0 })).not.toThrow()
+    expect(activeOwner.send).not.toHaveBeenCalled()
+  })
+
+  // Regression: 'destroyed' was the only lifecycle subscription, and a reload does not
+  // emit it. The app reloads the renderer deliberately — render-process-gone and
+  // sustained-unresponsive recovery in rendererLifecycle.ts, plus the reload buttons in
+  // ErrorBoundary and StartupErrorView — and the reload wipes the renderer-side session
+  // map, so kill() could never name those PTYs again. Every shell and its children (dev
+  // servers, watchers, builds) survived invisibly until before-quit.
+  it('kills a PTY when its renderer replaces the document without being destroyed', async () => {
+    const dir = tempDir()
+    const pty = new FakePty()
+    const owner = new FakeWebContents()
+    const service = new ElectronTerminalService({
+      env: { HOME: dir, SHELL: '/bin/test-shell' },
+      platform: 'linux',
+      ptyFactory: { spawn: vi.fn(() => pty) },
+    })
+    await service.spawn({ cols: 80, rows: 24, cwd: dir }, owner)
+
+    // A navigation that starts but never commits must not touch a live shell.
+    // installMainWindowNavigationGuards cancels external http(s) in `will-navigate`,
+    // and Chromium dispatches DidStartNavigation before that throttle runs — so the
+    // start event fires for navigation the user never actually goes through with.
+    owner.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+    expect(pty.killed).toBe(false)
+
+    owner.emit('did-navigate', {}, 'app://index.html', 200)
+
+    expect(pty.killed).toBe(true)
+    expect(owner.isDestroyed()).toBe(false)
+    expect(() => service.write(1, 'after reload', owner)).toThrow('terminal session is not running')
+  })
+
+  it('stops watching navigation once the session is killed normally', async () => {
+    const dir = tempDir()
+    const pty = new FakePty()
+    const owner = new FakeWebContents()
+    const service = new ElectronTerminalService({
+      env: { HOME: dir, SHELL: '/bin/test-shell' },
+      platform: 'linux',
+      ptyFactory: { spawn: vi.fn(() => pty) },
+    })
+    const { session_id } = await service.spawn({ cols: 80, rows: 24, cwd: dir }, owner)
+    service.kill(session_id, owner)
+
+    // Both listeners have to come off together, or a long-lived renderer accumulates
+    // one navigation handler per terminal it ever opened.
+    expect(owner.listenerCount('did-navigate')).toBe(0)
+    expect(owner.listenerCount('destroyed')).toBe(0)
+  })
+
+  it('ignores a renderer destroyed during send but rethrows unrelated send errors', async () => {
+    const dir = tempDir()
+    const destroyedPty = new FakePty()
+    const destroyedOwner = new FakeWebContents()
+    destroyedOwner.send.mockImplementation(() => {
+      throw new TypeError('Object has been destroyed')
+    })
+    const destroyedService = new ElectronTerminalService({
+      env: { HOME: dir, SHELL: '/bin/test-shell' },
+      platform: 'linux',
+      ptyFactory: { spawn: vi.fn(() => destroyedPty) },
+    })
+
+    await destroyedService.spawn({ cols: 80, rows: 24, cwd: dir }, destroyedOwner)
+
+    expect(() => destroyedPty.emitData('late output')).not.toThrow()
+    expect(() => destroyedPty.emitExit({ exitCode: 0 })).not.toThrow()
+
+    const failingPty = new FakePty()
+    const failingOwner = new FakeWebContents()
+    failingOwner.send.mockImplementation(() => {
+      throw new Error('unexpected IPC failure')
+    })
+    const failingService = new ElectronTerminalService({
+      env: { HOME: dir, SHELL: '/bin/test-shell' },
+      platform: 'linux',
+      ptyFactory: { spawn: vi.fn(() => failingPty) },
+    })
+    await failingService.spawn({ cols: 80, rows: 24, cwd: dir }, failingOwner)
+
+    expect(() => failingPty.emitData('output')).toThrow('unexpected IPC failure')
+  })
+
+  it('ignores PTY events that arrive after killAll', async () => {
+    const dir = tempDir()
+    const fakePty = new FakePty()
+    const send = vi.fn()
+    const service = new ElectronTerminalService({
+      env: { HOME: dir, SHELL: '/bin/test-shell' },
+      platform: 'linux',
+      ptyFactory: { spawn: vi.fn(() => fakePty) },
+    })
+    const owner = new FakeWebContents()
+
+    owner.send.mockImplementation(send)
+    await service.spawn({ cols: 80, rows: 24, cwd: dir }, owner)
+    service.killAll()
+
+    expect(fakePty.killed).toBe(true)
+    expect(() => fakePty.emitData('late output')).not.toThrow()
+    expect(() => fakePty.emitExit({ exitCode: 0 })).not.toThrow()
+    expect(send).not.toHaveBeenCalled()
   })
 })

@@ -30,6 +30,9 @@ export type DiagnosticsStatus = {
   maxBytes: number
   totalBytes: number
   eventCount: number
+  physicalLineCount: number
+  corruptLineCount: number
+  storageLimitExceeded: boolean
   recentErrorCount: number
   lastEventAt: string | null
 }
@@ -40,9 +43,27 @@ export type DiagnosticsBundle = {
   bytes: number
 }
 
+export type LocalIndexMode = 'off' | 'shadow' | 'on'
+export type LocalIndexState = 'off' | 'building' | 'ready' | 'degraded'
+
+export type LocalIndexStatus = {
+  mode: LocalIndexMode
+  state: LocalIndexState
+  discovered: number
+  indexed: number
+  degradedSources: number
+  databaseBytes: number
+  walBytes: number
+  lastUpdatedAt: string | null
+  lastErrorCode: string | null
+}
+
 export const diagnosticsApi = {
   getStatus: () => api.get<DiagnosticsStatus>('/api/diagnostics/status'),
+  getLocalIndexStatus: () => api.get<LocalIndexStatus>('/api/diagnostics/local-index'),
+  rebuildLocalIndex: () => api.post<LocalIndexStatus>('/api/diagnostics/local-index/rebuild'),
   getEvents: (limit = 100) => api.get<{ events: DiagnosticEvent[] }>(`/api/diagnostics/events?limit=${limit}`),
+  getIssueReport: () => api.get<{ report: string }>('/api/diagnostics/issue-report'),
   recordEvent: (event: DiagnosticEventInput) => api.post<{ ok: true }>('/api/diagnostics/events', event, { timeout: 5_000 }),
   exportBundle: () => api.post<{ bundle: DiagnosticsBundle }>('/api/diagnostics/export', undefined, { timeout: 60_000 }),
   openLogDir: () => api.post<{ ok: true }>('/api/diagnostics/open-log-dir'),

@@ -16,10 +16,13 @@ vi.mock('mermaid', () => ({
 
 import { MermaidRenderer } from './MermaidRenderer'
 import { useUIStore } from '../../stores/uiStore'
+import { useSettingsStore } from '../../stores/settingsStore'
 
 describe('MermaidRenderer', () => {
   beforeEach(() => {
     useUIStore.setState({ theme: 'white' })
+    // The zoom controls are translated; assertions below spell the English strings.
+    useSettingsStore.setState({ locale: 'en' })
     initializeMock.mockReset()
     renderMock.mockReset()
     renderMock.mockResolvedValue({
@@ -76,6 +79,40 @@ describe('MermaidRenderer', () => {
     expect(arrow).toHaveAttribute('stroke', '#ff0000')
     expect(arrow?.getAttribute('style') ?? '').not.toContain('fill:')
     expect(arrow?.getAttribute('style') ?? '').not.toContain('stroke:')
+  })
+
+  it('quotes generated slash labels that Mermaid would parse as invalid shape syntax', async () => {
+    render(
+      <MermaidRenderer
+        code={[
+          'flowchart TD',
+          '  D1[/api/dcl] --> D2[直接调用 dclService]',
+        ].join('\n')}
+      />,
+    )
+
+    await waitFor(() => {
+      expect(renderMock).toHaveBeenCalledWith(
+        expect.any(String),
+        [
+          'flowchart TD',
+          '  D1["/api/dcl"] --> D2[直接调用 dclService]',
+        ].join('\n'),
+      )
+    })
+  })
+
+  it('preserves slash-delimited Mermaid flowchart shapes', async () => {
+    const code = [
+      'flowchart TD',
+      '  A[/Manual input/] --> B[OK]',
+    ].join('\n')
+
+    render(<MermaidRenderer code={code} />)
+
+    await waitFor(() => {
+      expect(renderMock).toHaveBeenCalledWith(expect.any(String), code)
+    })
   })
 
   it('fits oversized diagrams inside the chat message surface', async () => {

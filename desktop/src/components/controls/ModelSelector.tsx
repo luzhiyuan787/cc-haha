@@ -1,5 +1,6 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
+import { BUNDLED_PROVIDER_PRESETS } from '../../config/providerPresets'
 import { OFFICIAL_MODELS } from '../../constants/modelCatalog'
 import {
   OPENAI_OFFICIAL_MODELS,
@@ -12,13 +13,32 @@ import { DRAFT_RUNTIME_SELECTION_KEY, useSessionRuntimeStore } from '../../store
 import { useSettingsStore } from '../../stores/settingsStore'
 import type { SavedProvider } from '../../types/provider'
 import type { RuntimeSelection } from '../../types/runtime'
-import type { EffortLevel, ModelInfo } from '../../types/settings'
+import type { ModelInfo, ReasoningEffortLevel } from '../../types/settings'
+import { useDismissable } from '@/hooks/useDismissable'
 import { useMobileViewport } from '../../hooks/useMobileViewport'
 import { isDesktopRuntime } from '../../lib/desktopRuntime'
-import { resolveDefaultRuntimeSelection } from '../../lib/runtimeSelection'
+import {
+  normalizeRuntimeSelection,
+  resolveDefaultRuntimeSelection,
+} from '../../lib/runtimeSelection'
 import { useHahaOAuthStore } from '../../stores/hahaOAuthStore'
 import { useHahaOpenAIOAuthStore } from '../../stores/hahaOpenAIOAuthStore'
-import { MobileBottomSheet } from '../shared/MobileBottomSheet'
+import { useHahaGrokOAuthStore } from '../../stores/hahaGrokOAuthStore'
+import {
+  GROK_OFFICIAL_MODELS,
+  GROK_OFFICIAL_PROVIDER_ID,
+} from '../../constants/grokOfficialProvider'
+import { MobileBottomSheet } from '@/components/ui/MobileBottomSheet'
+import { SearchField } from '@/components/ui/SearchField'
+import { ReasoningEffortPopover } from './ReasoningEffortPopover'
+import { useUIStore } from '../../stores/uiStore'
+import { SETTINGS_TAB_ID, useTabStore } from '../../stores/tabStore'
+import {
+  getModelReasoningCapabilityOverride,
+  isModelReasoningEffort,
+  normalizeModelReasoningEffort,
+  resolveModelReasoningProfile,
+} from '../../../../src/shared/modelReasoning'
 
 type ProviderChoice = {
   providerId: string | null
@@ -30,11 +50,20 @@ type ProviderChoice = {
 type Props = {
   value?: string
   onChange?: (modelId: string) => void
+  /**
+   * Overrides the settings-store catalog for controlled pickers. This keeps
+   * the shared search, portal, and viewport positioning while allowing a
+   * feature to prepend semantic choices such as an inherited model.
+   */
+  models?: ModelInfo[]
+  ariaLabel?: string
+  appearance?: 'toolbar' | 'field'
   runtimeSelection?: RuntimeSelection
   onRuntimeSelectionChange?: (selection: RuntimeSelection) => void
   runtimeKey?: string
   disabled?: boolean
   compact?: boolean
+  fluid?: boolean
 }
 
 export type ModelSelectorHandle = {
@@ -54,6 +83,20 @@ const DROPDOWN_GAP = 8
 const VIEWPORT_MARGIN = 16
 const DROPDOWN_MAX_HEIGHT = 420
 const DROPDOWN_MIN_HEIGHT = 180
+const PROVIDER_PRESET_DEFAULT_ENVS = new Map(
+  BUNDLED_PROVIDER_PRESETS.map(preset => [preset.id, preset.defaultEnv ?? {}]),
+)
+
+function getProviderModelCapabilityOverride(
+  provider: SavedProvider,
+  modelId: string,
+): string | undefined {
+  return getModelReasoningCapabilityOverride(
+    modelId,
+    provider.models,
+    PROVIDER_PRESET_DEFAULT_ENVS.get(provider.presetId) ?? {},
+  )
+}
 
 function officialChoices(
   providerId: string | null,
@@ -67,6 +110,18 @@ function officialChoices(
     isDefault,
     models,
   }
+}
+
+function mergeOfficialModels(availableModels: ModelInfo[]): ModelInfo[] {
+  const merged = [...OFFICIAL_MODELS]
+  const knownIds = new Set(merged.map(model => model.id))
+  for (const model of availableModels) {
+    if (!knownIds.has(model.id)) {
+      knownIds.add(model.id)
+      merged.push(model)
+    }
+  }
+  return merged
 }
 
 function buildProviderModels(
@@ -93,12 +148,23 @@ function buildProviderModels(
     byId.set(entry.id, { id: entry.id, labels: [entry.label] })
   }
 
-  return [...byId.values()].map((entry) => ({
-    id: entry.id,
-    name: entry.id,
-    description: entry.labels.join(' · '),
-    context: '',
-  }))
+  return [...byId.values()].map((entry) => {
+    const reasoningProfile = resolveModelReasoningProfile(
+      entry.id,
+      provider.apiFormat,
+      getProviderModelCapabilityOverride(provider, entry.id),
+    )
+    return {
+      id: entry.id,
+      name: entry.id,
+      description: entry.labels.join(' · '),
+      context: '',
+      supportedReasoningEfforts: [...(reasoningProfile?.supportedReasoningEfforts ?? [])],
+      ...(reasoningProfile?.defaultReasoningEffort
+        ? { defaultReasoningEffort: reasoningProfile.defaultReasoningEffort }
+        : {}),
+    }
+  })
 }
 
 function buildProviderChoices(
@@ -107,16 +173,21 @@ function buildProviderChoices(
   availableModels: ModelInfo[],
   officialName: string,
   openAIOfficialName: string,
+  grokOfficialName: string,
   labels: Record<'main' | 'haiku' | 'sonnet' | 'opus', string>,
   claudeOfficialLoggedIn: boolean,
   openAIOfficialLoggedIn: boolean,
+  grokOfficialLoggedIn: boolean,
 ): ProviderChoice[] {
   const claudeOfficialModels = activeId === null && availableModels.length > 0
-    ? availableModels
+    ? mergeOfficialModels(availableModels)
     : OFFICIAL_MODELS
   const openAIOfficialModels = activeId === OPENAI_OFFICIAL_PROVIDER_ID && availableModels.length > 0
     ? availableModels
     : OPENAI_OFFICIAL_MODELS
+  const grokOfficialModels = activeId === GROK_OFFICIAL_PROVIDER_ID && availableModels.length > 0
+    ? availableModels
+    : GROK_OFFICIAL_MODELS
 
   const choices: ProviderChoice[] = []
 
@@ -129,6 +200,14 @@ function buildProviderChoices(
       openAIOfficialModels,
       activeId === OPENAI_OFFICIAL_PROVIDER_ID,
       openAIOfficialName,
+    ))
+  }
+  if (grokOfficialLoggedIn) {
+    choices.push(officialChoices(
+      GROK_OFFICIAL_PROVIDER_ID,
+      grokOfficialModels,
+      activeId === GROK_OFFICIAL_PROVIDER_ID,
+      grokOfficialName,
     ))
   }
 
@@ -144,14 +223,23 @@ function buildProviderChoices(
   return choices
 }
 
+function modelMatchesSearch(model: ModelInfo, query: string): boolean {
+  return [model.id, model.name, model.description]
+    .some(value => value.toLocaleLowerCase().includes(query))
+}
+
 export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function ModelSelector({
   value,
   onChange,
+  models,
+  ariaLabel,
+  appearance = 'toolbar',
   runtimeSelection: controlledRuntimeSelection,
   onRuntimeSelectionChange,
   runtimeKey,
   disabled = false,
   compact = false,
+  fluid = false,
 }: Props = {}, selectorRef) {
   const t = useTranslation()
   const isMobileBrowser = useMobileViewport() && !isDesktopRuntime()
@@ -165,6 +253,7 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
   const {
     providers,
     activeId,
+    hasLoadedProviders,
     isLoading: providersLoading,
     fetchProviders,
   } = useProviderStore()
@@ -172,22 +261,35 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
   const fetchClaudeOAuthStatus = useHahaOAuthStore((s) => s.fetchStatus)
   const openAIOAuthStatus = useHahaOpenAIOAuthStore((s) => s.status)
   const fetchOpenAIOAuthStatus = useHahaOpenAIOAuthStore((s) => s.fetchStatus)
+  const grokOAuthStatus = useHahaGrokOAuthStore((s) => s.status)
+  const fetchGrokOAuthStatus = useHahaGrokOAuthStore((s) => s.fetchStatus)
   const runtimeSelection = useSessionRuntimeStore((state) =>
     runtimeKey ? state.selections[runtimeKey] : undefined,
   )
   const [open, setOpen] = useState(false)
+  const [effortOpen, setEffortOpen] = useState(false)
+  const [searchQuery, setSearchQuery] = useState('')
   const [dropdownPosition, setDropdownPosition] = useState<DropdownPosition | null>(null)
   const ref = useRef<HTMLDivElement>(null)
+  const effortButtonRef = useRef<HTMLButtonElement>(null)
   const dropdownRef = useRef<HTMLDivElement>(null)
   const requestedProvidersRef = useRef(false)
   const requestedOAuthStatusRef = useRef(false)
 
-  const EFFORT_OPTIONS: { value: EffortLevel; label: string }[] = [
+  const EFFORT_OPTIONS: { value: ReasoningEffortLevel; label: string }[] = [
     { value: 'low', label: t('settings.general.effort.low') },
     { value: 'medium', label: t('settings.general.effort.medium') },
     { value: 'high', label: t('settings.general.effort.high') },
+    { value: 'xhigh', label: t('settings.general.effort.xhigh') },
     { value: 'max', label: t('settings.general.effort.max') },
   ]
+  const effortLabels: Record<ReasoningEffortLevel, string> = {
+    low: t('settings.general.effort.low'),
+    medium: t('settings.general.effort.medium'),
+    high: t('settings.general.effort.high'),
+    xhigh: t('settings.general.effort.xhigh'),
+    max: t('settings.general.effort.max'),
+  }
 
   const isControlled = value !== undefined
   const isRuntimeScoped =
@@ -196,48 +298,35 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
   const canEditRuntimeEffort = runtimeKey !== undefined
 
   useEffect(() => {
-    if (!isRuntimeScoped || providersLoading || requestedProvidersRef.current) return
+    if (
+      !isRuntimeScoped ||
+      hasLoadedProviders ||
+      providersLoading ||
+      requestedProvidersRef.current
+    ) return
     requestedProvidersRef.current = true
     void fetchProviders()
-  }, [fetchProviders, isRuntimeScoped, providersLoading])
+  }, [fetchProviders, hasLoadedProviders, isRuntimeScoped, providersLoading])
 
   useEffect(() => {
     if (!isRuntimeScoped || !open || requestedOAuthStatusRef.current) return
     requestedOAuthStatusRef.current = true
     void fetchClaudeOAuthStatus()
     void fetchOpenAIOAuthStatus()
-  }, [fetchClaudeOAuthStatus, fetchOpenAIOAuthStatus, isRuntimeScoped, open])
+    void fetchGrokOAuthStatus()
+  }, [fetchClaudeOAuthStatus, fetchGrokOAuthStatus, fetchOpenAIOAuthStatus, isRuntimeScoped, open])
 
-  const openSelector = useCallback(() => {
-    if (!disabled) setOpen(true)
-  }, [disabled])
+  const closeSelector = useCallback(() => setOpen(false), [])
 
-  useImperativeHandle(selectorRef, () => ({
-    open: openSelector,
-  }), [openSelector])
-
-  useEffect(() => {
-    if (!open) return
-    const handleClick = (e: MouseEvent) => {
-      const target = e.target as Node
-      if (
-        ref.current &&
-        !ref.current.contains(target) &&
-        !dropdownRef.current?.contains(target)
-      ) {
-        setOpen(false)
-      }
-    }
-    const handleEsc = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setOpen(false)
-    }
-    document.addEventListener('mousedown', handleClick)
-    document.addEventListener('keydown', handleEsc)
-    return () => {
-      document.removeEventListener('mousedown', handleClick)
-      document.removeEventListener('keydown', handleEsc)
-    }
-  }, [open])
+  // `ref` is the trigger row; `dropdownRef` is the portalled panel (or the
+  // mobile sheet). `stopEscapePropagation` keeps one Escape from closing both
+  // this dropdown and a dialog it was opened inside.
+  useDismissable({
+    open,
+    refs: [ref, dropdownRef],
+    onDismiss: closeSelector,
+    stopEscapePropagation: true,
+  })
 
   const updateDropdownPosition = useCallback(() => {
     const anchor = ref.current
@@ -278,6 +367,10 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
   }, [open, updateDropdownPosition])
 
   useEffect(() => {
+    if (!open && searchQuery) setSearchQuery('')
+  }, [open, searchQuery])
+
+  useEffect(() => {
     if (!open) return
     window.addEventListener('resize', updateDropdownPosition)
     window.addEventListener('scroll', updateDropdownPosition, true)
@@ -304,24 +397,50 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
       availableModels,
       t('settings.providers.officialName'),
       t('settings.providers.openaiOfficialName'),
+      t('settings.providers.grokOfficialName'),
       roleLabels,
       claudeOAuthStatus?.loggedIn === true,
       openAIOAuthStatus?.loggedIn === true,
+      grokOAuthStatus?.loggedIn === true,
     ),
-    [activeId, availableModels, providers, roleLabels, t, claudeOAuthStatus, openAIOAuthStatus],
+    [activeId, availableModels, providers, roleLabels, t, claudeOAuthStatus, grokOAuthStatus, openAIOAuthStatus],
+  )
+  const normalizedSearchQuery = searchQuery.trim().toLocaleLowerCase()
+  const selectableModels = isControlled && models ? models : availableModels
+  const filteredProviderChoices = useMemo(() => {
+    if (!normalizedSearchQuery) return providerChoices
+
+    return providerChoices.flatMap((choice) => {
+      const providerMatches = choice.providerName.toLocaleLowerCase().includes(normalizedSearchQuery)
+      const models = providerMatches
+        ? choice.models
+        : choice.models.filter(model => modelMatchesSearch(model, normalizedSearchQuery))
+      return models.length > 0 ? [{ ...choice, models }] : []
+    })
+  }, [normalizedSearchQuery, providerChoices])
+  const filteredAvailableModels = useMemo(
+    () => normalizedSearchQuery
+      ? selectableModels.filter(model => modelMatchesSearch(model, normalizedSearchQuery))
+      : selectableModels,
+    [normalizedSearchQuery, selectableModels],
   )
 
   const selectedModel = isControlled
-    ? availableModels.find((model) => model.id === value) || null
+    ? selectableModels.find((model) => model.id === value) || null
     : storeModel
 
-  const activeRuntimeSelection = isRuntimeScoped
+  const requestedRuntimeSelection = isRuntimeScoped
     ? controlledRuntimeSelection ?? runtimeSelection ?? resolveDefaultRuntimeSelection(
       activeId,
       activeProviderName,
       providers,
       storeModel?.id,
     )
+    : null
+  const activeRuntimeSelection = requestedRuntimeSelection && providerChoices.some(
+    (choice) => choice.providerId === requestedRuntimeSelection.providerId,
+  )
+    ? requestedRuntimeSelection
     : null
 
   const selectedProviderChoice = activeRuntimeSelection
@@ -338,26 +457,121 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
       }
     : null
 
+  const selectedRuntimeProvider = activeRuntimeSelection?.providerId
+    ? providers.find((provider) => provider.id === activeRuntimeSelection.providerId) ?? null
+    : null
+  const runtimeEffortSuppressedByProvider =
+    selectedRuntimeProvider?.disableExperimentalBetas === true &&
+    (selectedRuntimeProvider.apiFormat ?? 'anthropic') === 'anthropic'
+
+  const needsProviderConfiguration = isRuntimeScoped && providerChoices.length === 0
   const buttonModelLabel = isRuntimeScoped
-    ? selectedRuntimeModel?.name ?? storeModel?.name ?? t('model.selectModel')
+    ? selectedRuntimeModel?.name
+      ?? (needsProviderConfiguration ? t('model.configureProvider') : t('model.selectModel'))
     : selectedModel?.name ?? t('model.selectModel')
   const buttonProviderLabel = isRuntimeScoped
-    ? selectedProviderChoice?.providerName ?? activeProviderName ?? t('settings.providers.officialName')
+    ? selectedProviderChoice?.providerName ?? null
     : null
-  const selectedRuntimeEffort = activeRuntimeSelection?.effortLevel ?? effortLevel
+  const supportedRuntimeEfforts = selectedRuntimeModel?.supportedReasoningEfforts
+  const selectedRuntimeEffort = selectedRuntimeModel && !runtimeEffortSuppressedByProvider
+    ? supportedRuntimeEfforts?.length === 0
+      ? undefined
+      : activeRuntimeSelection?.effortLevel
+        ?? selectedRuntimeModel.defaultReasoningEffort
+        ?? effortLevel
+    : undefined
+  const runtimeEffortOptions = supportedRuntimeEfforts === undefined
+    ? EFFORT_OPTIONS.filter((option) => option.value !== 'xhigh')
+    : EFFORT_OPTIONS.filter((option) => supportedRuntimeEfforts.includes(option.value))
+
+  const navigateToProviderSettings = useCallback(() => {
+    setOpen(false)
+    useUIStore.getState().setPendingSettingsTab('providers')
+    useTabStore.getState().openTab(SETTINGS_TAB_ID, t('sidebar.settings'), 'settings')
+  }, [t])
+
+  const openSelector = useCallback(() => {
+    if (disabled) return
+    setEffortOpen(false)
+
+    if (!isRuntimeScoped || providerChoices.length > 0) {
+      setOpen(true)
+      return
+    }
+
+    const claudeStatus = useHahaOAuthStore.getState().status
+    const openAIStatus = useHahaOpenAIOAuthStore.getState().status
+    const grokStatus = useHahaGrokOAuthStore.getState().status
+    const statuses = [claudeStatus, openAIStatus, grokStatus]
+    const providerState = useProviderStore.getState()
+    if (providerState.providers.length > 0) {
+      setOpen(true)
+      return
+    }
+    if (statuses.some((status) => status?.loggedIn === true)) {
+      setOpen(true)
+      return
+    }
+    if (providerState.hasLoadedProviders && statuses.every((status) => status !== null)) {
+      navigateToProviderSettings()
+      return
+    }
+
+    void (async () => {
+      const latestProviderState = useProviderStore.getState()
+      if (!latestProviderState.hasLoadedProviders) {
+        await latestProviderState.fetchProviders()
+      }
+      if (useProviderStore.getState().providers.length > 0) {
+        setOpen(true)
+        return
+      }
+
+      requestedOAuthStatusRef.current = true
+      await Promise.all([
+        fetchClaudeOAuthStatus(),
+        fetchOpenAIOAuthStatus(),
+        fetchGrokOAuthStatus(),
+      ])
+      const hasOfficialLogin = [
+        useHahaOAuthStore.getState().status,
+        useHahaOpenAIOAuthStore.getState().status,
+        useHahaGrokOAuthStore.getState().status,
+      ].some((status) => status?.loggedIn === true)
+      if (hasOfficialLogin) {
+        setOpen(true)
+      } else {
+        navigateToProviderSettings()
+      }
+    })()
+  }, [
+    disabled,
+    fetchClaudeOAuthStatus,
+    fetchGrokOAuthStatus,
+    fetchOpenAIOAuthStatus,
+    isRuntimeScoped,
+    navigateToProviderSettings,
+    providerChoices.length,
+  ])
+
+  useImperativeHandle(selectorRef, () => ({
+    open: openSelector,
+  }), [openSelector])
 
   const handleRuntimeSelect = (selection: RuntimeSelection) => {
-    onRuntimeSelectionChange?.(selection)
+    const apiFormat = providers.find((provider) => provider.id === selection.providerId)?.apiFormat
+    const normalizedSelection = normalizeRuntimeSelection(selection, apiFormat)
+    onRuntimeSelectionChange?.(normalizedSelection)
     if (runtimeKey) {
-      useSessionRuntimeStore.getState().setSelection(runtimeKey, selection)
+      useSessionRuntimeStore.getState().setSelection(runtimeKey, normalizedSelection)
       if (runtimeKey !== DRAFT_RUNTIME_SELECTION_KEY) {
-        useChatStore.getState().setSessionRuntime(runtimeKey, selection)
+        useChatStore.getState().setSessionRuntime(runtimeKey, normalizedSelection)
       }
     }
     setOpen(false)
   }
 
-  const handleRuntimeEffortSelect = (level: EffortLevel) => {
+  const handleRuntimeEffortSelect = (level: ReasoningEffortLevel) => {
     if (!activeRuntimeSelection) return
     handleRuntimeSelect({
       ...activeRuntimeSelection,
@@ -365,21 +579,52 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
     })
   }
 
+  const hasMatchingModels = isRuntimeScoped
+    ? filteredProviderChoices.length > 0
+    : filteredAvailableModels.length > 0
+  const searchField = (
+    <SearchField
+      value={searchQuery}
+      onChange={setSearchQuery}
+      label={t('model.searchPlaceholder')}
+      placeholder={t('model.searchPlaceholder')}
+      clearLabel={t('model.clearSearch')}
+      size={isMobileBrowser ? 'xl' : 'md'}
+      autoFocus={!isMobileBrowser}
+    />
+  )
+
   const dropdownContent = (
     <>
-      <div className={`overflow-y-auto ${isMobileBrowser ? 'p-1' : 'p-3'}`} style={{ maxHeight: isMobileBrowser ? undefined : dropdownPosition?.maxHeight }}>
-        {!isMobileBrowser && (
-          <div className="mb-2 px-1 text-[10px] font-bold uppercase tracking-widest text-[var(--color-outline)]">
+      {/* The header stays OUTSIDE the scroll region: a sticky header inside
+          `overflow-y-auto` depends on the engine compositing it above the
+          scrolling layer, and on the desktop shell scrolled items paint
+          through it (and above the panel edge). As a sibling above the
+          scrollport, the list is hard-clipped below the header instead. */}
+      {!isMobileBrowser && (
+        <div className="flex-none border-b border-[var(--color-border)] px-3.5 pb-2 pt-3">
+          <div className="mb-2 px-1 text-[10px] font-bold uppercase tracking-widest text-[var(--color-text-tertiary)]">
             {t('model.configuration')}
+          </div>
+          {searchField}
+        </div>
+      )}
+      <div className={`overflow-y-auto ${isMobileBrowser ? 'p-1' : 'min-h-0 flex-1 p-1.5'}`}>
+        {!hasMatchingModels && (
+          <div
+            role="status"
+            className={`flex items-center justify-center px-4 text-center text-sm text-[var(--color-text-tertiary)] ${isMobileBrowser ? 'min-h-28' : 'min-h-24'}`}
+          >
+            {t('model.noMatches')}
           </div>
         )}
 
         {isRuntimeScoped ? (
           <div className="space-y-3">
-            {providerChoices.map((choice) => (
+            {filteredProviderChoices.map((choice) => (
               <div key={choice.providerId ?? 'official'} className="space-y-1.5">
-                <div className="flex items-center justify-between px-2 pt-1">
-                  <span className="truncate text-[11px] font-semibold tracking-[0.01em] text-[var(--color-text-secondary)]">
+                <div className="flex items-center justify-between gap-2 px-3 pt-1">
+                  <span className="truncate text-xs font-semibold text-[var(--color-text-tertiary)]">
                     {choice.providerName}
                   </span>
                   {choice.isDefault && (
@@ -397,39 +642,71 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
                     return (
                       <button
                         key={`${choice.providerId ?? 'official'}:${model.id}`}
-                        onClick={() => handleRuntimeSelect({
-                          providerId: choice.providerId,
-                          modelId: model.id,
-                          effortLevel: selectedRuntimeEffort,
-                        })}
+                        onClick={() => {
+                          const supportedEfforts = model.supportedReasoningEfforts
+                          const explicitEffort = activeRuntimeSelection?.effortLevel
+                          const selectedProvider = providers.find(
+                            (provider) => provider.id === choice.providerId,
+                          )
+                          const normalizedProviderEffort = explicitEffort &&
+                            isModelReasoningEffort(explicitEffort)
+                            ? normalizeModelReasoningEffort(
+                                model.id,
+                                explicitEffort,
+                                selectedProvider?.apiFormat,
+                                selectedProvider
+                                  ? getProviderModelCapabilityOverride(selectedProvider, model.id)
+                                  : undefined,
+                              )
+                            : undefined
+                          const supportedProviderEffort = normalizedProviderEffort && (
+                            supportedEfforts === undefined ||
+                            supportedEfforts.includes(normalizedProviderEffort)
+                          )
+                            ? normalizedProviderEffort
+                            : undefined
+                          const nextEffort = supportedEfforts === undefined
+                            ? explicitEffort ?? effortLevel
+                            : supportedEfforts.length
+                              ? supportedProviderEffort
+                                ?? (explicitEffort && supportedEfforts.includes(explicitEffort)
+                                ? explicitEffort
+                                : supportedEfforts.includes(effortLevel)
+                                  ? effortLevel
+                                  : model.defaultReasoningEffort ?? supportedEfforts[0])
+                              : undefined
+                          handleRuntimeSelect({
+                            providerId: choice.providerId,
+                            modelId: model.id,
+                            ...(nextEffort ? { effortLevel: nextEffort } : {}),
+                          })
+                        }}
                         className={`
-                          w-full rounded-lg border px-3 text-left transition-colors
-                          ${isMobileBrowser ? 'min-h-[56px] py-3' : 'py-2.5'}
+                          w-full rounded-[var(--radius-md)] border px-3 text-left transition-colors
+                          ${isMobileBrowser ? 'min-h-[56px] py-3' : 'py-2'}
                           ${isSelected
                             ? 'border-[var(--color-model-option-selected-border)] bg-[var(--color-model-option-selected-bg)]'
                             : 'border-transparent hover:bg-[var(--color-surface-hover)]'
                           }
                         `}
                       >
-                        <div className="flex items-start gap-3">
-                          <div className={`mt-0.5 flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full border-2 ${
-                            isSelected ? 'border-[var(--color-brand)]' : 'border-[var(--color-outline)]'
-                          }`}>
-                            {isSelected && (
-                              <div className="h-2 w-2 rounded-full bg-[var(--color-brand)]" />
-                            )}
-                          </div>
-
+                        <div className="flex items-center gap-3">
                           <div className="min-w-0 flex-1">
-                            <div className="truncate text-sm font-semibold text-[var(--color-text-primary)]">
+                            {/* Model ids are identifiers, so they sit in the
+                                mono face alongside paths and token counts. */}
+                            <div className="truncate font-mono text-[13px] font-medium text-[var(--color-text-primary)]">
                               {model.name}
                             </div>
                             {model.description && (
-                              <div className="mt-0.5 truncate pr-[6px] text-[10px] text-[var(--color-text-tertiary)]">
+                              <div className="mt-0.5 truncate pr-[6px] text-[11px] text-[var(--color-text-tertiary)]">
                                 {model.description}
                               </div>
                             )}
                           </div>
+
+                          {isSelected && (
+                            <span className="material-symbols-outlined flex-shrink-0 text-[16px] text-[var(--color-brand)]">check</span>
+                          )}
                         </div>
                       </button>
                     )
@@ -440,7 +717,7 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
           </div>
         ) : (
           <div className="space-y-1">
-            {availableModels.map((model) => {
+            {filteredAvailableModels.map((model) => {
               const isSelected = model.id === selectedModel?.id
               return (
                 <button
@@ -454,8 +731,8 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
                     setOpen(false)
                   }}
                   className={`
-                    w-full rounded-lg px-3 text-left transition-colors
-                    ${isMobileBrowser ? 'min-h-[56px] py-3' : 'py-2.5'}
+                    w-full rounded-[var(--radius-md)] px-3 text-left transition-colors
+                    ${isMobileBrowser ? 'min-h-[56px] py-3' : 'py-2'}
                     ${isSelected
                       ? 'border border-[var(--color-model-option-selected-border)] bg-[var(--color-model-option-selected-bg)]'
                       : 'hover:bg-[var(--color-surface-hover)]'
@@ -463,22 +740,18 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
                   `}
                 >
                   <div className="flex items-center gap-3">
-                    <div className={`flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full border-2 ${
-                      isSelected ? 'border-[var(--color-brand)]' : 'border-[var(--color-outline)]'
-                    }`}>
-                      {isSelected && (
-                        <div className="h-2 w-2 rounded-full bg-[var(--color-brand)]" />
-                      )}
-                    </div>
-
                     <div className="min-w-0 flex-1">
-                      <div className="text-sm font-semibold text-[var(--color-text-primary)]">{model.name}</div>
+                      <div className="truncate font-mono text-[13px] font-medium text-[var(--color-text-primary)]">{model.name}</div>
                       {model.description && (
-                        <div className="mt-0.5 truncate text-[10px] text-[var(--color-text-tertiary)]">
+                        <div className="mt-0.5 truncate text-[11px] text-[var(--color-text-tertiary)]">
                           {model.description}
                         </div>
                       )}
                     </div>
+
+                    {isSelected && (
+                      <span className="material-symbols-outlined flex-shrink-0 text-[16px] text-[var(--color-brand)]">check</span>
+                    )}
                   </div>
                 </button>
               )
@@ -487,35 +760,6 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
         )}
       </div>
 
-      {canEditRuntimeEffort && (
-        <div className="border-t border-[var(--color-border)] p-3">
-          <div className="mb-2 px-1 text-[10px] font-bold uppercase tracking-widest text-[var(--color-outline)]">
-            {t('model.effort')}
-          </div>
-          <div className="grid grid-cols-4 gap-1.5">
-            {EFFORT_OPTIONS.map((opt) => {
-              const isSelected = opt.value === selectedRuntimeEffort
-              return (
-                <button
-                  key={opt.value}
-                  onClick={() => {
-                    handleRuntimeEffortSelect(opt.value)
-                  }}
-                  className={`
-                    rounded-lg py-2 text-center text-xs font-semibold transition-colors
-                    ${isSelected
-                      ? 'bg-[var(--color-brand)] text-white'
-                      : 'bg-[var(--color-surface-container-high)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]'
-                    }
-                  `}
-                >
-                  {opt.label}
-                </button>
-              )
-            })}
-          </div>
-        </div>
-      )}
     </>
   )
 
@@ -527,7 +771,8 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
         title={t('model.configuration')}
         closeLabel={t('tabs.close')}
         ariaLabel={t('model.configuration')}
-        contentClassName="p-3"
+        headerExtra={searchField}
+        contentClassName="p-1"
         panelRef={dropdownRef}
         testId="model-selector-dropdown"
       >
@@ -537,12 +782,13 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
       <div
         ref={dropdownRef}
         data-testid="model-selector-dropdown"
-        className="fixed z-[80] rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] shadow-[var(--shadow-dropdown)]"
+        className="fixed z-[var(--z-dropdown)] flex flex-col overflow-hidden rounded-[var(--radius-xl)] border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] shadow-[var(--shadow-overlay)]"
         style={{
           top: dropdownPosition.top,
           bottom: dropdownPosition.bottom,
           left: dropdownPosition.left,
           width: dropdownPosition.width,
+          maxHeight: dropdownPosition.maxHeight,
         }}
       >
         {dropdownContent}
@@ -552,27 +798,92 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
     : null
 
   return (
-    <div ref={ref} className="relative min-w-0 shrink-0">
-      <button
-        onClick={() => !disabled && setOpen(!open)}
-        disabled={disabled}
-        className={`flex items-center gap-2 rounded-full bg-[var(--color-surface-container-low)] text-xs font-medium text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface-hover)] disabled:cursor-not-allowed disabled:opacity-50 ${
-          compact ? 'max-w-[112px] px-2.5 py-1.5' : 'max-w-[280px] px-3 py-1.5'
-        }`}
+    <div
+      data-testid="model-selector-shell"
+      className={`relative min-w-0 ${fluid || appearance === 'field' ? 'flex-1' : 'shrink-0'}`}
+    >
+      {/* No fill at rest: on the composer row the model name is type, not a
+          control chip — the handoff reserves filled pills for the permission
+          and context chips and gives this one a hover ground only. */}
+      {/* On the phone composer this sits between two 44px buttons and opens a
+          bottom sheet, so both halves stretch to the same 44px touch target
+          `PermissionModeSelector` uses; `compact` alone would also shrink the
+          desktop composer, which narrows for the right panel, not for touch. */}
+      <div
+        ref={ref}
+        className={`flex min-w-0 items-stretch rounded-[var(--radius-md)] transition-colors ${
+          appearance === 'field'
+            ? 'h-10 w-full border border-[var(--color-border)] bg-[var(--color-surface)] hover:border-[var(--color-border-focus)] hover:bg-[var(--color-surface-container-low)]'
+            : 'hover:bg-[var(--color-surface-hover)]'
+        } ${isMobileBrowser ? 'min-h-11' : ''} ${fluid ? 'w-full' : ''} ${disabled ? 'opacity-50' : ''}`}
       >
-        <div className="flex min-w-0 flex-1 items-center gap-2">
-          <span className={`${compact ? 'text-xs' : 'text-sm'} min-w-0 flex-1 truncate font-semibold text-[var(--color-text-primary)]`}>
+        <button
+          type="button"
+          onClick={() => {
+            if (disabled) return
+            if (open) {
+              setOpen(false)
+              return
+            }
+            openSelector()
+          }}
+          disabled={disabled}
+          aria-label={ariaLabel ?? (buttonProviderLabel ? `${buttonModelLabel}, ${buttonProviderLabel}` : buttonModelLabel)}
+          title={buttonProviderLabel ? `${buttonProviderLabel} · ${buttonModelLabel}` : buttonModelLabel}
+          // `focus-visible:rounded-*` restores the other pair of corners while
+          // focused. The ring traces `border-radius`, so on the half-rounded
+          // halves of this segmented control it otherwise drew a box that was
+          // rounded down one side and square down the other.
+          className={`flex min-w-0 items-center gap-2 text-xs font-medium text-[var(--color-text-secondary)] outline-none transition-colors focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)] disabled:cursor-not-allowed ${
+            appearance === 'field'
+              ? 'h-full w-full rounded-[var(--radius-md)] px-3 text-left'
+              : `rounded-l-[var(--radius-md)] focus-visible:rounded-[var(--radius-md)] ${compact ? `${fluid ? 'flex-1' : ''} max-w-[112px] py-1.5 pl-2.5 pr-1` : 'max-w-[220px] py-2 pl-2.5 pr-1'}`
+          }`}
+        >
+          <span className={`${appearance === 'field' ? 'text-sm font-normal' : compact ? 'text-xs font-semibold' : 'text-[15px] font-semibold'} min-w-0 flex-1 truncate text-[var(--color-text-primary)]`}>
             {buttonModelLabel}
           </span>
-          {!compact && buttonProviderLabel && (
+          {!canEditRuntimeEffort && !compact && buttonProviderLabel && (
             <span className="max-w-[108px] flex-shrink-0 truncate text-[11px] text-[var(--color-text-tertiary)]">
               {buttonProviderLabel}
             </span>
           )}
-        </div>
-        <span className="material-symbols-outlined flex-shrink-0 text-[12px]">expand_more</span>
-      </button>
+          <span className={`material-symbols-outlined flex-shrink-0 text-[var(--color-text-tertiary)] ${appearance === 'field' ? 'text-[16px]' : 'text-[12px]'}`}>
+            {needsProviderConfiguration ? 'arrow_forward' : 'expand_more'}
+          </span>
+        </button>
+
+        {canEditRuntimeEffort && selectedRuntimeEffort && runtimeEffortOptions.length > 0 && (
+          <button
+            ref={effortButtonRef}
+            type="button"
+            disabled={disabled}
+            aria-label={`${t('model.effort')}: ${effortLabels[selectedRuntimeEffort]}`}
+            aria-expanded={effortOpen}
+            onClick={() => {
+              if (disabled) return
+              setOpen(false)
+              setEffortOpen(!effortOpen)
+            }}
+            className={`rounded-r-[var(--radius-md)] pr-2.5 text-[var(--color-text-secondary)] outline-none transition-colors hover:text-[var(--color-text-primary)] focus-visible:rounded-[var(--radius-md)] focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)] disabled:cursor-not-allowed ${compact ? 'pl-1 text-[10px]' : 'pl-1.5 text-[13.5px]'}`}
+          >
+            {effortLabels[selectedRuntimeEffort]}
+          </button>
+        )}
+      </div>
       {dropdown}
+      {canEditRuntimeEffort && selectedRuntimeEffort && (
+        <ReasoningEffortPopover
+          open={effortOpen}
+          anchorRef={effortButtonRef}
+          options={runtimeEffortOptions.map((option) => option.value)}
+          value={selectedRuntimeEffort}
+          labels={effortLabels}
+          ariaLabel={t('model.effort')}
+          onChange={handleRuntimeEffortSelect}
+          onClose={() => setEffortOpen(false)}
+        />
+      )}
     </div>
   )
 })

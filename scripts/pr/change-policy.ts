@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import { existsSync, readFileSync, appendFileSync } from 'node:fs'
+import { dependentFilesForChangeSet } from './module-graph'
 
 export type ChangeArea =
   | 'desktop'
@@ -26,6 +27,11 @@ export type ChangePolicyResult = {
     server: boolean
     adapters: boolean
     desktopNative: boolean
+    providerContract: boolean
+    chatContract: boolean
+    agentFlow: boolean
+    persistence: boolean
+    policy: boolean
     docs: boolean
     coverage: boolean
   }
@@ -66,9 +72,112 @@ const desktopNativeExactPaths = new Set([
   'desktop/scripts/build-linux.sh',
 ])
 
+const desktopWebExactPaths = new Set([
+  'desktop/bun.lock',
+  'desktop/package.json',
+  'desktop/package-lock.json',
+  'desktop/tsconfig.json',
+  'desktop/tsconfig.app.json',
+  'desktop/tsconfig.node.json',
+  'desktop/vite.config.ts',
+  'desktop/vitest.config.ts',
+])
+
+const providerContractPrefixes = [
+  'src/server/__tests__/network-settings',
+  'src/server/__tests__/provider',
+  'src/server/__tests__/providers',
+  'src/server/__tests__/proxy-',
+  'src/server/api/providers',
+  'src/server/config/provider',
+  'src/server/proxy/',
+  'src/server/services/provider',
+  'src/server/types/provider',
+  'src/services/api/client',
+  'src/services/compact/autoCompact',
+  'src/services/openaiAuth/',
+  'src/utils/model/',
+  'src/utils/__tests__/providerManagedEnvCompat',
+  'src/utils/managedEnv',
+  'src/utils/providerManagedEnvCompat',
+  'src/utils/proxy.test',
+]
+
+const chatContractPrefixes = [
+  'src/server/__tests__/conversations',
+  'src/server/__tests__/websocket-handler',
+  'src/server/ws/',
+  'src/server/services/conversationService',
+  'desktop/src/api/websocket',
+  'desktop/src/components/chat/ChatInput',
+  'desktop/src/pages/ActiveSession',
+  'desktop/src/pages/EmptySession',
+  'desktop/src/stores/chatStore',
+  'desktop/src/stores/sessionRuntimeStore',
+  'desktop/src/types/chat',
+]
+
+/**
+ * Paths whose behavior the deterministic agent-flow lane proves end to end:
+ * session lifecycle, WebSocket framing, tool permission round-trips, reconnect
+ * replay, and the mock runtime that stands in for a provider.
+ */
+const agentFlowPrefixes = [
+  'src/server/api/sessions',
+  'src/server/services/conversationService',
+  'src/server/services/sessionService',
+  'src/server/ws/',
+  'src/server/__tests__/fixtures/mock-sdk-cli',
+  'scripts/quality-gate/agent-flow/',
+  'desktop/src/api/websocket',
+  'desktop/src/api/sessions',
+  'desktop/src/stores/chatStore',
+  'desktop/src/types/chat',
+  // Protocol clients, not import consumers. These talk to POST /api/sessions and
+  // /ws/:sessionId over the wire, so no module graph can link them to the server —
+  // `adapters/common/ws-bridge.ts` even hand-copies `src/server/ws/events.ts` types.
+  // d14154379 shipped 4 test files and still hardcoded permissionMode:'default' in
+  // adapters/common/http-client.ts, short-circuiting the server's global fallback
+  // until 4626dbef4 restored it a release later.
+  'adapters/common/http-client',
+  'adapters/common/ws-bridge',
+]
+
+const persistencePrefixes = [
+  'src/server/services/persistentStorageMigrations',
+  'src/server/__tests__/persistence-upgrade',
+  'src/server/services/desktopUiPreferencesService',
+  'src/server/__tests__/desktop-ui-preferences',
+  'desktop/src/lib/persistenceMigrations',
+  'scripts/quality-gate/persistence-upgrade',
+]
+
+const policyPrefixes = [
+  '.github/workflows/',
+  // `scripts/pr/dead-imports.ts` owns these three source roots — every root no
+  // compiler checks for unreferenced imports. The lane is selected by prefix, and
+  // that check reads its files rather than importing them, so the import graph
+  // cannot route a diff here on its own. `scripts/` also covers the git hooks, the
+  // PR tooling and the quality gate, which selected this lane before.
+  'adapters/',
+  'scripts/',
+  'src/',
+]
+
+const policyExactPaths = new Set([
+  '.github/CODEOWNERS',
+  '.github/copilot-instructions.md',
+  '.github/pull_request_template.md',
+  'AGENTS.md',
+  'CONTRIBUTING.md',
+  'docs/en/internals/contributing.md',
+  'docs/internals/contributing.md',
+  'package.json',
+])
+
 const docsExactPaths = new Set([
   'README.md',
-  'README.en.md',
+  'README.zh-CN.md',
   'package.json',
   'package-lock.json',
   '.github/workflows/deploy-docs.yml',
@@ -107,8 +216,16 @@ function isCliCorePath(path: string) {
   return startsWithAny(path, cliCorePrefixes)
 }
 
+function isAgentInstructionPath(path: string) {
+  return /(^|\/)AGENTS(?:\.override)?\.md$/.test(path)
+}
+
 function areasForPath(path: string): ChangeArea[] {
   const areas = new Set<ChangeArea>()
+
+  if (isAgentInstructionPath(path)) {
+    return []
+  }
 
   if (path.startsWith('desktop/')) {
     areas.add('desktop')
@@ -124,6 +241,7 @@ function areasForPath(path: string): ChangeArea[] {
 
   if (
     path.startsWith('docs/') ||
+    path.startsWith('site/') ||
     path.startsWith('release-notes/') ||
     docsExactPaths.has(path)
   ) {
@@ -148,9 +266,14 @@ function hasMatchingTest(files: string[], predicate: (file: string) => boolean) 
   ))
 }
 
+function isExecutableSourcePath(path: string) {
+  return /\.[cm]?[jt]sx?$/.test(path)
+}
+
 function changedProductionFiles(files: string[], predicate: (file: string) => boolean) {
   return files.filter((file) => (
     predicate(file) &&
+    isExecutableSourcePath(file) &&
     !/\.test\.[cm]?[jt]sx?$/.test(file) &&
     !file.includes('/__tests__/') &&
     !file.includes('/fixtures/')
@@ -162,9 +285,9 @@ function missingTestSignals(files: string[]) {
   const desktopProd = changedProductionFiles(files, (file) => file.startsWith('desktop/src/'))
   const serverProd = changedProductionFiles(files, (file) => file.startsWith('src/server/'))
   const adapterProd = changedProductionFiles(files, (file) => file.startsWith('adapters/'))
-  const agentRuntimeProd = changedProductionFiles(files, (file) => (
-    file.startsWith('src/tools/') ||
-    file.startsWith('src/utils/')
+  const rootRuntimeProd = changedProductionFiles(files, (file) => (
+    file.startsWith('src/') &&
+    !file.startsWith('src/server/')
   ))
 
   if (desktopProd.length > 0 && !hasMatchingTest(files, (file) => file.startsWith('desktop/src/'))) {
@@ -176,19 +299,34 @@ function missingTestSignals(files: string[]) {
   if (adapterProd.length > 0 && !hasMatchingTest(files, (file) => file.startsWith('adapters/'))) {
     signals.push('Adapter product files changed without an adapter test file in the PR.')
   }
-  if (agentRuntimeProd.length > 0 && !hasMatchingTest(files, (file) => file.startsWith('src/tools/') || file.startsWith('src/utils/'))) {
-    signals.push('Agent/runtime product files changed without a tools/utils test file in the PR.')
+  if (rootRuntimeProd.length > 0 && !hasMatchingTest(files, (file) => (
+    file.startsWith('src/') &&
+    !file.startsWith('src/server/')
+  ))) {
+    signals.push('Root runtime product files changed without a matching root runtime test file in the PR.')
   }
 
   return signals
 }
 
+/**
+ * @param inputDependentFiles Files that transitively import a changed file, from
+ *   `scripts/pr/module-graph.ts`. They widen *check selection* only. Areas, labels,
+ *   and every blocking rule stay scoped to what the author actually changed, so a
+ *   hub edit never demands tests for files the PR did not touch.
+ */
 export function evaluateChangePolicy(
   inputFiles: string[],
   inputLabels: string[] = [],
+  inputDependentFiles: string[] = [],
 ): ChangePolicyResult {
   const files = [...new Set(inputFiles.map(normalizePath).filter(Boolean))].sort()
   const labels = [...new Set(inputLabels.map((label) => label.trim()).filter(Boolean))].sort()
+  const changedSet = new Set(files)
+  const dependentFiles = [...new Set(
+    inputDependentFiles.map(normalizePath).filter((file) => file && !changedSet.has(file)),
+  )].sort()
+  const selectionFiles = [...files, ...dependentFiles]
   const areas = new Set<ChangeArea>()
 
   for (const file of files) {
@@ -217,25 +355,45 @@ export function evaluateChangePolicy(
   }
   const blocked = blockingReasons.length > 0
 
-  const touchesDesktopNative = files.some((file) => (
-    file.startsWith('desktop/') ||
-    file.startsWith('adapters/') ||
-    file.startsWith('src/server/') ||
+  // Surface checks run when the diff touches a surface *or* when a changed file is
+  // imported by it. Prefix-only routing let cross-package edits ship green:
+  // desktop/src/config/providerPresets.ts bundles src/server/config/providerPresets.json,
+  // desktop/src/lib/runtimeSelection.ts imports src/shared/modelReasoning, and
+  // desktop/electron/** compiles against desktop/src/** outside desktop/tsconfig.json.
+  const touchesDesktopWeb = selectionFiles.some((file) => (
+    file.startsWith('desktop/src/') || desktopWebExactPaths.has(file)
+  ))
+  const touchesDesktopNative = selectionFiles.some((file) => (
+    file.startsWith('desktop/electron/') ||
+    file.startsWith('desktop/scripts/') ||
+    file.startsWith('desktop/src-tauri/') ||
     desktopNativeExactPaths.has(file)
+  ))
+  const touchesProviderContract = selectionFiles.some((file) => startsWithAny(file, providerContractPrefixes))
+  const touchesChatContract = selectionFiles.some((file) => startsWithAny(file, chatContractPrefixes))
+  const touchesAgentFlow = selectionFiles.some((file) => startsWithAny(file, agentFlowPrefixes))
+  const touchesPersistence = selectionFiles.some((file) => startsWithAny(file, persistencePrefixes))
+  const touchesPolicy = files.some((file) => (
+    startsWithAny(file, policyPrefixes) ||
+    policyExactPaths.has(file) ||
+    isAgentInstructionPath(file)
   ))
 
   const touchesDocs = files.some((file) => (
-    file.startsWith('docs/') ||
-    file.startsWith('release-notes/') ||
-    docsExactPaths.has(file)
+    !isAgentInstructionPath(file) && (
+      file.startsWith('docs/') ||
+      file.startsWith('site/') ||
+      file.startsWith('release-notes/') ||
+      docsExactPaths.has(file)
+    )
   ))
   const touchesCoverage = files.some((file) => (
-    file.startsWith('desktop/src/') ||
-    file.startsWith('src/server/') ||
-    file.startsWith('src/tools/') ||
-    file.startsWith('src/utils/') ||
-    file.startsWith('adapters/') ||
-    file.startsWith('scripts/quality-gate/') ||
+    (isExecutableSourcePath(file) && (
+      file.startsWith('desktop/src/') ||
+      file.startsWith('src/') ||
+      file.startsWith('adapters/')
+    )) ||
+    file.startsWith('scripts/quality-gate/coverage') ||
     file === 'package.json' ||
     file === 'desktop/package.json' ||
     file === 'desktop/bun.lock'
@@ -255,10 +413,15 @@ export function evaluateChangePolicy(
     coveragePolicyFiles,
     missingTestSignals: missingTests,
     checks: {
-      desktop: areas.has('desktop') || areas.has('server'),
-      server: areas.has('server') || files.some((file) => file.startsWith('src/tools/') || file.startsWith('src/utils/')),
-      adapters: areas.has('adapters'),
+      desktop: touchesDesktopWeb,
+      server: selectionFiles.some((file) => file.startsWith('src/') && !isAgentInstructionPath(file)),
+      adapters: selectionFiles.some((file) => file.startsWith('adapters/') && !isAgentInstructionPath(file)),
       desktopNative: touchesDesktopNative,
+      providerContract: touchesProviderContract,
+      chatContract: touchesChatContract,
+      agentFlow: touchesAgentFlow,
+      persistence: touchesPersistence,
+      policy: touchesPolicy,
       docs: touchesDocs,
       coverage: touchesCoverage,
     },
@@ -302,7 +465,7 @@ function formatSummary(result: ChangePolicyResult) {
     'PR change policy',
     `  Areas: ${result.areas.length ? result.areas.join(', ') : 'none'}`,
     `  Labels: ${result.labels.length ? result.labels.join(', ') : 'none'}`,
-    `  Checks: desktop=${result.checks.desktop}, server=${result.checks.server}, adapters=${result.checks.adapters}, desktopNative=${result.checks.desktopNative}, docs=${result.checks.docs}, coverage=${result.checks.coverage}`,
+    `  Checks: desktop=${result.checks.desktop}, server=${result.checks.server}, adapters=${result.checks.adapters}, desktopNative=${result.checks.desktopNative}, providerContract=${result.checks.providerContract}, chatContract=${result.checks.chatContract}, agentFlow=${result.checks.agentFlow}, persistence=${result.checks.persistence}, policy=${result.checks.policy}, docs=${result.checks.docs}, coverage=${result.checks.coverage}`,
   ]
 
   if (result.cliCoreFiles.length > 0) {
@@ -346,10 +509,16 @@ function writeGithubOutputs(result: ChangePolicyResult) {
     areas: result.areas.join(','),
     area_labels: result.areaLabels.join(','),
     blocked: String(result.blocked),
+    blocking_reasons: result.blockingReasons.join(' | '),
     desktop_checks: String(result.checks.desktop),
     server_checks: String(result.checks.server),
     adapter_checks: String(result.checks.adapters),
     desktop_native_checks: String(result.checks.desktopNative),
+    provider_contract_checks: String(result.checks.providerContract),
+    chat_contract_checks: String(result.checks.chatContract),
+    agent_flow_checks: String(result.checks.agentFlow),
+    persistence_checks: String(result.checks.persistence),
+    policy_checks: String(result.checks.policy),
     docs_checks: String(result.checks.docs),
     coverage_checks: String(result.checks.coverage),
   }
@@ -378,11 +547,19 @@ if (import.meta.main) {
     ? readListFile(labelsPath)
     : labelsArg?.split(',').map((label) => label.trim()).filter(Boolean) ?? []
 
-  const result = evaluateChangePolicy(files, labels)
+  const resolution = dependentFilesForChangeSet(process.cwd(), files, {
+    enabled: !args.has('--no-dependency-graph'),
+  })
+  if (resolution.degraded) {
+    console.warn(`[change-policy] dependency graph unavailable (${resolution.reason}); selecting every surface check.`)
+  }
+
+  const result = evaluateChangePolicy(files, labels, resolution.dependents)
   console.log(formatSummary(result))
+  console.log(`  Dependent files: ${resolution.dependents.length}${resolution.degraded ? ' (degraded fallback)' : ''}`)
   writeGithubOutputs(result)
 
-  if (result.blocked) {
+  if (result.blocked && !args.has('--plan-only')) {
     process.exit(1)
   }
 }

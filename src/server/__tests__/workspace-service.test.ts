@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import * as fs from 'node:fs/promises'
 import { execFileSync } from 'node:child_process'
 import * as os from 'node:os'
@@ -81,6 +81,19 @@ afterEach(async () => {
 })
 
 describe('WorkspaceService outside-workspace preview', () => {
+  // Cleared going in as well as coming out. The registry is one module-level Set that
+  // every test file in the process shares, and these tests open by asserting a path is
+  // *not* reachable — a precondition they cannot assume, only establish. In a full run
+  // they inherited the entire macOS temp root: title-service.test.ts:463 and
+  // sessions.test.ts:2860 both create a session on the bare os.tmpdir(), and
+  // registering a session's workDir is exactly what sessionService is supposed to do.
+  // So every path under /var/folders/.../T was already allowed by the time this file
+  // ran, and the "outside workspace" assertion failed. Matches the pairing that
+  // filesystemAccessRoots.test.ts and h5-access-auth.test.ts already use.
+  beforeEach(() => {
+    clearFilesystemAccessRootsForTests()
+  })
+
   afterEach(() => {
     clearFilesystemAccessRootsForTests()
   })
@@ -284,6 +297,50 @@ describe('WorkspaceService', () => {
     expect(diff.diff).toContain('diff --session a/src/App.jsx b/src/App.jsx')
     expect(diff.diff).toContain('-export default function App() { return <main>Old</main> }')
     expect(diff.diff).toContain('+export default function App() { return <main>New</main> }')
+  })
+
+  it('does not report a rejected session tool edit as a changed file', async () => {
+    const nonGitDir = await makeTempDir('workspace-service-rejected-change-')
+    const toolUseId = 'Write:rejected'
+    const service = new WorkspaceService(
+      async () => nonGitDir,
+      async () => [
+        {
+          id: 'assistant-1',
+          type: 'tool_use',
+          timestamp: new Date().toISOString(),
+          content: [{
+            type: 'tool_use',
+            id: toolUseId,
+            name: 'Write',
+            input: {
+              file_path: 'permission-denial-test.txt',
+              content: 'must not be written\n',
+            },
+          }],
+        },
+        {
+          id: 'tool-result-1',
+          type: 'tool_result',
+          timestamp: new Date().toISOString(),
+          content: [{
+            type: 'tool_result',
+            tool_use_id: toolUseId,
+            content: 'The user rejected this tool use.',
+            is_error: true,
+          }],
+        },
+      ],
+    )
+
+    const status = await service.getStatus('session-1')
+
+    expect(status).toMatchObject({
+      state: 'ok',
+      workDir: nonGitDir,
+      isGitRepo: false,
+      changedFiles: [],
+    })
   })
 
   it('reports file-history changes without requiring a git repository', async () => {

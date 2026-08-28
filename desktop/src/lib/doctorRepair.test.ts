@@ -1,14 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const doctorApiMock = vi.hoisted(() => ({
-  reportAndRepair: vi.fn(),
+  report: vi.fn(),
 }))
 
 vi.mock('../api/doctor', () => ({
   doctorApi: doctorApiMock,
 }))
 
-import { SAFE_DOCTOR_STORAGE_KEYS, runLocalDoctorRepair, runDoctorRepair } from './doctorRepair'
+import { SAFE_DOCTOR_STORAGE_KEYS, runDoctorCheck, runLocalDoctorRepair } from './doctorRepair'
 
 describe('doctorRepair', () => {
   beforeEach(() => {
@@ -34,6 +34,17 @@ describe('doctorRepair', () => {
     expect(window.localStorage.getItem('cc-haha-provider-config')).toBe('preserve')
   })
 
+  it('resets the appearance completely, not just the applied theme', () => {
+    // The theme is three keys. Clearing only the applied one leaves the
+    // follow-the-system switch behind, so the reset would not restore the
+    // out-of-the-box appearance.
+    expect(SAFE_DOCTOR_STORAGE_KEYS).toEqual(expect.arrayContaining([
+      'cc-haha-theme',
+      'cc-haha-follow-system-theme',
+      'cc-haha-light-theme',
+    ]))
+  })
+
   it('keeps local repair non-throwing when storage access is blocked', () => {
     const storage = {
       getItem: () => {
@@ -50,16 +61,22 @@ describe('doctorRepair', () => {
     expect(result.failedKeys).toEqual(expect.arrayContaining([...SAFE_DOCTOR_STORAGE_KEYS]))
   })
 
-  it('keeps local repair successful when the server doctor endpoint is unavailable', async () => {
+  it('checks the server report for the active cwd without clearing desktop state', async () => {
     window.localStorage.clear()
     window.localStorage.setItem('cc-haha-theme', 'dark')
-    doctorApiMock.reportAndRepair.mockRejectedValueOnce(new Error('Failed to fetch'))
+    doctorApiMock.report.mockResolvedValueOnce({
+      report: {
+        generatedAt: '2026-07-11T00:00:00.000Z',
+        items: [],
+        protectedSkips: [],
+        summary: { total: 0, protectedCount: 0, missingCount: 0, invalidCount: 0 },
+      },
+    })
 
-    const result = await runDoctorRepair({ storage: window.localStorage })
+    const report = await runDoctorCheck({ cwd: '/workspace/project' })
 
-    expect(doctorApiMock.reportAndRepair).toHaveBeenCalled()
-    expect(result.local.removedKeys).toContain('cc-haha-theme')
-    expect(result.server).toBeNull()
-    expect(result.serverError).toBe('Failed to fetch')
+    expect(doctorApiMock.report).toHaveBeenCalledWith('/workspace/project')
+    expect(report.summary.total).toBe(0)
+    expect(window.localStorage.getItem('cc-haha-theme')).toBe('dark')
   })
 })

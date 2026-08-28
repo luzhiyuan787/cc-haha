@@ -16,12 +16,18 @@ import { anthropicToOpenaiChat } from '../proxy/transform/anthropicToOpenaiChat.
 import { anthropicToOpenaiResponses } from '../proxy/transform/anthropicToOpenaiResponses.js'
 import { openaiChatToAnthropic } from '../proxy/transform/openaiChatToAnthropic.js'
 import { openaiResponsesToAnthropic } from '../proxy/transform/openaiResponsesToAnthropic.js'
-import type { AnthropicRequest, AnthropicResponse } from '../proxy/transform/types.js'
+import type { AnthropicRequest } from '../proxy/transform/types.js'
 import {
   OPENAI_OFFICIAL_PROVIDER,
   isOpenAIOfficialProviderId,
 } from './openaiOfficialProvider.js'
 import { hahaOpenAIOAuthService } from './hahaOpenAIOAuthService.js'
+import { hahaOAuthService } from './hahaOAuthService.js'
+import {
+  GROK_OFFICIAL_PROVIDER,
+  isGrokOfficialProviderId,
+} from './grokOfficialProvider.js'
+import { hahaGrokOAuthService } from './hahaGrokOAuthService.js'
 import {
   CURRENT_PROVIDER_INDEX_SCHEMA_VERSION,
   ensurePersistentStorageUpgraded,
@@ -32,6 +38,7 @@ import {
   getManagedEnvKeys,
   getPresetAuthStrategy,
   getPresetDefaultEnv,
+  normalizeImageGeneration,
   normalizeModelMapping,
   normalizeProvidersIndex,
 } from './providerRuntimeEnv.js'
@@ -99,6 +106,28 @@ function mergeSavedOrderIntoDisplayOrder(providerOrder: string[], savedOrder: st
     if (!savedSet.has(id)) return id
     return queue.shift() ?? id
   })
+}
+
+function buildSavedProvider(input: CreateProviderInput): SavedProvider {
+  const imageGeneration = normalizeImageGeneration(input.imageGeneration)
+  return {
+    id: crypto.randomUUID(),
+    presetId: input.presetId,
+    name: input.name,
+    apiKey: input.apiKey,
+    ...(input.authStrategy !== undefined && { authStrategy: input.authStrategy }),
+    baseUrl: input.baseUrl,
+    apiFormat: input.apiFormat ?? 'anthropic',
+    runtimeKind: input.runtimeKind ?? 'anthropic_compatible',
+    models: normalizeModelMapping(input.models),
+    ...(input.model1mSupport !== undefined && { model1mSupport: input.model1mSupport }),
+    ...(input.autoCompactWindow !== undefined && { autoCompactWindow: input.autoCompactWindow }),
+    ...(input.modelContextWindows !== undefined && { modelContextWindows: input.modelContextWindows }),
+    toolSearchEnabled: input.toolSearchEnabled ?? false,
+    ...(input.disableExperimentalBetas === true && { disableExperimentalBetas: true }),
+    ...(imageGeneration !== undefined && { imageGeneration }),
+    ...(input.notes !== undefined && { notes: input.notes }),
+  }
 }
 
 function appendNewProviderToOrder(providerOrder: string[], providerId: string, existingProviders: SavedProvider[]): string[] {
@@ -202,6 +231,9 @@ export class ProviderService {
     if (isOpenAIOfficialProviderId(id)) {
       return OPENAI_OFFICIAL_PROVIDER
     }
+    if (isGrokOfficialProviderId(id)) {
+      return GROK_OFFICIAL_PROVIDER
+    }
 
     const index = await this.readIndex()
     const provider = index.providers.find((p) => p.id === id)
@@ -212,28 +244,36 @@ export class ProviderService {
   async addProvider(input: CreateProviderInput): Promise<SavedProvider> {
     const index = await this.readIndex()
 
-    const provider: SavedProvider = {
-      id: crypto.randomUUID(),
-      presetId: input.presetId,
-      name: input.name,
-      apiKey: input.apiKey,
-      ...(input.authStrategy !== undefined && { authStrategy: input.authStrategy }),
-      baseUrl: input.baseUrl,
-      apiFormat: input.apiFormat ?? 'anthropic',
-      runtimeKind: input.runtimeKind ?? 'anthropic_compatible',
-      models: normalizeModelMapping(input.models),
-      ...(input.model1mSupport !== undefined && { model1mSupport: input.model1mSupport }),
-      ...(input.autoCompactWindow !== undefined && { autoCompactWindow: input.autoCompactWindow }),
-      ...(input.modelContextWindows !== undefined && { modelContextWindows: input.modelContextWindows }),
-      toolSearchEnabled: input.toolSearchEnabled ?? true,
-      ...(input.disableExperimentalBetas === true && { disableExperimentalBetas: true }),
-      ...(input.notes !== undefined && { notes: input.notes }),
-    }
+    const provider = buildSavedProvider(input)
 
     index.providerOrder = appendNewProviderToOrder(index.providerOrder, provider.id, index.providers)
     index.providers.push(provider)
     await this.writeIndex(index)
     return provider
+  }
+
+  /**
+   * Append several providers in one pass.
+   *
+   * Bulk imports (cc-switch) read the index once and write it once so a partial
+   * failure cannot leave half the batch behind. The persisted shape is identical
+   * to addProvider, so no storage migration is involved.
+   */
+  async importProviders(inputs: CreateProviderInput[]): Promise<SavedProvider[]> {
+    if (inputs.length === 0) return []
+
+    const index = await this.readIndex()
+
+    const imported: SavedProvider[] = []
+    for (const input of inputs) {
+      const provider = buildSavedProvider(input)
+      index.providerOrder = appendNewProviderToOrder(index.providerOrder, provider.id, index.providers)
+      index.providers.push(provider)
+      imported.push(provider)
+    }
+
+    await this.writeIndex(index)
+    return imported
   }
 
   async updateProvider(id: string, input: UpdateProviderInput): Promise<SavedProvider> {
@@ -242,6 +282,9 @@ export class ProviderService {
     if (idx === -1) throw ApiError.notFound(`Provider not found: ${id}`)
 
     const existing = index.providers[idx]
+    const imageGeneration = input.imageGeneration
+      ? normalizeImageGeneration(input.imageGeneration)
+      : input.imageGeneration
     const updated: SavedProvider = {
       ...existing,
       ...(input.name !== undefined && { name: input.name }),
@@ -256,6 +299,7 @@ export class ProviderService {
       ...(input.modelContextWindows !== undefined && input.modelContextWindows !== null && { modelContextWindows: input.modelContextWindows }),
       ...(input.toolSearchEnabled !== undefined && { toolSearchEnabled: input.toolSearchEnabled }),
       ...(input.disableExperimentalBetas === true && { disableExperimentalBetas: true }),
+      ...(imageGeneration !== undefined && imageGeneration !== null && { imageGeneration }),
       ...(input.notes !== undefined && { notes: input.notes }),
     }
     if (input.model1mSupport === null) {
@@ -269,6 +313,9 @@ export class ProviderService {
     }
     if (input.disableExperimentalBetas === false) {
       delete updated.disableExperimentalBetas
+    }
+    if (imageGeneration === null) {
+      delete updated.imageGeneration
     }
 
     index.providers[idx] = updated
@@ -332,13 +379,15 @@ export class ProviderService {
     const index = await this.readIndex()
     const provider = isOpenAIOfficialProviderId(id)
       ? OPENAI_OFFICIAL_PROVIDER
-      : index.providers.find((p) => p.id === id)
+      : isGrokOfficialProviderId(id)
+        ? GROK_OFFICIAL_PROVIDER
+        : index.providers.find((p) => p.id === id)
     if (!provider) throw ApiError.notFound(`Provider not found: ${id}`)
 
     index.activeId = id
     await this.writeIndex(index)
 
-    if (provider.runtimeKind === 'openai_oauth') {
+    if (provider.runtimeKind === 'openai_oauth' || provider.runtimeKind === 'grok_oauth') {
       await this.syncToSettings(provider)
     } else if (provider.presetId === 'official') {
       await this.clearProviderFromSettings()
@@ -424,17 +473,18 @@ export class ProviderService {
 
   /**
    * Check whether any usable auth exists:
-   *  1. A cc-haha provider is active → has auth
-   *  2. Original ~/.claude/settings.json has ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY → has auth
-   *  3. process.env already has ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN → has auth
-   *  4. None of the above → needs setup
+   *  1. The active cc-haha provider or built-in OAuth provider has auth
+   *  2. Claude Official has a desktop-managed OAuth token
+   *  3. process.env already has ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN
+   *  4. Original ~/.claude/settings.json contains one of those auth variables
+   *  5. None of the above → needs setup
    */
   async checkAuthStatus(): Promise<{
     hasAuth: boolean
-    source: 'cc-haha-provider' | 'openai-oauth' | 'original-settings' | 'env' | 'none'
+    source: 'cc-haha-provider' | 'claude-oauth' | 'openai-oauth' | 'grok-oauth' | 'original-settings' | 'env' | 'none'
     activeProvider?: string
   }> {
-    // 1. Check cc-haha active provider
+    // 1–2. Check the selected provider, including Claude Official (activeId=null).
     const index = await this.readIndex()
     if (index.activeId) {
       if (isOpenAIOfficialProviderId(index.activeId)) {
@@ -452,6 +502,21 @@ export class ProviderService {
           activeProvider: OPENAI_OFFICIAL_PROVIDER.name,
         }
       }
+      if (isGrokOfficialProviderId(index.activeId)) {
+        const tokens = await hahaGrokOAuthService.ensureFreshTokens()
+        if (tokens?.accessToken && tokens.refreshToken) {
+          return {
+            hasAuth: true,
+            source: 'grok-oauth',
+            activeProvider: GROK_OFFICIAL_PROVIDER.name,
+          }
+        }
+        return {
+          hasAuth: false,
+          source: 'none',
+          activeProvider: GROK_OFFICIAL_PROVIDER.name,
+        }
+      }
 
       const provider = index.providers.find(p => p.id === index.activeId)
       if (provider) {
@@ -462,14 +527,23 @@ export class ProviderService {
           return { hasAuth: true, source: 'cc-haha-provider', activeProvider: provider.name }
         }
       }
+    } else {
+      const tokens = await hahaOAuthService.ensureFreshTokens()
+      if (tokens?.accessToken) {
+        return {
+          hasAuth: true,
+          source: 'claude-oauth',
+          activeProvider: 'Claude Official',
+        }
+      }
     }
 
-    // 2. Check process.env (covers .env file + inherited env)
+    // 3. Check process.env (covers .env file + inherited env)
     if (process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN) {
       return { hasAuth: true, source: 'env' }
     }
 
-    // 3. Check original ~/.claude/settings.json
+    // 4. Check original ~/.claude/settings.json
     try {
       const originalPath = path.join(this.getConfigDir(), 'settings.json')
       const raw = await fs.readFile(originalPath, 'utf-8')
@@ -495,7 +569,7 @@ export class ProviderService {
     apiFormat: ApiFormat
   } | null> {
     if (providerId) {
-      if (isOpenAIOfficialProviderId(providerId)) {
+      if (isOpenAIOfficialProviderId(providerId) || isGrokOfficialProviderId(providerId)) {
         return null
       }
       const provider = await this.getProvider(providerId)
@@ -510,7 +584,7 @@ export class ProviderService {
 
     const index = await this.readIndex()
     if (!index.activeId) return null
-    if (isOpenAIOfficialProviderId(index.activeId)) {
+    if (isOpenAIOfficialProviderId(index.activeId) || isGrokOfficialProviderId(index.activeId)) {
       return null
     }
     const provider = await this.getProvider(index.activeId).catch(() => null)
@@ -536,13 +610,13 @@ export class ProviderService {
 
   async testProvider(
     id: string,
-    overrides?: { baseUrl?: string; modelId?: string; apiFormat?: ApiFormat; authStrategy?: ProviderAuthStrategy },
+    overrides?: { modelId?: string },
   ): Promise<ProviderTestResult> {
     const provider = await this.getProvider(id)
-    const baseUrl = overrides?.baseUrl || provider.baseUrl
+    const baseUrl = provider.baseUrl
     const modelId = overrides?.modelId || provider.models.main
-    const apiFormat = overrides?.apiFormat ?? provider.apiFormat ?? 'anthropic'
-    const authStrategy = overrides?.authStrategy ?? provider.authStrategy ?? getPresetAuthStrategy(provider.presetId)
+    const apiFormat = provider.apiFormat ?? 'anthropic'
+    const authStrategy = provider.authStrategy ?? getPresetAuthStrategy(provider.presetId)
     const presetDefaultEnv = getPresetDefaultEnv(provider.presetId)
     const apiKey = provider.apiKey
       || presetDefaultEnv.ANTHROPIC_AUTH_TOKEN

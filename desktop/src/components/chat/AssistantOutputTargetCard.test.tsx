@@ -58,6 +58,17 @@ const localhostTarget: AssistantOutputTarget = {
   source: 'plain-url',
 }
 
+const documentTarget: AssistantOutputTarget = {
+  id: 'file:outputs/brief.docx',
+  kind: 'file',
+  title: 'brief.docx',
+  subtitle: 'outputs/brief.docx',
+  href: 'outputs/brief.docx',
+  normalizedPath: 'outputs/brief.docx',
+  confidence: 'high',
+  source: 'changed-file',
+}
+
 afterEach(() => {
   openBrowser.mockReset()
   ensureTargets.mockReset().mockResolvedValue(undefined)
@@ -81,10 +92,19 @@ describe('AssistantOutputTargetCard', () => {
     expect(screen.getByText('assistantOutputs.kind.localhost')).toBeInTheDocument()
   })
 
+  it('renders an Office artifact with its concrete document type', () => {
+    render(<AssistantOutputTargetCard target={documentTarget} sessionId="s1" />)
+    expect(screen.getByText('brief.docx')).toBeInTheDocument()
+    expect(screen.getByText('openWith.fileType.document')).toBeInTheDocument()
+    expect(screen.getByText('outputs/brief.docx')).toBeInTheDocument()
+  })
+
   it('routes Open to workspace preview for a markdown target', () => {
     render(<AssistantOutputTargetCard target={markdownTarget} sessionId="s1" />)
     fireEvent.click(screen.getByLabelText('assistantOutputs.open'))
-    expect(openPreviewFn).toHaveBeenCalledWith('s1', 'docs/readme.md', 'file')
+    // The trailing args are openPreview's optional `origin` and `reveal` (#1146);
+    // a card has no line number to reveal, hence undefined.
+    expect(openPreviewFn).toHaveBeenCalledWith('s1', 'docs/readme.md', 'file', undefined, undefined)
   })
 
   it('routes Open to the in-app browser for a localhost target', () => {

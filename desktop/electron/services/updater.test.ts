@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { ElectronUpdaterService, normalizeUpdateInfo, type ElectronUpdaterLike } from './updater'
+import { ElectronUpdaterService, normalizeUpdateInfo, updaterSessionProxyConfig, type ElectronUpdaterLike } from './updater'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -145,6 +145,22 @@ describe('Electron updater service', () => {
     expect(localUpdater.checkForUpdates).toHaveBeenCalledTimes(3)
   })
 
+  it('disables differential download so update downloads run at full bandwidth', () => {
+    const localUpdater = fakeUpdater()
+
+    void new ElectronUpdaterService(localUpdater)
+
+    expect(localUpdater.disableDifferentialDownload).toBe(true)
+  })
+
+  it('maps proxy settings to the updater net session proxy config', () => {
+    expect(updaterSessionProxyConfig(null)).toEqual({ mode: 'system' })
+    expect(updaterSessionProxyConfig('http://127.0.0.1:7890')).toEqual({
+      proxyRules: 'http://127.0.0.1:7890',
+      proxyBypassRules: '<local>',
+    })
+  })
+
   it('does not hide non-metadata updater failures', async () => {
     const service = new ElectronUpdaterService(updater)
     updater.checkForUpdates.mockRejectedValueOnce(new Error('feed unavailable'))
@@ -165,5 +181,38 @@ describe('Electron updater service', () => {
     service.quitAndInstallDownloadedUpdate()
 
     expect(updater.quitAndInstall).toHaveBeenCalledWith(false, true)
+  })
+
+  it('hands the spawned installer an environment without the app-managed portable selection', async () => {
+    const service = new ElectronUpdaterService(updater)
+    updater.checkForUpdates.mockResolvedValue({ updateInfo: { version: '1.2.4' } })
+    updater.downloadUpdate.mockResolvedValue(undefined)
+    await service.checkForUpdates()
+    await service.downloadUpdate(() => {})
+
+    const env: NodeJS.ProcessEnv = {
+      CLAUDE_CONFIG_DIR: 'E:\\cc-haha-data',
+      CC_HAHA_APP_PORTABLE_DIR: '1',
+      WEBVIEW2_USER_DATA_FOLDER: 'E:\\cc-haha-data\\EBWebView',
+      APPDATA: 'C:\\Users\\someone\\AppData\\Roaming',
+    }
+    service.quitAndInstallDownloadedUpdate(env)
+
+    expect(updater.quitAndInstall).toHaveBeenCalledWith(false, true)
+    expect(env).toEqual({ APPDATA: 'C:\\Users\\someone\\AppData\\Roaming' })
+  })
+
+  it('leaves an externally supplied CLAUDE_CONFIG_DIR untouched when installing', async () => {
+    const service = new ElectronUpdaterService(updater)
+    updater.checkForUpdates.mockResolvedValue({ updateInfo: { version: '1.2.4' } })
+    updater.downloadUpdate.mockResolvedValue(undefined)
+    await service.checkForUpdates()
+    await service.downloadUpdate(() => {})
+
+    const env: NodeJS.ProcessEnv = { CLAUDE_CONFIG_DIR: 'E:\\external-data' }
+    service.quitAndInstallDownloadedUpdate(env)
+
+    expect(updater.quitAndInstall).toHaveBeenCalledWith(false, true)
+    expect(env).toEqual({ CLAUDE_CONFIG_DIR: 'E:\\external-data' })
   })
 })

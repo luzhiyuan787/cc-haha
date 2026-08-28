@@ -40,6 +40,45 @@ describe('sessionsApi', () => {
     })
   })
 
+  it('deduplicates concurrent Git info requests for the same session', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    let resolveFetch!: (response: Response) => void
+    fetchMock.mockReturnValueOnce(new Promise<Response>((resolve) => {
+      resolveFetch = resolve
+    }))
+
+    const first = sessionsApi.getGitInfo('session-1')
+    const second = sessionsApi.getGitInfo('session-1')
+
+    expect(fetchMock).toHaveBeenCalledOnce()
+    resolveFetch(new Response(JSON.stringify({
+      branch: 'main',
+      repoName: 'repo',
+      workDir: '/repo',
+      changedFiles: 0,
+      worktree: null,
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+
+    const [firstResult, secondResult] = await Promise.all([first, second])
+    expect(firstResult).toEqual(secondResult)
+
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      branch: 'main',
+      repoName: 'repo',
+      workDir: '/repo',
+      changedFiles: 1,
+      worktree: null,
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    await sessionsApi.getGitInfo('session-1')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
   it('fetches a single trace call from the call detail endpoint', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch')
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
@@ -55,5 +94,77 @@ describe('sessionsApi', () => {
     const [url, init] = fetchMock.mock.calls[0]!
     expect(url).toBe('http://127.0.0.1:3456/api/sessions/session-1/trace/calls/call-1')
     expect(init).toMatchObject({ method: 'GET' })
+  })
+
+  it('reads pet activity without opening a websocket session', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      state: 'thinking',
+      activityState: 'waiting',
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+
+    const result = await sessionsApi.getChatStatus('session-1')
+
+    expect(result.state).toBe('thinking')
+    expect(result.activityState).toBe('waiting')
+    expect(fetchMock).toHaveBeenCalledOnce()
+    const [url, init] = fetchMock.mock.calls[0]!
+    expect(url).toBe('http://127.0.0.1:3456/api/sessions/session-1/chat/status')
+    expect(init).toMatchObject({ method: 'GET' })
+  })
+
+  it('searches the session workspace with an encoded query', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      state: 'ok',
+      query: 'Mental Health Controller',
+      truncated: false,
+      entries: [],
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+
+    const result = await sessionsApi.searchWorkspace('session-1', 'Mental Health Controller')
+
+    expect(result.query).toBe('Mental Health Controller')
+    expect(result.truncated).toBe(false)
+    const [url, init] = fetchMock.mock.calls[0]!
+    expect(url).toBe('http://127.0.0.1:3456/api/sessions/session-1/workspace/search?query=Mental+Health+Controller')
+    expect(init).toMatchObject({ method: 'GET' })
+  })
+
+  it('preserves optional local index progress from session list responses', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      sessions: [],
+      total: 0,
+      index: {
+        mode: 'on',
+        state: 'building',
+        discovered: 12,
+        indexed: 4,
+        degradedSources: 0,
+        databaseBytes: 4096,
+        walBytes: 0,
+        lastUpdatedAt: '2026-07-15T00:00:00.000Z',
+        lastErrorCode: null,
+      },
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+
+    const result = await sessionsApi.list()
+
+    expect(result.index).toMatchObject({
+      mode: 'on',
+      state: 'building',
+      discovered: 12,
+      indexed: 4,
+    })
   })
 })

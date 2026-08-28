@@ -28,7 +28,8 @@ describe('translateCliMessage: agent_tool_activity', () => {
       {
         type: 'tool_use_complete',
         toolName: 'Bash',
-        toolUseId: 'toolu_child',
+        toolUseId: 'toolu_parent/toolu_child',
+        originalToolUseId: 'toolu_child',
         input: { command: 'ls' },
         parentToolUseId: 'toolu_parent',
       },
@@ -54,7 +55,8 @@ describe('translateCliMessage: agent_tool_activity', () => {
     expect(out).toEqual([
       {
         type: 'tool_result',
-        toolUseId: 'toolu_child',
+        toolUseId: 'toolu_parent/toolu_child',
+        originalToolUseId: 'toolu_child',
         content: 'done',
         isError: true,
         parentToolUseId: 'toolu_parent',
@@ -73,6 +75,27 @@ describe('translateCliMessage: agent_tool_activity', () => {
       },
       'session-1',
     )
+    expect(out).toEqual([])
+  })
+
+  it('does not flatten an owned Agent tool activity into the root transcript', () => {
+    const out = translateCliMessage(
+      {
+        type: 'system',
+        subtype: 'agent_tool_activity',
+        task_id: 'nested-agent-1',
+        tool_use_id: 'toolu_nested_parent',
+        owner_agent_id: 'teammate-run-1',
+        activity: {
+          kind: 'tool_use',
+          tool_name: 'Bash',
+          tool_use_id: 'toolu_nested_child',
+          input: { command: 'pwd' },
+        },
+      },
+      'session-1',
+    )
+
     expect(out).toEqual([])
   })
 })

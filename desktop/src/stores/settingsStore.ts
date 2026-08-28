@@ -5,7 +5,6 @@ import { modelsApi } from '../api/models'
 import { h5AccessApi } from '../api/h5Access'
 import { tracesApi } from '../api/traces'
 import {
-  isThemeMode,
   type AppMode,
   type AppModeConfig,
   type ChatSendBehavior,
@@ -22,6 +21,7 @@ import {
   type ThemeMode,
   type UpdateProxyMode,
   type UpdateProxySettings,
+  type UserSettings,
   type WebSearchSettings,
 } from '../types/settings'
 import type { TraceCaptureSettings } from '../types/trace'
@@ -37,34 +37,34 @@ import {
   readStoredAppZoomLevel,
 } from '../lib/appZoom'
 import { useUIStore } from './uiStore'
+import {
+  applyDocumentLocale,
+  getInitialLocale,
+  LOCALE_STORAGE_KEY,
+  subscribeLocaleChanges,
+} from '../i18n/locale'
 
-const LOCALE_STORAGE_KEY = 'cc-haha-locale'
 export const UI_ZOOM_MIN = MIN_APP_ZOOM
 export const UI_ZOOM_MAX = MAX_APP_ZOOM
 export const UI_ZOOM_STEP = APP_ZOOM_CONTROL_STEP
 export const UI_ZOOM_DEFAULT = DEFAULT_APP_ZOOM
 let desktopNotificationsSaveQueue: Promise<void> = Promise.resolve()
 
-const VALID_LOCALES: readonly Locale[] = ['en', 'zh', 'zh-TW', 'jp', 'kr']
-
-function getStoredLocale(): Locale {
-  try {
-    const stored = localStorage.getItem(LOCALE_STORAGE_KEY)
-    if (stored && (VALID_LOCALES as readonly string[]).includes(stored)) return stored as Locale
-  } catch { /* localStorage unavailable */ }
-  return 'zh'
-}
-
 type SettingsStore = {
   permissionMode: PermissionMode
   currentModel: ModelInfo | null
   effortLevel: EffortLevel
   thinkingEnabled: boolean
+  workflowKeywordTriggerEnabled: boolean
   autoDreamEnabled: boolean
+  autoModeOptInAccepted: boolean
   availableModels: ModelInfo[]
   activeProviderName: string | null
   locale: Locale
-  theme: ThemeMode
+  // No `theme` here on purpose: uiStore owns it. A copy in this store went
+  // stale the moment the OS flipped the appearance without going through
+  // setTheme, and the Settings picker highlighted a theme that was no longer
+  // on screen. Read `useUIStore(s => s.theme)` instead.
   chatSendBehavior: ChatSendBehavior
   outputStyle: string
   outputStyles: OutputStyleOption[]
@@ -86,6 +86,7 @@ type SettingsStore = {
   uiZoom: number
   isLoading: boolean
   error: string | null
+  proxyManagedSettingsWarning: boolean
 
   appMode: AppModeConfig
   appModeRequiresRestart: boolean
@@ -96,7 +97,9 @@ type SettingsStore = {
   setModel: (modelId: string) => Promise<void>
   setEffort: (level: EffortLevel) => Promise<void>
   setThinkingEnabled: (enabled: boolean) => Promise<void>
+  setWorkflowKeywordTriggerEnabled: (enabled: boolean) => Promise<void>
   setAutoDreamEnabled: (enabled: boolean) => Promise<void>
+  acceptAutoModeOptIn: () => Promise<void>
   setLocale: (locale: Locale) => void
   setTheme: (theme: ThemeMode) => Promise<void>
   setChatSendBehavior: (behavior: ChatSendBehavior) => Promise<void>
@@ -142,6 +145,9 @@ const DEFAULT_DESKTOP_TERMINAL_SETTINGS: DesktopTerminalSettings = {
   startupShell: 'system',
   customShellPath: '',
 }
+let desktopTerminalSaveQueue: Promise<void> = Promise.resolve()
+let desktopTerminalSaveVersion = 0
+let lastPersistedDesktopTerminal = DEFAULT_DESKTOP_TERMINAL_SETTINGS
 
 const DEFAULT_UPDATE_PROXY_SETTINGS: UpdateProxySettings = {
   mode: 'system',
@@ -151,7 +157,7 @@ const DEFAULT_UPDATE_PROXY_SETTINGS: UpdateProxySettings = {
 const DEFAULT_NETWORK_SETTINGS: NetworkSettings = {
   aiRequestTimeoutMs: 600_000,
   proxy: {
-    mode: 'direct',
+    mode: 'system',
     url: '',
   },
 }
@@ -171,16 +177,20 @@ const DEFAULT_TRACE_CAPTURE_SETTINGS: TraceCaptureSettings = {
   storageDir: '',
 }
 
+const initialLocale = getInitialLocale()
+applyDocumentLocale(initialLocale)
+
 export const useSettingsStore = create<SettingsStore>((set, get) => ({
   permissionMode: 'default',
   currentModel: null,
   effortLevel: 'max',
   thinkingEnabled: true,
+  workflowKeywordTriggerEnabled: true,
   autoDreamEnabled: false,
+  autoModeOptInAccepted: false,
   availableModels: [],
   activeProviderName: null,
-  locale: getStoredLocale(),
-  theme: useUIStore.getState().theme,
+  locale: initialLocale,
   chatSendBehavior: 'enter',
   outputStyle: DEFAULT_OUTPUT_STYLE,
   outputStyles: DEFAULT_OUTPUT_STYLE_OPTIONS,
@@ -202,11 +212,11 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   uiZoom: readStoredAppZoomLevel(),
   isLoading: false,
   error: null,
+  proxyManagedSettingsWarning: false,
 
   appMode: {
     mode: 'default',
     portableDir: null,
-    defaultPortableDir: null,
     activeConfigDir: null,
     configDirSource: 'system',
   },
@@ -221,7 +231,15 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set({ isLoading: true, error: null })
     try {
       const previousH5Access = get().h5Access
-      const [{ mode }, modelsRes, { model }, { level }, userSettings, h5AccessResult, traceCapture] = await Promise.all([
+      const [
+        { mode },
+        modelsRes,
+        { model },
+        { level },
+        userSettings,
+        h5AccessResult,
+        traceCapture,
+      ] = await Promise.all([
         settingsApi.getPermissionMode(),
         modelsApi.list(),
         modelsApi.getCurrent(),
@@ -230,22 +248,27 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         loadH5AccessSettings(previousH5Access),
         loadTraceCaptureSettings(),
       ])
-      const theme = isThemeMode(userSettings.theme) ? userSettings.theme : 'white'
-      useUIStore.getState().setTheme(theme)
+      const desktopTerminal = normalizeDesktopTerminalSettings(userSettings.desktopTerminal)
+      lastPersistedDesktopTerminal = desktopTerminal
+      // Nothing to do for the theme here: uiStore already applied it at
+      // startup, and re-applying would re-persist and re-report it on every
+      // provider switch.
       set({
         permissionMode: mode,
-        availableModels: modelsRes.models,
+        // 服务端响应异常可能缺 models 字段,兜底为空数组防止下游渲染崩溃
+        availableModels: modelsRes.models ?? [],
         activeProviderName: modelsRes.provider?.name ?? null,
         currentModel: model,
         effortLevel: level,
         thinkingEnabled: userSettings.alwaysThinkingEnabled !== false,
+        workflowKeywordTriggerEnabled: userSettings.workflowKeywordTriggerEnabled !== false,
         autoDreamEnabled: userSettings.autoDreamEnabled === true,
-        theme,
+        autoModeOptInAccepted: userSettings.skipAutoPermissionPrompt === true,
         chatSendBehavior: normalizeChatSendBehavior(userSettings.chatSendBehavior),
         outputStyle: normalizeOutputStyle(userSettings.outputStyle),
         skipWebFetchPreflight: userSettings.skipWebFetchPreflight !== false,
         desktopNotificationsEnabled: userSettings.desktopNotificationsEnabled === true,
-        desktopTerminal: normalizeDesktopTerminalSettings(userSettings.desktopTerminal),
+        desktopTerminal,
         webSearch: normalizeWebSearchSettings(userSettings.webSearch),
         updateProxy: normalizeUpdateProxySettings(userSettings.updateProxy),
         network: normalizeNetworkSettings(userSettings.network),
@@ -254,6 +277,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         h5AccessDiagnostics: h5AccessResult.diagnostics,
         h5AccessError: h5AccessResult.error,
         responseLanguage: typeof userSettings.language === 'string' ? userSettings.language : '',
+        proxyManagedSettingsWarning: hasProxyManagedOnlyUserSettings(userSettings),
         isLoading: false,
         error: null,
       })
@@ -310,6 +334,17 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     }
   },
 
+  setWorkflowKeywordTriggerEnabled: async (enabled) => {
+    const prev = get().workflowKeywordTriggerEnabled
+    set({ workflowKeywordTriggerEnabled: enabled })
+    try {
+      await settingsApi.updateUser({ workflowKeywordTriggerEnabled: enabled })
+    } catch (error) {
+      set({ workflowKeywordTriggerEnabled: prev })
+      throw error
+    }
+  },
+
   setAutoDreamEnabled: async (enabled) => {
     const prev = get().autoDreamEnabled
     set({ autoDreamEnabled: enabled })
@@ -321,21 +356,29 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     }
   },
 
-  setLocale: (locale) => {
-    set({ locale })
-    try { localStorage.setItem(LOCALE_STORAGE_KEY, locale) } catch { /* noop */ }
+  acceptAutoModeOptIn: async () => {
+    const previous = get().autoModeOptInAccepted
+    set({ autoModeOptInAccepted: true })
+    try {
+      await settingsApi.updateUser({ skipAutoPermissionPrompt: true })
+    } catch (error) {
+      set({ autoModeOptInAccepted: previous })
+      throw error
+    }
   },
 
+  setLocale: (locale) => {
+    set({ locale })
+    applyDocumentLocale(locale)
+    try { localStorage.setItem(LOCALE_STORAGE_KEY, locale) } catch { /* noop */ }
+    void getDesktopHost().app.setLocalePreference(locale).catch((error) => {
+      console.error('[desktop] Failed to persist locale preference', error)
+    })
+  },
+
+  // Kept as the Settings page's entry point; uiStore owns the state.
   setTheme: async (theme) => {
-    const prev = get().theme
-    set({ theme })
     useUIStore.getState().setTheme(theme)
-    try {
-      await settingsApi.updateUser({ theme })
-    } catch {
-      set({ theme: prev })
-      useUIStore.getState().setTheme(prev)
-    }
   },
 
   setChatSendBehavior: async (behavior) => {
@@ -433,15 +476,25 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   setDesktopTerminal: async (settings) => {
-    const prev = get().desktopTerminal
     const next = normalizeDesktopTerminalSettings(settings)
+    const saveVersion = ++desktopTerminalSaveVersion
     set({ desktopTerminal: next })
-    try {
-      await settingsApi.updateUser({ desktopTerminal: next })
-    } catch (error) {
-      set({ desktopTerminal: prev })
-      throw error
-    }
+    const save = desktopTerminalSaveQueue
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          await settingsApi.updateUser({ desktopTerminal: next })
+          lastPersistedDesktopTerminal = next
+        } catch (error) {
+          if (saveVersion === desktopTerminalSaveVersion) {
+            set({ desktopTerminal: lastPersistedDesktopTerminal })
+          }
+          throw error
+        }
+      })
+
+    desktopTerminalSaveQueue = save
+    await save
   },
 
   setWebSearch: async (webSearch) => {
@@ -576,16 +629,14 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     const host = getDesktopHost()
     if (!host.isDesktop) return
     const prev = get().appMode
+    const selectedCustomDir = mode === 'portable' ? portableDir?.trim() || null : null
+    if (mode === 'portable' && !selectedCustomDir) {
+      throw new Error('Choose an absolute custom data directory')
+    }
     const newMode: AppModeConfig = {
       ...prev,
       mode,
-      portableDir: mode === 'portable'
-        ? portableDir ?? prev.defaultPortableDir ?? prev.portableDir
-        : null,
-      activeConfigDir: mode === 'portable'
-        ? portableDir ?? prev.defaultPortableDir ?? prev.portableDir
-        : null,
-      configDirSource: mode === 'portable' ? 'portable' : 'system',
+      portableDir: selectedCustomDir,
     }
     set({ appMode: newMode, appModeRequiresRestart: true })
     try {
@@ -593,11 +644,29 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         mode,
         portableDir: newMode.portableDir || null,
       })
-    } catch {
+    } catch (error) {
       set({ appMode: prev, appModeRequiresRestart: false })
+      throw error
     }
   },
 }))
+
+export function hasProxyManagedOnlyUserSettings(settings: UserSettings): boolean {
+  const keys = Object.keys(settings)
+  if (keys.length !== 1 || keys[0] !== 'env') return false
+
+  const env = settings.env
+  if (typeof env !== 'object' || env === null || Array.isArray(env)) return false
+
+  const values = env as Record<string, unknown>
+  return values.ANTHROPIC_API_KEY === 'PROXY_MANAGED'
+    || values.ANTHROPIC_AUTH_TOKEN === 'PROXY_MANAGED'
+}
+
+subscribeLocaleChanges((locale) => {
+  useSettingsStore.setState({ locale })
+  applyDocumentLocale(locale)
+})
 
 function normalizeWebSearchSettings(settings: WebSearchSettings | undefined): WebSearchSettings {
   return {
@@ -659,9 +728,9 @@ function normalizeNetworkSettings(
     : DEFAULT_NETWORK_SETTINGS.aiRequestTimeoutMs
   const proxyMode = settings?.proxy?.mode === 'manual'
     ? 'manual'
-    : settings?.proxy?.mode === 'system'
-      ? 'system'
-      : 'direct'
+    : settings?.proxy?.mode === 'direct'
+      ? 'direct'
+      : 'system'
 
   return {
     aiRequestTimeoutMs: timeout,

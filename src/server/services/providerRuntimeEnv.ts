@@ -1,7 +1,15 @@
 import * as fs from 'fs'
 import * as path from 'path'
 
+import { getClaudeCodeModelCapabilities } from '../../shared/modelReasoning.js'
 import { MODEL_CONTEXT_WINDOWS_ENV_KEY } from '../../utils/model/modelContextWindows.js'
+import {
+  IMAGE_GENERATION_API_KEY_ENV_KEY,
+  IMAGE_GENERATION_BASE_URL_ENV_KEY,
+  IMAGE_GENERATION_MODEL_ENV_KEY,
+  IMAGE_GENERATION_PROVIDER_ID_ENV_KEY,
+  IMAGE_GENERATION_PROVIDER_KIND_ENV_KEY,
+} from '../../services/imageGeneration/config.js'
 import { PROVIDER_PRESETS } from '../config/providerPresets.js'
 import type {
   ApiFormat,
@@ -11,6 +19,7 @@ import type {
 } from '../types/provider.js'
 import {
   BUILT_IN_PROVIDER_IDS,
+  PROVIDER_TOOL_SEARCH_OPT_IN_SCHEMA_VERSION,
 } from '../types/provider.js'
 import {
   ATTRIBUTION_HEADER_ENV_KEY,
@@ -22,6 +31,12 @@ import {
   buildOpenAIOfficialRuntimeEnv,
   isOpenAIOfficialProviderId,
 } from './openaiOfficialProvider.js'
+import {
+  GROK_OAUTH_FILE_ENV_KEY,
+  GROK_OAUTH_PROVIDER_ENV_KEY,
+  buildGrokOfficialRuntimeEnv,
+  isGrokOfficialProviderId,
+} from './grokOfficialProvider.js'
 
 export const MANAGED_PROVIDER_ENV_KEYS = [
   'ANTHROPIC_BASE_URL',
@@ -30,6 +45,10 @@ export const MANAGED_PROVIDER_ENV_KEYS = [
   'ENABLE_TOOL_SEARCH',
   'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS',
   'ANTHROPIC_MODEL',
+  'ANTHROPIC_DEFAULT_FABLE_MODEL',
+  'ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION',
+  'ANTHROPIC_DEFAULT_FABLE_MODEL_NAME',
+  'ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES',
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
@@ -41,10 +60,15 @@ export const MANAGED_PROVIDER_ENV_KEYS = [
   MODEL_CONTEXT_WINDOWS_ENV_KEY,
   OPENAI_OAUTH_PROVIDER_ENV_KEY,
   OPENAI_CODEX_OAUTH_FILE_ENV_KEY,
+  GROK_OAUTH_PROVIDER_ENV_KEY,
+  GROK_OAUTH_FILE_ENV_KEY,
+  IMAGE_GENERATION_PROVIDER_KIND_ENV_KEY,
+  IMAGE_GENERATION_PROVIDER_ID_ENV_KEY,
+  IMAGE_GENERATION_BASE_URL_ENV_KEY,
+  IMAGE_GENERATION_API_KEY_ENV_KEY,
+  IMAGE_GENERATION_MODEL_ENV_KEY,
 ] as const
 
-const CUSTOM_PROVIDER_MODEL_CAPABILITIES = 'thinking,effort,adaptive_thinking,max_effort'
-const XIAOMI_MIMO_MODEL_CAPABILITIES = 'thinking'
 const AUTH_ENV_KEYS = new Set(['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'])
 const MODEL_SLOTS = ['main', 'haiku', 'sonnet', 'opus'] as const
 
@@ -56,6 +80,7 @@ function isProviderModels(value: unknown): value is SavedProvider['models'] {
   return (
     isRecord(value) &&
     typeof value.main === 'string' &&
+    (value.fable === undefined || typeof value.fable === 'string') &&
     typeof value.haiku === 'string' &&
     typeof value.sonnet === 'string' &&
     typeof value.opus === 'string'
@@ -66,6 +91,17 @@ function isProviderModel1mSupport(value: unknown): value is SavedProvider['model
   return (
     isRecord(value) &&
     MODEL_SLOTS.every((slot) => typeof value[slot] === 'boolean')
+  )
+}
+
+function isImageGenerationConfig(
+  value: unknown,
+): value is NonNullable<SavedProvider['imageGeneration']> {
+  return (
+    isRecord(value) &&
+    typeof value.model === 'string' &&
+    (value.baseUrl === undefined || typeof value.baseUrl === 'string') &&
+    (value.apiKey === undefined || typeof value.apiKey === 'string')
   )
 }
 
@@ -81,14 +117,16 @@ function isSavedProvider(value: unknown): value is SavedProvider {
     (
       runtimeKind === undefined ||
       runtimeKind === 'anthropic_compatible' ||
-      runtimeKind === 'openai_oauth'
+      runtimeKind === 'openai_oauth' ||
+      runtimeKind === 'grok_oauth'
     ) &&
     isProviderModels(value.models) &&
-    (value.model1mSupport === undefined || isProviderModel1mSupport(value.model1mSupport))
+    (value.model1mSupport === undefined || isProviderModel1mSupport(value.model1mSupport)) &&
+    (value.imageGeneration === undefined || isImageGenerationConfig(value.imageGeneration))
   )
 }
 
-function normalizeToolSearchEnabled(value: unknown): boolean {
+export function normalizeToolSearchEnabled(value: unknown): boolean {
   if (typeof value === 'boolean') return value
   if (typeof value === 'number') return value !== 0
   if (typeof value === 'string') {
@@ -98,10 +136,10 @@ function normalizeToolSearchEnabled(value: unknown): boolean {
       return true
     }
   }
-  return true
+  return false
 }
 
-function normalizeDisableExperimentalBetas(value: unknown): boolean {
+export function normalizeDisableExperimentalBetas(value: unknown): boolean {
   if (typeof value === 'boolean') return value
   if (typeof value === 'number') return value !== 0
   if (typeof value === 'string') {
@@ -116,6 +154,7 @@ export function normalizeModelMapping(models: SavedProvider['models']): SavedPro
   const main = models.main.trim()
   return {
     main,
+    ...(models.fable?.trim() ? { fable: models.fable.trim() } : {}),
     haiku: models.haiku.trim() || main,
     sonnet: models.sonnet.trim() || main,
     opus: models.opus.trim() || main,
@@ -135,6 +174,20 @@ function normalizeModel1mSupport(
   return MODEL_SLOTS.some((slot) => normalized[slot]) ? normalized : undefined
 }
 
+export function normalizeImageGeneration(
+  value: SavedProvider['imageGeneration'] | undefined,
+): SavedProvider['imageGeneration'] | undefined {
+  const model = value?.model.trim()
+  if (!model) return undefined
+  const baseUrl = value?.baseUrl?.trim()
+  const apiKey = value?.apiKey?.trim()
+  return {
+    model,
+    ...(baseUrl ? { baseUrl } : {}),
+    ...(apiKey ? { apiKey } : {}),
+  }
+}
+
 function applyModel1mSupport(model: string, enabled: boolean | undefined): string {
   const trimmed = model.trim()
   if (!enabled) return trimmed
@@ -147,6 +200,7 @@ function applyModel1mSupportMapping(
 ): SavedProvider['models'] {
   return {
     main: applyModel1mSupport(models.main, model1mSupport?.main),
+    ...(models.fable ? { fable: models.fable.trim() } : {}),
     haiku: applyModel1mSupport(models.haiku, model1mSupport?.haiku),
     sonnet: applyModel1mSupport(models.sonnet, model1mSupport?.sonnet),
     opus: applyModel1mSupport(models.opus, model1mSupport?.opus),
@@ -156,11 +210,13 @@ function applyModel1mSupportMapping(
 export function normalizeSavedProvider(provider: SavedProvider): SavedProvider {
   const {
     disableExperimentalBetas: rawDisableExperimentalBetas,
+    imageGeneration: rawImageGeneration,
     model1mSupport: rawModel1mSupport,
     ...rest
   } = provider
   const rawProvider = provider as SavedProvider & Record<string, unknown>
   const model1mSupport = normalizeModel1mSupport(rawModel1mSupport)
+  const imageGeneration = normalizeImageGeneration(rawImageGeneration)
   return {
     ...rest,
     apiFormat: provider.apiFormat ?? 'anthropic',
@@ -169,6 +225,22 @@ export function normalizeSavedProvider(provider: SavedProvider): SavedProvider {
     toolSearchEnabled: normalizeToolSearchEnabled(rawProvider.toolSearchEnabled),
     ...(normalizeDisableExperimentalBetas(rawDisableExperimentalBetas) ? { disableExperimentalBetas: true } : {}),
     ...(model1mSupport !== undefined ? { model1mSupport } : {}),
+    ...(imageGeneration !== undefined ? { imageGeneration } : {}),
+  }
+}
+
+function buildImageGenerationManagedEnv(
+  provider: SavedProvider,
+): Record<string, string> {
+  const imageGeneration = normalizeImageGeneration(provider.imageGeneration)
+  if (!imageGeneration) return {}
+
+  return {
+    [IMAGE_GENERATION_PROVIDER_KIND_ENV_KEY]: 'openai_images',
+    [IMAGE_GENERATION_PROVIDER_ID_ENV_KEY]: provider.id,
+    [IMAGE_GENERATION_BASE_URL_ENV_KEY]: imageGeneration.baseUrl ?? provider.baseUrl,
+    [IMAGE_GENERATION_API_KEY_ENV_KEY]: imageGeneration.apiKey ?? provider.apiKey,
+    [IMAGE_GENERATION_MODEL_ENV_KEY]: imageGeneration.model,
   }
 }
 
@@ -216,9 +288,13 @@ export function normalizeProvidersIndex(value: unknown): ProvidersIndex | null {
     providerOrder: rawProviderOrder,
     ...rest
   } = value
+  const schemaVersion = typeof value.schemaVersion === 'number' ? value.schemaVersion : 1
   const providers = value.providers
     .filter(isSavedProvider)
     .map((provider) => normalizeSavedProvider(provider))
+    .map((provider) => schemaVersion < PROVIDER_TOOL_SEARCH_OPT_IN_SCHEMA_VERSION
+      ? { ...provider, toolSearchEnabled: false }
+      : provider)
   const rawActiveId =
     typeof value.activeId === 'string'
       ? value.activeId
@@ -227,14 +303,15 @@ export function normalizeProvidersIndex(value: unknown): ProvidersIndex | null {
         : null
   const activeId = rawActiveId && (
     providers.some((provider) => provider.id === rawActiveId) ||
-    isOpenAIOfficialProviderId(rawActiveId)
+    isOpenAIOfficialProviderId(rawActiveId) ||
+    isGrokOfficialProviderId(rawActiveId)
   )
     ? rawActiveId
     : null
 
   return {
     ...rest,
-    schemaVersion: typeof value.schemaVersion === 'number' ? value.schemaVersion : 1,
+    schemaVersion,
     activeId,
     providers,
     providerOrder: normalizeProviderOrder(rawProviderOrder, providers),
@@ -259,23 +336,25 @@ function getPresetModelContextWindows(presetId: string): Record<string, number> 
   return PROVIDER_PRESETS.find((preset) => preset.id === presetId)?.modelContextWindows ?? {}
 }
 
-function isXiaomiMimoProvider(provider: SavedProvider, models: SavedProvider['models']): boolean {
-  const baseUrl = provider.baseUrl.toLowerCase()
-  const modelIds = Object.values(models).map((model) => model.toLowerCase())
-  return (
-    baseUrl.includes('xiaomimimo.com') ||
-    modelIds.some((model) => /^mimo-v\d/i.test(model))
-  )
-}
-
-function getCustomProviderModelCapabilities(
+function getProviderCapabilityEnv(
   provider: SavedProvider,
   models: SavedProvider['models'],
-): string {
-  if (isXiaomiMimoProvider(provider, models)) {
-    return XIAOMI_MIMO_MODEL_CAPABILITIES
+): Record<string, string> {
+  const apiFormat = provider.apiFormat ?? 'anthropic'
+  return {
+    ...(models.fable
+      ? {
+          ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES:
+            getClaudeCodeModelCapabilities(models.fable, apiFormat),
+        }
+      : {}),
+    ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES:
+      getClaudeCodeModelCapabilities(models.haiku, apiFormat),
+    ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES:
+      getClaudeCodeModelCapabilities(models.sonnet, apiFormat),
+    ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES:
+      getClaudeCodeModelCapabilities(models.opus, apiFormat),
   }
-  return CUSTOM_PROVIDER_MODEL_CAPABILITIES
 }
 
 export function buildProviderAuthEnv(
@@ -323,6 +402,9 @@ export function buildProviderManagedEnv(
   if (provider.runtimeKind === 'openai_oauth') {
     return buildOpenAIOfficialRuntimeEnv()
   }
+  if (provider.runtimeKind === 'grok_oauth') {
+    return buildGrokOfficialRuntimeEnv()
+  }
 
   const apiFormat: ApiFormat = provider.apiFormat ?? 'anthropic'
   const needsProxy = apiFormat !== 'anthropic'
@@ -340,19 +422,11 @@ export function buildProviderManagedEnv(
   }
 
   const presetDefaultEnv = getPresetDefaultEnv(provider.presetId)
-  const customProviderCapabilities = getCustomProviderModelCapabilities(provider, models)
-  const customProviderCapabilityEnv =
-    provider.presetId === 'custom'
-      ? {
-          ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES: customProviderCapabilities,
-          ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES: customProviderCapabilities,
-          ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES: customProviderCapabilities,
-        }
-      : {}
+  const providerCapabilityEnv = getProviderCapabilityEnv(provider, models)
 
   return {
+    ...providerCapabilityEnv,
     ...omitAuthEnv(presetDefaultEnv),
-    ...customProviderCapabilityEnv,
     ...(provider.autoCompactWindow !== undefined && {
       CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(provider.autoCompactWindow),
     }),
@@ -360,7 +434,7 @@ export function buildProviderManagedEnv(
       [MODEL_CONTEXT_WINDOWS_ENV_KEY]: JSON.stringify(modelContextWindows),
     }),
     ...(apiFormat === 'anthropic' && {
-      ENABLE_TOOL_SEARCH: provider.toolSearchEnabled === false ? 'false' : 'true',
+      ENABLE_TOOL_SEARCH: provider.toolSearchEnabled === true ? 'true' : 'false',
     }),
     ...(provider.disableExperimentalBetas === true && {
       CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: '1',
@@ -368,10 +442,14 @@ export function buildProviderManagedEnv(
     ANTHROPIC_BASE_URL: baseUrl,
     ...buildProviderAuthEnv(provider, presetDefaultEnv, needsProxy),
     ANTHROPIC_MODEL: runtimeModels.main,
+    ...(runtimeModels.fable && {
+      ANTHROPIC_DEFAULT_FABLE_MODEL: runtimeModels.fable,
+    }),
     ANTHROPIC_DEFAULT_HAIKU_MODEL: runtimeModels.haiku,
     ANTHROPIC_DEFAULT_SONNET_MODEL: runtimeModels.sonnet,
     ANTHROPIC_DEFAULT_OPUS_MODEL: runtimeModels.opus,
     ...attributionHeaderEnvForModel(runtimeModels.main),
+    ...buildImageGenerationManagedEnv(provider),
   }
 }
 
@@ -386,6 +464,9 @@ export function readActiveProviderManagedEnv(
 
     if (isOpenAIOfficialProviderId(index.activeId)) {
       return buildOpenAIOfficialRuntimeEnv()
+    }
+    if (isGrokOfficialProviderId(index.activeId)) {
+      return buildGrokOfficialRuntimeEnv()
     }
 
     const provider = index.providers.find((entry) => entry.id === index.activeId)
@@ -403,7 +484,11 @@ export function activeProviderNeedsProxy(configDir: string): boolean {
   try {
     const raw = fs.readFileSync(path.join(configDir, 'cc-haha', 'providers.json'), 'utf-8')
     const index = normalizeProvidersIndex(JSON.parse(raw))
-    if (!index?.activeId || isOpenAIOfficialProviderId(index.activeId)) {
+    if (
+      !index?.activeId ||
+      isOpenAIOfficialProviderId(index.activeId) ||
+      isGrokOfficialProviderId(index.activeId)
+    ) {
       return false
     }
 

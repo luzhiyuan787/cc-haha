@@ -3,12 +3,22 @@ import { getDefaultBaseUrl, setAuthToken, setBaseUrl } from './client'
 import { desktopUiPreferencesApi, getProfileAvatarUrl } from './desktopUiPreferences'
 
 const preferences = {
-  schemaVersion: 2,
+  schemaVersion: 3,
+  projectDisplayNames: {},
   profile: {
     displayName: 'cc-haha',
     subtitle: 'github.com/NanmiCoder/cc-haha',
     avatarFile: null,
     avatarUpdatedAt: null,
+  },
+  pet: {
+    enabled: false,
+    selectedPetId: 'dada-code',
+    size: 144,
+    showTaskPanel: false,
+    collapsed: false,
+    motionEnabled: true,
+    lastSessionId: null,
   },
   sidebar: {
     projectOrder: [],
@@ -24,6 +34,100 @@ describe('desktopUiPreferencesApi', () => {
     setAuthToken(null)
     setBaseUrl(getDefaultBaseUrl())
     vi.restoreAllMocks()
+  })
+
+  it('sends only the requested pet preference fields through the pet endpoint', async () => {
+    setBaseUrl('http://127.0.0.1:49237')
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ ok: true, preferences }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    const pet = { size: 160, lastSessionId: 'session-42' }
+
+    await expect(desktopUiPreferencesApi.updatePetPreferences(pet)).resolves.toEqual({
+      ok: true,
+      preferences,
+    })
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:49237/api/desktop-ui/preferences/pet',
+      expect.objectContaining({
+        method: 'PUT',
+        body: JSON.stringify(pet),
+      }),
+    )
+  })
+
+  it('updates project display names and sends null to reset one', async () => {
+    setBaseUrl('http://127.0.0.1:49237')
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        ok: true,
+        projectKey: '/workspace/apps/../project',
+        displayName: 'Project alias',
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        ok: true,
+        projectKey: '/workspace/apps/../project',
+        displayName: null,
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }))
+
+    await expect(desktopUiPreferencesApi.updateProjectDisplayName(
+      '/workspace/apps/../project',
+      'Project alias',
+    )).resolves.toEqual({
+      ok: true,
+      projectKey: '/workspace/apps/../project',
+      displayName: 'Project alias',
+    })
+    await expect(desktopUiPreferencesApi.updateProjectDisplayName(
+      '/workspace/apps/../project',
+      null,
+    )).resolves.toEqual({
+      ok: true,
+      projectKey: '/workspace/apps/../project',
+      displayName: null,
+    })
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      'http://127.0.0.1:49237/api/desktop-ui/preferences/project-display-name',
+      expect.objectContaining({
+        method: 'PUT',
+        body: JSON.stringify({ projectKey: '/workspace/apps/../project', displayName: 'Project alias' }),
+      }),
+    )
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      'http://127.0.0.1:49237/api/desktop-ui/preferences/project-display-name',
+      expect.objectContaining({
+        method: 'PUT',
+        body: JSON.stringify({ projectKey: '/workspace/apps/../project', displayName: null }),
+      }),
+    )
+  })
+
+  it('reads only the pet projection through the scoped preference endpoint', async () => {
+    setBaseUrl('http://127.0.0.1:49237')
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ exists: true, pet: preferences.pet }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+
+    await expect(desktopUiPreferencesApi.getPetPreferences()).resolves.toEqual({ exists: true, pet: preferences.pet })
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:49237/api/desktop-ui/preferences/pet',
+      expect.objectContaining({ method: 'GET' }),
+    )
   })
 
   it('wraps preference reads and profile updates with the configured API base URL', async () => {

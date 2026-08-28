@@ -9,10 +9,17 @@ import { z } from 'zod'
 
 export const CLAUDE_OFFICIAL_PROVIDER_ID = 'claude-official'
 export const OPENAI_OFFICIAL_PROVIDER_ID = 'openai-official'
+export const GROK_OFFICIAL_PROVIDER_ID = 'grok-official'
+export const PROVIDER_TOOL_SEARCH_OPT_IN_SCHEMA_VERSION = 4
 export const BUILT_IN_PROVIDER_IDS = [
   CLAUDE_OFFICIAL_PROVIDER_ID,
   OPENAI_OFFICIAL_PROVIDER_ID,
+  GROK_OFFICIAL_PROVIDER_ID,
 ] as const
+
+export function isBuiltInProviderId(id: string | null | undefined): boolean {
+  return !!id && (BUILT_IN_PROVIDER_IDS as readonly string[]).includes(id)
+}
 
 export const ApiFormatSchema = z.enum([
   'anthropic',         // Native Anthropic Messages API (passthrough, no proxy)
@@ -33,11 +40,13 @@ export type ProviderAuthStrategy = z.infer<typeof ProviderAuthStrategySchema>
 export const ProviderRuntimeKindSchema = z.enum([
   'anthropic_compatible',
   'openai_oauth',
+  'grok_oauth',
 ])
 export type ProviderRuntimeKind = z.infer<typeof ProviderRuntimeKindSchema>
 
 export const ModelMappingSchema = z.object({
   main: z.string(),
+  fable: z.string().optional(),
   haiku: z.string(),
   sonnet: z.string(),
   opus: z.string(),
@@ -58,6 +67,12 @@ export const ModelContextWindowsSchema = z.record(
 export const ToolSearchEnabledSchema = z.boolean()
 export const DisableExperimentalBetasSchema = z.boolean()
 
+export const ImageGenerationConfigSchema = z.object({
+  model: z.string().trim().min(1),
+  baseUrl: z.string().trim().optional(),
+  apiKey: z.string().trim().optional(),
+})
+
 export const SavedProviderSchema = z.object({
   id: z.string(),
   presetId: z.string(),
@@ -73,6 +88,7 @@ export const SavedProviderSchema = z.object({
   modelContextWindows: ModelContextWindowsSchema.optional(),
   toolSearchEnabled: ToolSearchEnabledSchema.optional(),
   disableExperimentalBetas: DisableExperimentalBetasSchema.optional(),
+  imageGeneration: ImageGenerationConfigSchema.optional(),
   notes: z.string().optional(),
 })
 
@@ -97,6 +113,7 @@ export const CreateProviderSchema = z.object({
   modelContextWindows: ModelContextWindowsSchema.optional(),
   toolSearchEnabled: ToolSearchEnabledSchema.optional(),
   disableExperimentalBetas: DisableExperimentalBetasSchema.optional(),
+  imageGeneration: ImageGenerationConfigSchema.optional(),
   notes: z.string().optional(),
 })
 
@@ -113,6 +130,7 @@ export const UpdateProviderSchema = z.object({
   modelContextWindows: ModelContextWindowsSchema.nullable().optional(),
   toolSearchEnabled: ToolSearchEnabledSchema.optional(),
   disableExperimentalBetas: DisableExperimentalBetasSchema.optional(),
+  imageGeneration: ImageGenerationConfigSchema.nullable().optional(),
   notes: z.string().optional(),
 })
 
@@ -133,6 +151,7 @@ export const ReorderProvidersSchema = z.object({
 // TypeScript types
 export type ModelMapping = z.infer<typeof ModelMappingSchema>
 export type Model1mSupport = z.infer<typeof Model1mSupportSchema>
+export type ImageGenerationConfig = z.infer<typeof ImageGenerationConfigSchema>
 export type SavedProvider = z.infer<typeof SavedProviderSchema>
 export type ProvidersIndex = z.infer<typeof ProvidersIndexSchema>
 export type CreateProviderInput = z.infer<typeof CreateProviderSchema>

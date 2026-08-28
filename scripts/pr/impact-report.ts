@@ -2,6 +2,7 @@
 
 import { evaluateChangePolicy } from './change-policy'
 import { changedFilesForLocalPrCheck } from './changed-files'
+import { dependentFilesForChangeSet } from './module-graph'
 
 function parseListArg(name: string) {
   const index = process.argv.indexOf(name)
@@ -23,7 +24,11 @@ async function changedFiles() {
 }
 
 function commandList(result: ReturnType<typeof evaluateChangePolicy>) {
-  const commands = ['bun run check:policy']
+  const commands: string[] = []
+
+  if (result.checks.policy) {
+    commands.push('bun run check:policy')
+  }
 
   if (result.checks.desktop) {
     commands.push('bun run check:desktop')
@@ -31,11 +36,23 @@ function commandList(result: ReturnType<typeof evaluateChangePolicy>) {
   if (result.checks.server) {
     commands.push('bun run check:server')
   }
+  if (result.checks.providerContract) {
+    commands.push('bun run check:provider-contract')
+  }
+  if (result.checks.chatContract) {
+    commands.push('bun run check:chat-contract')
+  }
+  if (result.checks.agentFlow) {
+    commands.push('bun run check:agent-flow')
+  }
   if (result.checks.adapters) {
     commands.push('bun run check:adapters')
   }
   if (result.checks.desktopNative) {
     commands.push('bun run check:native')
+  }
+  if (result.checks.persistence) {
+    commands.push('bun run check:persistence-upgrade')
   }
   if (result.checks.docs) {
     commands.push('bun run check:docs')
@@ -57,6 +74,7 @@ function hasMatchingTest(files: string[], predicate: (file: string) => boolean) 
 function changedProductionFiles(files: string[], predicate: (file: string) => boolean) {
   return files.filter((file) => (
     predicate(file) &&
+    /\.[cm]?[jt]sx?$/.test(file) &&
     !/\.test\.[cm]?[jt]sx?$/.test(file) &&
     !file.includes('/__tests__/') &&
     !file.includes('/fixtures/')
@@ -132,7 +150,10 @@ if (process.env.ALLOW_COVERAGE_BASELINE_CHANGE === '1') {
 }
 
 const files = await changedFiles()
-const result = evaluateChangePolicy(files, labels)
+const dependency = dependentFilesForChangeSet(process.cwd(), files, {
+  enabled: !process.argv.includes('--no-dependency-graph'),
+})
+const result = evaluateChangePolicy(files, labels, dependency.dependents)
 const commands = commandList(result)
 const warnings = [...coverageWarnings(result.files)]
 const blockingTestSignals = result.missingTestSignals
@@ -156,6 +177,33 @@ console.log('')
 console.log('## Required local checks')
 for (const command of commands) {
   console.log(`- \`${command}\``)
+}
+
+console.log('')
+console.log('## Cross-surface impact')
+if (dependency.degraded) {
+  console.log(`- Dependency graph unavailable (${dependency.reason}); every surface check was selected as a safe fallback.`)
+} else if (dependency.dependents.length === 0) {
+  console.log('- No file outside the diff imports a changed file.')
+} else {
+  const pathOnly = evaluateChangePolicy(files, labels)
+  const widened = (Object.keys(result.checks) as Array<keyof typeof result.checks>)
+    .filter((check) => result.checks[check] && !pathOnly.checks[check])
+  console.log(`- ${dependency.dependents.length} file(s) outside the diff import a changed file.`)
+  if (widened.length === 0) {
+    console.log('- Path-based routing already covered every importing surface.')
+  } else {
+    for (const check of widened) {
+      const example = dependency.dependents.find((file) => (
+        check === 'desktop' ? file.startsWith('desktop/src/')
+          : check === 'desktopNative' ? file.startsWith('desktop/electron/') || file.startsWith('desktop/scripts/')
+            : check === 'adapters' ? file.startsWith('adapters/')
+              : check === 'server' ? file.startsWith('src/')
+                : true
+      ))
+      console.log(`- Selected \`${check}\` because a changed file is imported by \`${example ?? dependency.dependents[0]}\`.`)
+    }
+  }
 }
 
 console.log('')

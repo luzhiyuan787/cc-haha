@@ -1,9 +1,10 @@
 import { useState } from 'react'
-import { useChatStore } from '../../stores/chatStore'
+import { getPendingPermission, useChatStore } from '../../stores/chatStore'
 import { useTabStore } from '../../stores/tabStore'
 import { useTranslation } from '../../i18n'
 import type { TranslationKey } from '../../i18n'
-import { Button } from '../shared/Button'
+import { Badge, StatusDot } from '@/components/ui/Badge'
+import { Button } from '@/components/ui/Button'
 import { DiffViewer } from './DiffViewer'
 import {
   PlanPreviewCard,
@@ -108,7 +109,7 @@ function renderPermissionPreview(toolName: string, input: unknown) {
   if (toolName === 'Bash' && typeof obj.command === 'string') {
     return (
       <div className="overflow-x-auto rounded-[var(--radius-md)] bg-[var(--color-terminal-bg)] px-3 py-2.5">
-        <pre className="font-[var(--font-mono)] text-[11px] leading-[1.3] text-[var(--color-terminal-fg)] whitespace-pre-wrap break-words">
+        <pre className="font-mono text-[11px] leading-[1.3] text-[var(--color-terminal-fg)] whitespace-pre-wrap break-words">
           <span className="text-[var(--color-terminal-accent)] select-none">$ </span>{obj.command}
         </pre>
       </div>
@@ -122,9 +123,11 @@ export function PermissionDialog({ sessionId, requestId, toolName, input, descri
   const { respondToPermission } = useChatStore()
   const activeTabId = useTabStore((s) => s.activeTabId)
   const targetSessionId = sessionId ?? activeTabId
-  const pendingPermission = useChatStore((s) => targetSessionId ? s.sessions[targetSessionId]?.pendingPermission : undefined)
+  const pendingPermission = useChatStore((s) => targetSessionId
+    ? getPendingPermission(s.sessions[targetSessionId], requestId)
+    : undefined)
   const t = useTranslation()
-  const isPending = pendingPermission?.requestId === requestId
+  const isPending = Boolean(pendingPermission)
   const [showRaw, setShowRaw] = useState(false)
 
   if (isExitPlanModeTool(toolName)) {
@@ -145,13 +148,18 @@ export function PermissionDialog({ sessionId, requestId, toolName, input, descri
   const preview = renderPermissionPreview(toolName, input)
   const title = getPermissionTitle(toolName, input, t)
   const allowRawToggle = !preview
+  const permissionContext = (details.primary || description || toolName).slice(0, 160)
 
   return (
-    <div className={`mb-4 overflow-hidden rounded-[var(--radius-lg)] border ${
-      isPending
-        ? 'border-[var(--color-warning)] bg-[var(--color-surface-container-lowest)]'
-        : 'border-[var(--color-outline-variant)]/40 bg-[var(--color-surface-container-low)] opacity-70'
-    }`}>
+    <div
+      role="group"
+      aria-label={`${title}: ${permissionContext}`}
+      className={`mb-4 overflow-hidden rounded-[var(--radius-lg)] border ${
+        isPending
+          ? 'border-[var(--color-warning)] bg-[var(--color-surface-container-lowest)]'
+          : 'border-[var(--color-border)] bg-[var(--color-surface-container-low)] opacity-70'
+      }`}
+    >
       {/* Header */}
       <div className={`flex items-center gap-3 px-4 py-3 ${
         isPending
@@ -163,6 +171,7 @@ export function PermissionDialog({ sessionId, requestId, toolName, input, descri
           style={{ backgroundColor: `${meta.color}18` }}
         >
           <span
+            aria-hidden="true"
             className="material-symbols-outlined text-[18px]"
             style={{ color: meta.color }}
           >
@@ -175,10 +184,13 @@ export function PermissionDialog({ sessionId, requestId, toolName, input, descri
               {title}
             </span>
             {isPending && (
-              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-[var(--color-warning)]/15 text-[var(--color-warning)]">
-                <span className="w-1.5 h-1.5 rounded-full bg-[var(--color-warning)] animate-pulse-dot" />
+              <Badge
+                tone="warning"
+                icon={<StatusDot tone="warning" pulse />}
+                className="font-bold uppercase tracking-wider"
+              >
                 {t('permission.awaitingApproval')}
-              </span>
+              </Badge>
             )}
             {!isPending && (
               <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-[var(--color-surface-container-high)] text-[var(--color-text-tertiary)]">
@@ -193,12 +205,12 @@ export function PermissionDialog({ sessionId, requestId, toolName, input, descri
       </div>
 
       {/* Tool details */}
-      <div className="border-t border-[var(--color-outline-variant)]/20 px-4 py-3">
+      <div className="border-t border-[var(--color-border)] px-4 py-3">
         {preview ? (
           <div className="space-y-2">
             {details.primary && toolName !== 'Bash' ? (
-              <div className="flex items-center gap-2 rounded-[var(--radius-md)] bg-[var(--color-surface-container)] px-3 py-2 text-xs font-[var(--font-mono)] text-[var(--color-text-secondary)]">
-                <span className="material-symbols-outlined text-[14px] text-[var(--color-outline)] flex-shrink-0">
+              <div className="flex items-center gap-2 rounded-[var(--radius-md)] bg-[var(--color-surface-container)] px-3 py-2 text-xs font-mono text-[var(--color-text-secondary)]">
+                <span aria-hidden="true" className="material-symbols-outlined text-[14px] text-[var(--color-outline)] flex-shrink-0">
                   folder_open
                 </span>
                 <span className="truncate">{details.primary}</span>
@@ -208,8 +220,8 @@ export function PermissionDialog({ sessionId, requestId, toolName, input, descri
           </div>
         ) : details.primary ? (
           <div className="mb-2">
-            <div className="flex items-center gap-2 rounded-[var(--radius-md)] bg-[var(--color-surface-container)] px-3 py-2 text-xs font-[var(--font-mono)] text-[var(--color-text-secondary)]">
-              <span className="material-symbols-outlined text-[14px] text-[var(--color-outline)] flex-shrink-0">
+            <div className="flex items-center gap-2 rounded-[var(--radius-md)] bg-[var(--color-surface-container)] px-3 py-2 text-xs font-mono text-[var(--color-text-secondary)]">
+              <span aria-hidden="true" className="material-symbols-outlined text-[14px] text-[var(--color-outline)] flex-shrink-0">
                 {toolName === 'Glob' || toolName === 'Grep' ? 'search' : 'folder_open'}
               </span>
               <span className="truncate">{details.primary}</span>
@@ -223,19 +235,23 @@ export function PermissionDialog({ sessionId, requestId, toolName, input, descri
         )}
 
         {allowRawToggle && (
-          <button
+          <Button
+            variant="link"
+            size="xs"
             onClick={() => setShowRaw(!showRaw)}
-            className="mt-2 flex cursor-pointer items-center gap-1 text-[11px] text-[var(--color-text-accent)] hover:underline"
+            className="mt-2"
+            icon={(
+              <span aria-hidden="true" className="material-symbols-outlined text-[14px]">
+                {showRaw ? 'expand_less' : 'expand_more'}
+              </span>
+            )}
           >
-            <span className="material-symbols-outlined text-[14px]">
-              {showRaw ? 'expand_less' : 'expand_more'}
-            </span>
             {showRaw ? t('permission.hideDetails') : t('permission.showFullInput')}
-          </button>
+          </Button>
         )}
 
         {allowRawToggle && showRaw && (
-          <pre className="mt-2 max-h-[220px] overflow-y-auto overflow-x-auto rounded-[var(--radius-md)] bg-[var(--color-terminal-bg)] px-3 py-2.5 font-[var(--font-mono)] text-[11px] leading-[1.3] text-[var(--color-terminal-fg)] whitespace-pre-wrap break-words">
+          <pre className="mt-2 max-h-[220px] overflow-y-auto overflow-x-auto rounded-[var(--radius-md)] bg-[var(--color-terminal-bg)] px-3 py-2.5 font-mono text-[11px] leading-[1.3] text-[var(--color-terminal-fg)] whitespace-pre-wrap break-words">
             {rawInput}
           </pre>
         )}
@@ -243,13 +259,14 @@ export function PermissionDialog({ sessionId, requestId, toolName, input, descri
 
       {/* Action buttons */}
       {isPending && (
-        <div className="flex items-center gap-2 border-t border-[var(--color-outline-variant)]/20 bg-[var(--color-surface-container-low)] px-4 py-3">
+        <div className="flex items-center gap-2 border-t border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-3">
           <Button
             variant="primary"
             size="sm"
+            aria-label={`${t('permission.allow')}: ${permissionContext}`}
             onClick={() => targetSessionId && respondToPermission(targetSessionId, requestId, true)}
             icon={
-              <span className="material-symbols-outlined text-[14px]">check</span>
+              <span aria-hidden="true" className="material-symbols-outlined text-[14px]">check</span>
             }
           >
             {t('permission.allow')}
@@ -257,9 +274,10 @@ export function PermissionDialog({ sessionId, requestId, toolName, input, descri
           <Button
             variant="ghost"
             size="sm"
+            aria-label={`${t('permission.allowForSession')}: ${permissionContext}`}
             onClick={() => targetSessionId && respondToPermission(targetSessionId, requestId, true, { rule: 'always' })}
             icon={
-              <span className="material-symbols-outlined text-[14px]">verified</span>
+              <span aria-hidden="true" className="material-symbols-outlined text-[14px]">verified</span>
             }
           >
             {t('permission.allowForSession')}
@@ -268,9 +286,10 @@ export function PermissionDialog({ sessionId, requestId, toolName, input, descri
           <Button
             variant="danger"
             size="sm"
+            aria-label={`${t('permission.deny')}: ${permissionContext}`}
             onClick={() => targetSessionId && respondToPermission(targetSessionId, requestId, false)}
             icon={
-              <span className="material-symbols-outlined text-[14px]">close</span>
+              <span aria-hidden="true" className="material-symbols-outlined text-[14px]">close</span>
             }
           >
             {t('permission.deny')}
@@ -304,15 +323,15 @@ function ExitPlanModePermissionDialog({
   return (
     <div className={`mb-4 overflow-hidden rounded-[var(--radius-lg)] border ${
       isPending
-        ? 'border-[var(--color-brand)]/60 bg-[var(--color-surface-container-lowest)]'
-        : 'border-[var(--color-outline-variant)]/40 bg-[var(--color-surface-container-low)] opacity-70'
+        ? 'border-[var(--color-primary-fixed-dim)] bg-[var(--color-surface-container-lowest)]'
+        : 'border-[var(--color-border)] bg-[var(--color-surface-container-low)] opacity-70'
     }`}>
       <div className={`flex items-center gap-3 px-4 py-3 ${
         isPending
           ? 'bg-[var(--color-surface-container)]'
           : 'bg-[var(--color-surface-container-low)]'
       }`}>
-        <div className="flex h-8 w-8 items-center justify-center rounded-[var(--radius-md)] bg-[var(--color-brand)]/15">
+        <div className="flex h-8 w-8 items-center justify-center rounded-[var(--radius-md)] bg-[var(--color-brand-soft)]">
           <span className="material-symbols-outlined text-[18px] text-[var(--color-brand)]">architecture</span>
         </div>
         <div className="min-w-0 flex-1">
@@ -321,14 +340,17 @@ function ExitPlanModePermissionDialog({
               {t('permission.planReadyTitle')}
             </span>
             {isPending ? (
-              <span className="inline-flex items-center gap-1 rounded-full bg-[var(--color-brand)]/15 px-2 py-0.5 text-[10px] font-bold uppercase text-[var(--color-brand)]">
-                <span className="h-1.5 w-1.5 rounded-full bg-[var(--color-brand)] animate-pulse-dot" />
+              <Badge
+                tone="brand"
+                icon={<StatusDot tone="brand" pulse />}
+                className="font-bold uppercase"
+              >
                 {t('permission.awaitingApproval')}
-              </span>
+              </Badge>
             ) : (
-              <span className="inline-flex items-center rounded-full bg-[var(--color-surface-container-high)] px-2 py-0.5 text-[10px] font-bold uppercase text-[var(--color-text-tertiary)]">
+              <Badge className="font-bold uppercase">
                 {t('permission.responded')}
-              </span>
+              </Badge>
             )}
           </div>
           {description ? (
@@ -337,7 +359,7 @@ function ExitPlanModePermissionDialog({
         </div>
       </div>
 
-      <div className="space-y-3 border-t border-[var(--color-outline-variant)]/20 px-4 py-3">
+      <div className="space-y-3 border-t border-[var(--color-border)] px-4 py-3">
         <PlanPreviewCard
           title={t('permission.planPreviewTitle')}
           plan={preview.plan}
@@ -352,13 +374,13 @@ function ExitPlanModePermissionDialog({
             onChange={(event) => setFeedback(event.target.value)}
             placeholder={t('permission.planFeedbackPlaceholder')}
             rows={3}
-            className="min-h-[72px] w-full resize-y rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-sm text-[var(--color-text-primary)] outline-none transition-colors placeholder:text-[var(--color-text-tertiary)] focus:border-[var(--color-brand)]/60 focus:ring-2 focus:ring-[var(--color-brand)]/15"
+            className="min-h-[72px] w-full resize-y rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-sm text-[var(--color-text-primary)] outline-none transition-colors placeholder:text-[var(--color-text-tertiary)] focus:border-[var(--color-border-focus)] focus:shadow-[var(--shadow-focus-ring)]"
           />
         ) : null}
       </div>
 
       {isPending ? (
-        <div className="flex items-center gap-2 border-t border-[var(--color-outline-variant)]/20 bg-[var(--color-surface-container-low)] px-4 py-3">
+        <div className="flex items-center gap-2 border-t border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-3">
           <Button
             variant="primary"
             size="sm"

@@ -9,6 +9,7 @@
 
 import { mkdir, readFile, writeFile } from 'fs/promises'
 import { join } from 'path'
+import { randomUUID } from 'node:crypto'
 import { z } from 'zod/v4'
 import { TEAMMATE_MESSAGE_TAG } from '../constants/xml.js'
 import { PermissionModeSchema } from '../entrypoints/sdk/coreSchemas.js'
@@ -22,8 +23,20 @@ import { getErrnoCode } from './errors.js'
 import { lazySchema } from './lazySchema.js'
 import * as lockfile from './lockfile.js'
 import { logError } from './log.js'
+import {
+  permissionUpdateSchema,
+  type PermissionUpdate,
+} from './permissions/PermissionUpdateSchema.js'
+import {
+  permissionBehaviorSchema,
+  permissionRuleValueSchema,
+} from './permissions/PermissionRule.js'
 import { jsonParse, jsonStringify } from './slowOperations.js'
-import type { BackendType } from './swarm/backends/types.js'
+import {
+  isPaneBackend,
+  type BackendType,
+  type PaneBackendType,
+} from './swarm/backends/types.js'
 import { TEAM_LEAD_NAME } from './swarm/constants.js'
 import { sanitizePathComponent } from './tasks.js'
 import { getAgentName, getTeammateColor, getTeamName } from './teammate.js'
@@ -41,12 +54,34 @@ const LOCK_OPTIONS = {
 }
 
 export type TeammateMessage = {
+  /** Stable envelope identity. Older mailbox records may not have one. */
+  id?: string
   from: string
   text: string
   timestamp: string
   read: boolean
   color?: string // Sender's assigned color (e.g., 'red', 'blue', 'green')
   summary?: string // 5-10 word summary shown as preview in the UI
+}
+
+export function createMailboxMessageId(): string {
+  return `mailbox-${randomUUID()}`
+}
+
+export function createMailboxMessage(
+  message: Omit<TeammateMessage, 'read'>,
+): TeammateMessage {
+  return {
+    ...message,
+    id: message.id ?? createMailboxMessageId(),
+    read: false,
+  }
+}
+
+export function isTrustedTeamLeaderMessage(
+  message: TeammateMessage,
+): boolean {
+  return message.from === TEAM_LEAD_NAME
 }
 
 /**
@@ -170,10 +205,7 @@ export async function writeToMailbox(
     // Re-read messages after acquiring lock to get the latest state
     const messages = await readMailbox(recipientName, teamName)
 
-    const newMessage: TeammateMessage = {
-      ...message,
-      read: false,
-    }
+    const newMessage = createMailboxMessage(message)
 
     messages.push(newMessage)
 
@@ -465,22 +497,31 @@ export type PermissionRequestMessage = {
  * Permission response message sent from leader to worker via mailbox.
  * Shape mirrors SDK ControlResponseSchema / ControlErrorResponseSchema.
  */
-export type PermissionResponseMessage =
-  | {
-      type: 'permission_response'
-      request_id: string
-      subtype: 'success'
-      response?: {
-        updated_input?: Record<string, unknown>
-        permission_updates?: unknown[]
-      }
-    }
-  | {
-      type: 'permission_response'
-      request_id: string
-      subtype: 'error'
-      error: string
-    }
+const PermissionResponseMessageSchema = lazySchema(() =>
+  z.discriminatedUnion('subtype', [
+    z.strictObject({
+      type: z.literal('permission_response'),
+      request_id: z.string().min(1),
+      subtype: z.literal('success'),
+      response: z
+        .strictObject({
+          updated_input: z.record(z.string(), z.unknown()).optional(),
+          permission_updates: z.array(permissionUpdateSchema()).optional(),
+        })
+        .optional(),
+    }),
+    z.strictObject({
+      type: z.literal('permission_response'),
+      request_id: z.string().min(1),
+      subtype: z.literal('error'),
+      error: z.string(),
+    }),
+  ]),
+)
+
+export type PermissionResponseMessage = z.infer<
+  ReturnType<typeof PermissionResponseMessageSchema>
+>
 
 /**
  * Creates a permission request message to send to the team leader
@@ -514,7 +555,7 @@ export function createPermissionResponseMessage(params: {
   subtype: 'success' | 'error'
   error?: string
   updated_input?: Record<string, unknown>
-  permission_updates?: unknown[]
+  permission_updates?: PermissionUpdate[]
 }): PermissionResponseMessage {
   if (params.subtype === 'error') {
     return {
@@ -559,10 +600,10 @@ export function isPermissionResponse(
   messageText: string,
 ): PermissionResponseMessage | null {
   try {
-    const parsed = jsonParse(messageText)
-    if (parsed && parsed.type === 'permission_response') {
-      return parsed as PermissionResponseMessage
-    }
+    const parsed = PermissionResponseMessageSchema().safeParse(
+      jsonParse(messageText),
+    )
+    if (parsed.success) return parsed.data
   } catch {
     // Not JSON or not a valid permission response
   }
@@ -594,17 +635,23 @@ export type SandboxPermissionRequestMessage = {
 /**
  * Sandbox permission response message sent from leader to worker via mailbox
  */
-export type SandboxPermissionResponseMessage = {
-  type: 'sandbox_permission_response'
-  /** ID of the request this responds to */
-  requestId: string
-  /** The host that was approved/denied */
-  host: string
-  /** Whether the connection is allowed */
-  allow: boolean
-  /** Timestamp when response was created */
-  timestamp: string
-}
+const SandboxPermissionResponseMessageSchema = lazySchema(() =>
+  z.strictObject({
+    type: z.literal('sandbox_permission_response'),
+    /** ID of the request this responds to */
+    requestId: z.string().min(1),
+    /** The host that was approved/denied */
+    host: z.string().min(1),
+    /** Whether the connection was allowed */
+    allow: z.boolean(),
+    /** Timestamp when response was created */
+    timestamp: z.string(),
+  }),
+)
+
+export type SandboxPermissionResponseMessage = z.infer<
+  ReturnType<typeof SandboxPermissionResponseMessageSchema>
+>
 
 /**
  * Creates a sandbox permission request message to send to the team leader
@@ -668,10 +715,10 @@ export function isSandboxPermissionResponse(
   messageText: string,
 ): SandboxPermissionResponseMessage | null {
   try {
-    const parsed = jsonParse(messageText)
-    if (parsed && parsed.type === 'sandbox_permission_response') {
-      return parsed as SandboxPermissionResponseMessage
-    }
+    const parsed = SandboxPermissionResponseMessageSchema().safeParse(
+      jsonParse(messageText),
+    )
+    if (parsed.success) return parsed.data
   } catch {
     // Not JSON or not a valid sandbox permission response
   }
@@ -735,13 +782,13 @@ export type ShutdownRequestMessage = z.infer<
  * Shutdown approved message sent from teammate to leader via mailbox
  */
 export const ShutdownApprovedMessageSchema = lazySchema(() =>
-  z.object({
+  z.strictObject({
     type: z.literal('shutdown_approved'),
-    requestId: z.string(),
-    from: z.string(),
+    requestId: z.string().min(1),
+    from: z.string().min(1),
     timestamp: z.string(),
     paneId: z.string().optional(),
-    backendType: z.string().optional(),
+    backendType: z.enum(['tmux', 'iterm2', 'in-process']).optional(),
   }),
 )
 
@@ -913,6 +960,50 @@ export function isShutdownApproved(
   return null
 }
 
+export type TrustedShutdownTeamMember = {
+  agentId: string
+  name: string
+  tmuxPaneId: string
+  backendType?: BackendType
+}
+
+export type TrustedShutdownApproval = {
+  approval: ShutdownApprovedMessage
+  agentId: string
+  name: string
+  paneId?: string
+  backendType?: PaneBackendType
+}
+
+/**
+ * Resolves a shutdown approval against mailbox and leader-owned team state.
+ * The mailbox envelope is the sender identity. Pane metadata from the message
+ * body is informational only and must never select the process to terminate.
+ */
+export function getTrustedShutdownApproval(
+  message: TeammateMessage,
+  teamMembers: readonly TrustedShutdownTeamMember[],
+): TrustedShutdownApproval | null {
+  const approval = isShutdownApproved(message.text)
+  if (!approval || approval.from !== message.from) return null
+
+  const member = teamMembers.find(candidate => candidate.name === message.from)
+  if (!member) return null
+
+  const backendType =
+    member.backendType && isPaneBackend(member.backendType)
+      ? member.backendType
+      : undefined
+
+  return {
+    approval,
+    agentId: member.agentId,
+    name: member.name,
+    paneId: backendType ? member.tmuxPaneId : undefined,
+    backendType,
+  }
+}
+
 /**
  * Checks if a message text contains a shutdown rejected message
  */
@@ -980,20 +1071,26 @@ export function isTaskAssignment(
  * Team permission update message sent from leader to teammates via mailbox
  * Broadcasts a permission update that applies to all teammates
  */
-export type TeamPermissionUpdateMessage = {
-  type: 'team_permission_update'
-  /** The permission update to apply */
-  permissionUpdate: {
-    type: 'addRules'
-    rules: Array<{ toolName: string; ruleContent?: string }>
-    behavior: 'allow' | 'deny' | 'ask'
-    destination: 'session'
-  }
-  /** The directory path that was allowed */
-  directoryPath: string
-  /** The tool name this applies to */
-  toolName: string
-}
+const TeamPermissionUpdateMessageSchema = lazySchema(() =>
+  z.strictObject({
+    type: z.literal('team_permission_update'),
+    /** The permission update to apply */
+    permissionUpdate: z.strictObject({
+      type: z.literal('addRules'),
+      rules: z.array(permissionRuleValueSchema()),
+      behavior: permissionBehaviorSchema(),
+      destination: z.literal('session'),
+    }),
+    /** The directory path that was allowed */
+    directoryPath: z.string(),
+    /** The tool name this applies to */
+    toolName: z.string(),
+  }),
+)
+
+export type TeamPermissionUpdateMessage = z.infer<
+  ReturnType<typeof TeamPermissionUpdateMessageSchema>
+>
 
 /**
  * Checks if a message text contains a team permission update
@@ -1002,10 +1099,10 @@ export function isTeamPermissionUpdate(
   messageText: string,
 ): TeamPermissionUpdateMessage | null {
   try {
-    const parsed = jsonParse(messageText)
-    if (parsed && parsed.type === 'team_permission_update') {
-      return parsed as TeamPermissionUpdateMessage
-    }
+    const parsed = TeamPermissionUpdateMessageSchema().safeParse(
+      jsonParse(messageText),
+    )
+    if (parsed.success) return parsed.data
   } catch {
     // Not JSON or not a valid team permission update
   }

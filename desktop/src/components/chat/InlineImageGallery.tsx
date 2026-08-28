@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react'
 import { ImageGalleryModal } from './ImageGalleryModal'
-import { getBaseUrl } from '../../api/client'
+import { localImageFileUrl } from '../../lib/attachmentImages'
 import { extractAssistantOutputTargets } from '../../lib/assistantOutputTargets'
-import { previewFsUrl } from '../../lib/handlePreviewLink'
+import { isAbsoluteLocalPath, previewFsUrl } from '../../lib/handlePreviewLink'
 import { getServerBaseUrl } from '../../lib/desktopRuntime'
 
 const IMAGE_EXTENSIONS = /\.(png|jpe?g|gif|webp|svg|bmp|avif|ico)$/i
@@ -30,10 +30,6 @@ export function extractImagePaths(text: string): string[] {
   return paths
 }
 
-function fileUrl(filePath: string): string {
-  return `${getBaseUrl()}/api/filesystem/file?path=${encodeURIComponent(filePath)}`
-}
-
 function fileName(filePath: string): string {
   return filePath.split('/').pop() || filePath
 }
@@ -52,16 +48,34 @@ type Props = {
    */
   sessionId?: string
   workDir?: string | null
+  changedFiles?: string[]
+  /** ImageGen outputs already have a dedicated placeholder/result card. */
+  suppressManagedGeneratedImages?: boolean
 }
 
-export function InlineImageGallery({ text, sessionId, workDir }: Props) {
+export function InlineImageGallery({ text, sessionId, workDir, changedFiles, suppressManagedGeneratedImages = false }: Props) {
   const [activeIndex, setActiveIndex] = useState<number | null>(null)
 
-  const imagePaths = useMemo(() => extractImagePaths(text), [text])
+  // Absolute paths are explicitly written out in the prose (not guessed), and the
+  // turn checkpoint can't see files written via Bash or outside its tracking scope
+  // — so they keep the legacy behavior and render unconditionally. changedFiles
+  // only steers the relative-target extraction below, where mentions genuinely
+  // need to be reconciled against what the turn actually wrote.
+  const imagePaths = useMemo(
+    () => extractImagePaths(text).filter(
+      (imagePath) => !suppressManagedGeneratedImages || !isManagedGeneratedImagePath(imagePath),
+    ),
+    [suppressManagedGeneratedImages, text],
+  )
+
+  // An empty changedFiles only means "no TRACKED file changed" (Bash writes are
+  // invisible to the checkpoint), so it is treated as "no evidence" and falls
+  // back to text-only extraction instead of filtering every mention away.
+  const changedFileEvidence = changedFiles !== undefined && changedFiles.length === 0 ? undefined : changedFiles
 
   const images = useMemo<GalleryImage[]>(() => {
     // 1. Absolute paths (legacy behavior) — served via /api/filesystem/file.
-    const absolute: GalleryImage[] = imagePaths.map((p) => ({ src: fileUrl(p), name: fileName(p) }))
+    const absolute: GalleryImage[] = imagePaths.map((p) => ({ src: localImageFileUrl(p), name: fileName(p) }))
 
     if (!sessionId) {
       return absolute
@@ -71,7 +85,7 @@ export function InlineImageGallery({ text, sessionId, workDir }: Props) {
     //    build a /preview-fs URL. Reuses the sandboxed target extractor instead of
     //    a bespoke relative-path regex.
     const base = getServerBaseUrl()
-    const relativeTargets = extractAssistantOutputTargets(text, { workDir }).filter(
+    const relativeTargets = extractAssistantOutputTargets(text, { workDir, changedFiles: changedFileEvidence }).filter(
       (target) => target.kind === 'image',
     )
 
@@ -88,7 +102,9 @@ export function InlineImageGallery({ text, sessionId, workDir }: Props) {
       if (absoluteNames.has(name)) {
         continue
       }
-      const src = previewFsUrl(base, sessionId, relPath)
+      const src = isAbsoluteLocalPath(relPath)
+        ? localImageFileUrl(relPath)
+        : previewFsUrl(base, sessionId, relPath)
       if (seenSrc.has(src)) {
         continue
       }
@@ -97,7 +113,7 @@ export function InlineImageGallery({ text, sessionId, workDir }: Props) {
     }
 
     return [...absolute, ...relative]
-  }, [imagePaths, sessionId, text, workDir])
+  }, [changedFileEvidence, imagePaths, sessionId, text, workDir])
 
   if (images.length === 0) return null
 
@@ -114,7 +130,7 @@ export function InlineImageGallery({ text, sessionId, workDir }: Props) {
               key={img.src}
               type="button"
               onClick={() => setActiveIndex(i)}
-              className="group/image relative overflow-hidden rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] text-left shadow-sm transition-all hover:shadow-md hover:border-[var(--color-brand)]/40"
+              className="group/image relative overflow-hidden rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface-container-low)] text-left shadow-[var(--shadow-card)] transition-[border-color,box-shadow] duration-150 hover:shadow-[var(--shadow-composer)] hover:border-[var(--color-primary-fixed-dim)]"
             >
               <img
                 src={img.src}
@@ -153,4 +169,8 @@ export function InlineImageGallery({ text, sessionId, workDir }: Props) {
       )}
     </>
   )
+}
+
+function isManagedGeneratedImagePath(imagePath: string): boolean {
+  return imagePath.replaceAll('\\', '/').includes('/.claude/cc-haha/generated-images/')
 }

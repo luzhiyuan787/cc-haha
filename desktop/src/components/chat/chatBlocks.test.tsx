@@ -2,10 +2,12 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { ThinkingBlock } from './ThinkingBlock'
 import { ToolCallBlock } from './ToolCallBlock'
+import { ToolCallGroup } from './ToolCallGroup'
 import { PermissionDialog } from './PermissionDialog'
 import { useChatStore } from '../../stores/chatStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useTabStore } from '../../stores/tabStore'
+import type { UIMessage } from '../../types/chat'
 
 describe('chat blocks', () => {
   beforeEach(() => {
@@ -18,7 +20,11 @@ describe('chat blocks', () => {
     const { container } = render(<ThinkingBlock content="this is a long internal reasoning trace" isActive />)
 
     expect(screen.getByText(/Thinking/)).toBeTruthy()
-    expect(container.textContent).not.toContain('this is a long internal reasoning trace')
+    // The row previews the reasoning; what stays shut is the full block. A
+    // label with nothing beside it was the old standalone form, and it made the
+    // opening thought of a turn — usually the substantial one — the least
+    // informative thing on screen.
+    expect(container.querySelector('[data-thinking-content="expanded"]')).toBeNull()
     expect(container.querySelector('.thinking-cursor')).toBeNull()
   })
 
@@ -31,12 +37,285 @@ describe('chat blocks', () => {
     expect(container.querySelector('.thinking-cursor')).toBeNull()
   })
 
+  it('allocates one live image placeholder per requested output', () => {
+    render(
+      <ToolCallBlock
+        toolName="ImageGen"
+        input={{ prompt: 'Two fox poster variations', count: 2, aspect_ratio: '16:9' }}
+        isPending
+      />,
+    )
+
+    expect(screen.getAllByTestId('image-generation-slot')).toHaveLength(2)
+    expect(screen.getByRole('status').getAttribute('aria-busy')).toBe('true')
+    expect(screen.getAllByText('Generating 2 images')).toHaveLength(2)
+  })
+
+  it('labels a referenced-image turn as editing while keeping output placeholders', () => {
+    render(
+      <ToolCallBlock
+        toolName="ImageEdit"
+        input={{
+          prompt: 'Change only the scarf color',
+          count: 2,
+          referenced_image_paths: ['/staged/fox.png'],
+        }}
+        isPending
+      />,
+    )
+
+    expect(screen.getAllByTestId('image-generation-slot')).toHaveLength(2)
+    expect(screen.getAllByText('Editing 2 image variations')).toHaveLength(2)
+  })
+
+  it('keeps image placeholders visible when deferred tool search shares the group', () => {
+    const toolCalls: Array<Extract<UIMessage, { type: 'tool_use' }>> = [
+      {
+        id: 'search-use',
+        type: 'tool_use',
+        toolName: 'ToolSearch',
+        toolUseId: 'search-1',
+        input: { query: 'image generation' },
+        timestamp: 1,
+      },
+      {
+        id: 'image-use',
+        type: 'tool_use',
+        toolName: 'ImageGen',
+        toolUseId: 'image-1',
+        input: { prompt: 'Two fox posters', count: 2 },
+        timestamp: 2,
+        isPending: true,
+      },
+    ]
+
+    render(
+      <ToolCallGroup
+        toolCalls={toolCalls}
+        resultMap={new Map()}
+        childToolCallsByParent={new Map()}
+        agentTaskNotifications={{}}
+        isStreaming
+      />,
+    )
+
+    expect(screen.getAllByTestId('image-generation-slot')).toHaveLength(2)
+    expect(screen.queryByRole('button', { name: /ToolSearch \(1\), ImageGen \(1\)/ })).toBeNull()
+  })
+
+  it('keeps image editing outside a mixed deferred-tool summary', () => {
+    const toolCalls: Array<Extract<UIMessage, { type: 'tool_use' }>> = [
+      {
+        id: 'search-use',
+        type: 'tool_use',
+        toolName: 'ToolSearch',
+        toolUseId: 'search-1',
+        input: { query: 'image editing' },
+        timestamp: 1,
+      },
+      {
+        id: 'edit-use',
+        type: 'tool_use',
+        toolName: 'ImageEdit',
+        toolUseId: 'edit-1',
+        input: {
+          prompt: 'Change only the scarf color',
+          count: 1,
+          referenced_image_paths: ['/staged/fox.png'],
+        },
+        timestamp: 2,
+        isPending: true,
+      },
+    ]
+
+    render(
+      <ToolCallGroup
+        toolCalls={toolCalls}
+        resultMap={new Map()}
+        childToolCallsByParent={new Map()}
+        agentTaskNotifications={{}}
+        isStreaming
+      />,
+    )
+
+    expect(screen.getAllByTestId('image-generation-slot')).toHaveLength(1)
+    expect(screen.queryByRole('button', { name: /ToolSearch \(1\), ImageEdit \(1\)/ })).toBeNull()
+  })
+
+  it('keeps post-image thinking visible and live after the image result arrives', () => {
+    const imageCall: Extract<UIMessage, { type: 'tool_use' }> = {
+      id: 'image-use',
+      type: 'tool_use',
+      toolName: 'ImageGen',
+      toolUseId: 'image-1',
+      input: { prompt: 'A quiet mountain study' },
+      timestamp: 1,
+    }
+    const thinking: Extract<UIMessage, { type: 'thinking' }> = {
+      id: 'thinking-after-image',
+      type: 'thinking',
+      content: 'Check whether the generated image matches the requested composition.',
+      timestamp: 3,
+    }
+
+    render(
+      <ToolCallGroup
+        toolCalls={[imageCall]}
+        steps={[
+          { kind: 'tool', toolCall: imageCall },
+          { kind: 'thinking', message: thinking },
+        ]}
+        resultMap={new Map([[
+          'image-1',
+          {
+            id: 'image-result',
+            type: 'tool_result' as const,
+            toolUseId: 'image-1',
+            content: JSON.stringify({ type: 'image_generation_result', images: [] }),
+            isError: false,
+            timestamp: 2,
+          },
+        ]])}
+        childToolCallsByParent={new Map()}
+        agentTaskNotifications={{}}
+        activeThinkingId="thinking-after-image"
+      />,
+    )
+
+    const thinkingRow = screen.getByRole('button', { name: /Thinking/ })
+    expect(thinkingRow).toBeTruthy()
+    expect(thinkingRow.querySelector('.thinking-dots')).not.toBeNull()
+  })
+
+  it('replaces every image placeholder with the saved tool result', () => {
+    const content = JSON.stringify({
+      type: 'image_generation_result',
+      providerId: 'grok-official',
+      providerKind: 'grok_oauth',
+      model: 'grok-imagine-image-quality',
+      prompt: 'Two fox poster variations',
+      durationMs: 1200,
+      images: [
+        { path: '/tmp/generated-one.jpg', mimeType: 'image/jpeg' },
+        { path: '/tmp/generated-two.jpg', mimeType: 'image/jpeg' },
+      ],
+    })
+
+    render(
+      <ToolCallBlock
+        toolName="ImageGen"
+        input={{ prompt: 'Two fox poster variations', count: 2 }}
+        result={{ content, isError: false }}
+      />,
+    )
+
+    const images = screen.getAllByRole('img')
+    expect(images).toHaveLength(2)
+    expect(images[0]?.getAttribute('src')).toContain(encodeURIComponent('/tmp/generated-one.jpg'))
+    expect(images[1]?.getAttribute('src')).toContain(encodeURIComponent('/tmp/generated-two.jpg'))
+    expect(screen.queryByRole('status')).toBeNull()
+
+    const block = screen.getByTestId('image-generation-block')
+    expect(block.getAttribute('data-layout')).toBe('thumbnail-rail')
+    expect(block.className).not.toContain('border')
+    expect(screen.queryByText('ImageGen')).toBeNull()
+    expect(screen.queryByText('grok-imagine-image-quality')).toBeNull()
+    expect(screen.queryByText('grok-official')).toBeNull()
+  })
+
+  it('keeps concurrent image calls in one thumbnail rail and opens the completed set as one gallery', () => {
+    const toolCalls: Array<Extract<UIMessage, { type: 'tool_use' }>> = Array.from(
+      { length: 4 },
+      (_, index) => ({
+        id: `image-use-${index + 1}`,
+        type: 'tool_use' as const,
+        toolName: 'ImageGen',
+        toolUseId: `image-${index + 1}`,
+        input: { prompt: `Fox poster ${index + 1}`, count: 1 },
+        timestamp: index + 1,
+        isPending: true,
+      }),
+    )
+    const childToolCallsByParent = new Map<
+      string,
+      Extract<UIMessage, { type: 'tool_use' }>[]
+    >()
+    const { rerender } = render(
+      <ToolCallGroup
+        toolCalls={toolCalls}
+        resultMap={new Map()}
+        childToolCallsByParent={childToolCallsByParent}
+        agentTaskNotifications={{}}
+        isStreaming
+      />,
+    )
+
+    const rail = screen.getByTestId('image-generation-rail')
+    expect(rail.firstElementChild?.className).toContain('grid-flow-col')
+    expect(screen.getAllByTestId('image-generation-slot')).toHaveLength(4)
+    expect(screen.getAllByText('Generating 4 images')).toHaveLength(2)
+
+    const resultMap = new Map<string, Extract<UIMessage, { type: 'tool_result' }>>(
+      toolCalls.map((toolCall, index) => [
+        toolCall.toolUseId,
+        {
+          id: `image-result-${index + 1}`,
+          type: 'tool_result' as const,
+          toolUseId: toolCall.toolUseId,
+          content: JSON.stringify({
+            type: 'image_generation_result',
+            providerId: 'openai-official',
+            providerKind: 'openai_oauth',
+            model: 'gpt-image-2',
+            prompt: `Fox poster ${index + 1}`,
+            durationMs: 1200 + index,
+            images: [{ path: `/tmp/generated-${index + 1}.png`, mimeType: 'image/png' }],
+          }),
+          isError: false,
+          timestamp: 20 + index,
+        },
+      ]),
+    )
+
+    rerender(
+      <ToolCallGroup
+        toolCalls={toolCalls.map((toolCall) => ({ ...toolCall, isPending: false }))}
+        resultMap={resultMap}
+        childToolCallsByParent={childToolCallsByParent}
+        agentTaskNotifications={{}}
+      />,
+    )
+
+    const completedImages = screen.getAllByRole('img')
+    expect(completedImages).toHaveLength(4)
+    expect(screen.getAllByTestId('image-generation-slot')).toHaveLength(4)
+    fireEvent.click(completedImages[2]!)
+    expect(screen.getByText('3 / 4')).toBeTruthy()
+  })
+
+  it('keeps every requested slot visible when image generation fails', () => {
+    render(
+      <ToolCallBlock
+        toolName="ImageGen"
+        input={{ prompt: 'Two fox poster variations', count: 2 }}
+        result={{ content: 'Provider quota exhausted', isError: true }}
+      />,
+    )
+
+    const slots = screen.getAllByTestId('image-generation-slot')
+    expect(slots).toHaveLength(2)
+    expect(slots.every((slot) => slot.getAttribute('data-error') === 'true')).toBe(true)
+    expect(screen.getAllByText('Provider quota exhausted')).toHaveLength(2)
+  })
+
   it('renders thinking content as markdown only after expanding', () => {
     const { container } = render(<ThinkingBlock content={'**important**\n\n- item one'} />)
 
-    expect(container.textContent).not.toContain('important')
+    // The preview is plain text with the markdown stripped — never rendered
+    // markup, which on one line would show as literal `**` / `-` noise.
     expect(container.querySelector('strong')).toBeNull()
     expect(container.querySelector('li')).toBeNull()
+    expect(container.textContent).not.toContain('item one')
 
     fireEvent.click(screen.getByRole('button', { name: /Thought/ }))
 
@@ -48,8 +327,10 @@ describe('chat blocks', () => {
     const content = Array.from({ length: 12 }, (_, index) => `line-${index + 1}`).join('\n')
     const { container } = render(<ThinkingBlock content={content} />)
 
-    expect(container.textContent).not.toContain('line-1')
+    // Collapsed shows the opening line only; the body stays shut.
+    expect(container.textContent).toContain('line-1')
     expect(container.textContent).not.toContain('line-11')
+    expect(container.querySelector('[data-thinking-content="expanded"]')).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: /Thought/ }))
 
@@ -76,7 +357,38 @@ describe('chat blocks', () => {
     expect(container.textContent).not.toContain('const answer = 42')
   })
 
-  it('does not surface bash stdout in the transcript preview', () => {
+  it('keeps expanded row input and output inline instead of nesting detail cards', () => {
+    const { container } = render(
+      <ToolCallBlock
+        chrome="row"
+        toolName="TaskCreate"
+        input={{ subject: 'Inspect activity UI', description: 'Find the nested card treatment' }}
+        result={{ content: 'Task #1 created successfully', isError: false }}
+      />,
+    )
+
+    const row = container.querySelector('[data-tool-call-chrome="row"]')
+    const disclosure = row?.querySelector<HTMLButtonElement>('[data-chat-disclosure="true"]')
+    expect(disclosure).toBeTruthy()
+    fireEvent.click(disclosure!)
+
+    const details = container.querySelector('[data-tool-call-details="inline"]')
+    expect(details).toBeTruthy()
+    expect(details?.className).not.toContain('rounded-')
+
+    const viewers = [...container.querySelectorAll('[data-code-viewer-chrome]')]
+    expect(viewers).toHaveLength(2)
+    expect(viewers.every((viewer) => viewer.getAttribute('data-code-viewer-chrome') === 'embedded')).toBe(true)
+    // Each section owns one compact header and one copy action. The previous
+    // nested Tool Output -> PLAINTEXT and Tool Input -> JSON cards doubled both.
+    expect(screen.getAllByRole('button', { name: 'Copy' })).toHaveLength(2)
+    expect((details?.textContent?.match(/Tool Output/g) ?? [])).toHaveLength(1)
+    expect((details?.textContent?.match(/Tool Input/g) ?? [])).toHaveLength(1)
+  })
+
+  // #1149: bash stdout used to be dropped entirely — the card showed the command
+  // three times and the result zero times. Output is now echoed into the terminal.
+  it('echoes bash stdout into the terminal card when expanded', () => {
     const { container } = render(
       <ToolCallBlock
         toolName="Bash"
@@ -91,7 +403,282 @@ describe('chat blocks', () => {
     fireEvent.click(screen.getByRole('button'))
 
     expect(container.textContent).toContain('ls -la')
-    expect(container.textContent).not.toContain('file-a')
+    expect(container.textContent).toContain('file-a')
+    expect(container.textContent).toContain('file-c')
+  })
+
+  // The whole point of #1149 is that things stop appearing twice. Deleting the
+  // shell guard in getVisibleResultText makes BOTH the terminal body and the
+  // generic result box render the same stdout, and every `toContain` assertion
+  // stays green through it — so assert the count, not the presence.
+  it('renders shell stdout exactly once', () => {
+    // Multi-line on purpose: the collapsed header summarises multi-line output as
+    // "N lines output" rather than echoing it, so the body is the only place the
+    // text may legitimately appear. (Single-line output DOES also show in the
+    // header — that is the deliberate "see the result without expanding" affordance.)
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Bash"
+        input={{ command: 'ls -la', description: 'List files' }}
+        result={{ content: 'UNIQUE_STDOUT_MARKER\nsecond line', isError: false }}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button'))
+
+    const occurrences = (container.textContent?.match(/UNIQUE_STDOUT_MARKER/g) ?? []).length
+    expect(occurrences).toBe(1)
+  })
+
+  it('renders a shell error body exactly once, and never truncates it', () => {
+    // #625 made full tool error output visible; the success-path 12-line window
+    // must not quietly start applying to failures.
+    const error = Array.from({ length: 25 }, (_, index) => `detail line ${index + 1}`).join('\n')
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Bash"
+        input={{ command: 'make', description: 'Build' }}
+        result={{ content: error, isError: true }}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button'))
+
+    // Scoped to the output block, not the whole card: the header also carries a
+    // one-line summary of the failure, which is not a duplicated body. Counting
+    // over `container.textContent` only ever passed by accident — the old
+    // material glyph rendered the literal text "error" straight after the
+    // summary, and that killed the `\b` the regex depends on.
+    const errorBodies = [...container.querySelectorAll('pre')].filter(
+      (block) => block.textContent?.includes('detail line 1'),
+    )
+    expect(errorBodies).toHaveLength(1)
+    expect(errorBodies[0]?.textContent).toContain('detail line 25')
+    expect(screen.queryByRole('button', { name: /more lines/ })).toBeNull()
+  })
+
+  it('drops the duplicate Tool Input JSON when the command is already echoed', () => {
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Bash"
+        input={{ command: 'ls -la', description: 'List files' }}
+        result={{ content: 'file-a', isError: false }}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button'))
+
+    expect(container.textContent).toContain('ls -la')
+    expect(container.textContent).not.toContain('Tool Input')
+  })
+
+  // ~20% of real Bash calls carry a `timeout`. Suppressing the JSON block only
+  // when command+description were the ONLY keys put the command back on screen
+  // three times for exactly those calls — the reported symptom, unfixed.
+  it('shows the extra shell input keys without re-printing the command', () => {
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Bash"
+        input={{ command: 'sleep 30', description: 'Wait', timeout: 60000 }}
+        result={{ content: 'done', isError: false }}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button'))
+
+    expect(container.textContent).toContain('Tool Input')
+    expect(container.textContent).toContain('timeout')
+    // The command appears once (the `$` line), never inside the JSON block.
+    expect(container.querySelector('[data-code-viewer-content]')?.textContent)
+      .not.toContain('sleep 30')
+  })
+
+  // The CLI substitutes `(<Tool> completed with no output)` for empty results
+  // (src/utils/toolResultStorage.ts, inc-4586) — the desktop never sees ''. Real
+  // payload here, not a hand-built empty string.
+  it('reports no output for a command that printed nothing', () => {
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Bash"
+        input={{ command: 'mv a b', description: 'Move' }}
+        result={{ content: '(Bash completed with no output)', isError: false }}
+      />,
+    )
+
+    // Visible collapsed, so the row never reads as "never ran".
+    expect(container.textContent).toContain('No output')
+    // The model-facing marker itself must never reach the user.
+    expect(container.textContent).not.toContain('completed with no output')
+
+    fireEvent.click(screen.getByRole('button'))
+
+    expect(container.textContent).toContain('mv a b')
+    expect(container.textContent).toContain('No output')
+    expect(container.textContent).not.toContain('completed with no output')
+  })
+
+  it('does not label an image-only shell result as having no output', () => {
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Bash"
+        input={{ command: 'python plot.py', description: 'Plot' }}
+        result={{ content: [{ type: 'image', source: { data: 'x' } }], isError: false }}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button'))
+
+    // Nothing to print is not the same as the command printing nothing.
+    expect(container.textContent).toContain('python plot.py')
+    expect(container.textContent).not.toContain('No output')
+  })
+
+  it('keeps rendering the error body for a shell call whose input lacks a command', () => {
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Bash"
+        input={{}}
+        result={{ content: 'InputValidationError: command is required', isError: true }}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button'))
+
+    // Without the terminal card there is no echo, so the generic result box has
+    // to take over — otherwise the expanded panel is blank.
+    expect(container.textContent).toContain('InputValidationError: command is required')
+  })
+
+  it('does not claim "no output" for a shell call that has not finished', () => {
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Bash"
+        input={{ command: 'sleep 5', description: 'Wait' }}
+        isPending
+      />,
+    )
+
+    // A pending call has no result at all — that is not the same as a result
+    // whose output happened to be empty.
+    expect(container.textContent).not.toContain('No output')
+    expect(container.textContent).toContain('Preparing tool')
+  })
+
+  it('echoes PowerShell output through the same shell path', () => {
+    const { container } = render(
+      <ToolCallBlock
+        toolName="PowerShell"
+        input={{ command: 'Get-ChildItem', description: 'List files' }}
+        result={{ content: 'Mode  Name\n----  ----', isError: false }}
+      />,
+    )
+
+    // Collapsed header must say what the command is for, same as Bash — a
+    // real-machine walkthrough caught PowerShell falling through to a bare tool
+    // name, and the row still has to carry more than that.
+    expect(container.textContent).toContain('List files')
+
+    fireEvent.click(screen.getByRole('button'))
+
+    // The command itself is not lost, it moves to the terminal where it ran.
+    expect(container.textContent).toContain('Get-ChildItem')
+    expect(container.textContent).toContain('Mode  Name')
+    expect(container.textContent).not.toContain('Tool Input')
+  })
+
+  // Read stays out of the shell path: file content is not command output, and it
+  // is by far the bulkiest tool output — see #1149.
+  it('keeps Read file contents suppressed', () => {
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Read"
+        input={{ file_path: '/tmp/example.ts' }}
+        result={{ content: 'const answer = 42\nconsole.log(answer)', isError: false }}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button'))
+
+    expect(container.textContent).not.toContain('const answer = 42')
+    expect(container.textContent).not.toContain('console.log(answer)')
+  })
+
+  it('collapses long shell output to a head window and expands on demand', () => {
+    const output = Array.from({ length: 40 }, (_, index) => `line-${index + 1}`).join('\n')
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Bash"
+        input={{ command: 'seq 40', description: 'Count' }}
+        result={{ content: output, isError: false }}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button'))
+
+    // Head kept, tail withheld behind an explicit affordance.
+    expect(container.textContent).toContain('line-1')
+    expect(container.textContent).toContain('line-12')
+    expect(container.textContent).not.toContain('line-13')
+
+    fireEvent.click(screen.getByRole('button', { name: /28 more lines/ }))
+
+    expect(container.textContent).toContain('line-40')
+
+    // Regression: the toggle used to render only while lines were hidden, so
+    // expanding removed the control and the output could never be collapsed.
+    const collapseButton = screen.getByRole('button', { name: /Show less/ })
+    fireEvent.click(collapseButton)
+
+    expect(container.textContent).toContain('line-12')
+    expect(container.textContent).not.toContain('line-13')
+  })
+
+  it('renders shell output as plain preformatted text, not through CodeViewer', () => {
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Bash"
+        input={{ command: 'ls', description: 'List' }}
+        result={{ content: 'file-a\nfile-b', isError: false }}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button'))
+
+    // Shell output has no language; routing it through CodeViewer would tokenize
+    // it twice (Prism, then Shiki) for nothing.
+    expect(container.querySelector('[data-shell-output]')).toBeTruthy()
+    expect(container.querySelector('[data-highlight-engine]')).toBeNull()
+  })
+
+  it('resolves terminal control sequences instead of printing them', () => {
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Bash"
+        input={{ command: 'pip install x', description: 'Install' }}
+        result={{ content: 'Downloading\r 10%\r100%\n\x1b[2K\x1b[1ADone', isError: false }}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button'))
+
+    const output = container.querySelector('[data-shell-output]')?.textContent ?? ''
+    expect(output).toContain('100%')
+    expect(output).toContain('Done')
+    expect(output).not.toContain('[2K')
+    expect(output).not.toContain('Downloading')
+  })
+
+  it('shows the tool duration once a result has landed', () => {
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Bash"
+        input={{ command: 'ls', description: 'List' }}
+        result={{ content: 'a', isError: false }}
+        durationMs={1598}
+      />,
+    )
+
+    expect(container.textContent).toContain('1.6s')
   })
 
   it('shows pending Write tool calls while input is still streaming', () => {
@@ -387,5 +974,61 @@ describe('chat blocks', () => {
     // react-diff-viewer-continued uses styled-components tables that don't
     // fully render in jsdom, so we verify the DiffViewer wrapper is mounted
     expect(container.querySelector('[class*="rounded-[var(--radius-lg)]"]')).toBeTruthy()
+  })
+
+  it('keeps every concurrent permission request actionable', () => {
+    const firstPermission = {
+      requestId: 'perm-read-1',
+      toolName: 'Read',
+      toolUseId: 'tool-read-1',
+      input: { file_path: '/outside/one.ts' },
+    }
+    const secondPermission = {
+      requestId: 'perm-read-2',
+      toolName: 'Read',
+      toolUseId: 'tool-read-2',
+      input: { file_path: '/outside/two.ts' },
+    }
+    useChatStore.setState({
+      sessions: {
+        'active-tab': {
+          messages: [],
+          chatState: 'permission_pending',
+          connectionState: 'connected',
+          streamingText: '',
+          streamingToolInput: '',
+          activeToolUseId: null,
+          activeToolName: null,
+          activeThinkingId: null,
+          pendingPermission: secondPermission,
+          pendingPermissions: {
+            [firstPermission.requestId]: firstPermission,
+            [secondPermission.requestId]: secondPermission,
+          },
+          pendingComputerUsePermission: null,
+          tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
+          elapsedSeconds: 0,
+          statusVerb: '',
+          slashCommands: [],
+          agentTaskNotifications: {},
+          elapsedTimer: null,
+        },
+      },
+    })
+
+    render(
+      <>
+        <PermissionDialog {...firstPermission} />
+        <PermissionDialog {...secondPermission} />
+      </>,
+    )
+
+    expect(screen.getAllByText('Awaiting approval')).toHaveLength(2)
+    expect(screen.getByRole('group', { name: /\/outside\/one\.ts/ })).toBeTruthy()
+    expect(screen.getByRole('group', { name: /\/outside\/two\.ts/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Allow: /outside/one.ts' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Allow: /outside/two.ts' })).toBeTruthy()
+    expect(screen.queryByText('Responded')).toBeNull()
   })
 })

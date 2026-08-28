@@ -54,6 +54,7 @@ import {
   createToolUseSummaryMessage,
   createMicrocompactBoundaryMessage,
   stripSignatureBlocks,
+  stripSignatureBlocksAfterModelChange,
 } from './utils/messages.js'
 import { generateToolUseSummary } from './services/toolUseSummary/toolUseSummaryGenerator.js'
 import { prependUserContext, appendSystemContext } from './utils/api.js'
@@ -107,7 +108,6 @@ import type { Terminal, Continue } from './query/transitions.js'
 import { feature } from 'bun:bundle'
 import {
   getCurrentTurnTokenBudget,
-  getSessionId,
   getTurnOutputTokens,
   incrementBudgetContinuationCount,
 } from './bootstrap/state.js'
@@ -579,6 +579,7 @@ async function* queryLoop(
         permissionMode === 'plan' &&
         doesMostRecentAssistantMessageExceed200k(messagesForQuery),
     })
+    messagesForQuery = stripSignatureBlocksAfterModelChange(messagesForQuery, currentModel)
 
     queryCheckpoint('query_setup_end')
 
@@ -699,6 +700,8 @@ async function* queryLoop(
               ),
               queryTracking,
               effortValue: appState.effortValue,
+              effortValueOverridesEnv:
+                toolUseContext.options.effortValueOverridesEnv,
               advisorModel: appState.advisorModel,
               skipCacheWrite,
               agentId: toolUseContext.agentId,

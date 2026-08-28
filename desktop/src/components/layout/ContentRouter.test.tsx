@@ -26,6 +26,10 @@ vi.mock('../../pages/Settings', () => ({
   Settings: () => <div data-testid="settings-page" />,
 }))
 
+vi.mock('../../pages/Market', () => ({
+  Market: () => <div data-testid="market-page" />,
+}))
+
 vi.mock('../../pages/TerminalSettings', () => ({
   TerminalSettings: ({ active, cwd, onNewTerminal, runtimeId, testId }: { active: boolean; cwd?: string; onNewTerminal: () => void; runtimeId?: string; testId: string }) => (
     <div data-active={active ? 'true' : 'false'} data-cwd={cwd ?? ''} data-runtime-id={runtimeId ?? ''} data-testid={testId}>
@@ -35,11 +39,25 @@ vi.mock('../../pages/TerminalSettings', () => ({
 }))
 
 vi.mock('../../pages/TraceSession', () => ({
-  TraceSession: ({ sessionId }: { sessionId: string }) => <div data-testid="trace-session">trace:{sessionId}</div>,
+  TraceSession: ({ sessionId, onBack }: { sessionId: string; onBack?: () => void }) => (
+    <div data-testid="trace-session">
+      trace:{sessionId}
+      {onBack ? <button type="button" onClick={onBack}>back</button> : null}
+    </div>
+  ),
 }))
 
 vi.mock('../../pages/TraceList', () => ({
   TraceList: () => <div data-testid="trace-list" />,
+}))
+
+vi.mock('../../pages/SubagentRunPage', () => ({
+  SubagentRunPage: ({ sourceSessionId, taskId, toolUseId, title }: { sourceSessionId: string; taskId?: string; toolUseId: string; title: string }) => (
+    <div data-testid="subagent-run-page">{sourceSessionId}:{toolUseId}:{taskId}:{title}</div>
+  ),
+  TeamMemberRunPage: ({ tabId, leadSessionId, agentId, title }: { tabId: string; leadSessionId: string; agentId: string; title: string }) => (
+    <div data-testid="team-member-run-page">{tabId}:{leadSessionId}:{agentId}:{title}</div>
+  ),
 }))
 
 vi.mock('../workbench/WorkbenchTab', () => ({
@@ -49,13 +67,15 @@ vi.mock('../workbench/WorkbenchTab', () => ({
 }))
 
 import { ContentRouter } from './ContentRouter'
-import { useTabStore } from '../../stores/tabStore'
+import { MARKET_TAB_ID, SETTINGS_TAB_ID, useTabStore } from '../../stores/tabStore'
+import { useUIStore } from '../../stores/uiStore'
 
 describe('ContentRouter tab surfaces', () => {
   afterEach(() => {
     cleanup()
     previewBridgeMock.close.mockClear()
     useTabStore.setState({ tabs: [], activeTabId: null })
+    useUIStore.setState({ pendingSettingsTab: null })
   })
 
   it('renders the active terminal tab as main content', () => {
@@ -137,6 +157,30 @@ describe('ContentRouter tab surfaces', () => {
     expect(screen.queryByTestId('active-session')).not.toBeInTheDocument()
   })
 
+  it('walks a trace tab back to the list and closes the tab behind it', () => {
+    useTabStore.setState({
+      tabs: [
+        { sessionId: 'session-1', title: 'Chat', type: 'session', status: 'idle' },
+        {
+          sessionId: '__trace__session-1',
+          title: 'Chat',
+          type: 'trace',
+          status: 'idle',
+          traceSessionId: 'session-1',
+        },
+      ],
+      activeTabId: '__trace__session-1',
+    })
+
+    render(<ContentRouter />)
+    fireEvent.click(screen.getByRole('button', { name: 'back' }))
+
+    const { tabs, activeTabId } = useTabStore.getState()
+    expect(activeTabId).toBe(SETTINGS_TAB_ID)
+    expect(tabs.some((tab) => tab.sessionId === '__trace__session-1')).toBe(false)
+    expect(useUIStore.getState().pendingSettingsTab).toBe('trace')
+  })
+
   it('renders the trace list tab without mounting the chat session surface', () => {
     useTabStore.setState({
       tabs: [{
@@ -151,6 +195,83 @@ describe('ContentRouter tab surfaces', () => {
     render(<ContentRouter />)
 
     expect(screen.getByTestId('trace-list')).toBeInTheDocument()
+    expect(screen.queryByTestId('active-session')).not.toBeInTheDocument()
+  })
+
+  it('renders SubAgent run tabs', () => {
+    useTabStore.setState({
+      tabs: [{
+        sessionId: '__subagent__session-1__tool-1',
+        title: 'Kuhn',
+        type: 'subagent',
+        status: 'idle',
+        sourceSessionId: 'session-1',
+        subagentToolUseId: 'tool-1',
+        subagentTaskId: 'agent-1',
+      }],
+      activeTabId: '__subagent__session-1__tool-1',
+    })
+
+    render(<ContentRouter />)
+
+    expect(screen.getByTestId('subagent-run-page')).toHaveTextContent('session-1:tool-1:agent-1:Kuhn')
+    expect(screen.queryByTestId('active-session')).not.toBeInTheDocument()
+  })
+
+  it('falls back to the empty session for malformed SubAgent tab metadata', () => {
+    useTabStore.setState({
+      tabs: [{
+        sessionId: '__subagent__session-1__tool-1',
+        title: 'Kuhn',
+        type: 'subagent',
+        status: 'idle',
+      }],
+      activeTabId: '__subagent__session-1__tool-1',
+    })
+
+    render(<ContentRouter />)
+
+    expect(screen.getByTestId('empty-session')).toBeInTheDocument()
+    expect(screen.queryByTestId('subagent-run-page')).not.toBeInTheDocument()
+  })
+
+  it('renders Agent Teams members through the shared agent run desktop route', () => {
+    useTabStore.setState({
+      tabs: [{
+        sessionId: 'team-member:reviewer@review-team',
+        title: 'Reviewer',
+        type: 'team-member',
+        status: 'idle',
+        sourceSessionId: 'lead-session',
+        teamLeadSessionId: 'lead-session',
+        teamMemberAgentId: 'reviewer@review-team',
+        returnTabId: '__team__lead-session',
+      }],
+      activeTabId: 'team-member:reviewer@review-team',
+    })
+
+    render(<ContentRouter />)
+
+    expect(screen.getByTestId('team-member-run-page')).toHaveTextContent(
+      'team-member:reviewer@review-team:lead-session:reviewer@review-team:Reviewer',
+    )
+    expect(screen.queryByTestId('active-session')).not.toBeInTheDocument()
+  })
+
+  it('renders the market tab without mounting the chat session surface', () => {
+    useTabStore.setState({
+      tabs: [{
+        sessionId: MARKET_TAB_ID,
+        title: 'Market',
+        type: 'market',
+        status: 'idle',
+      }],
+      activeTabId: MARKET_TAB_ID,
+    })
+
+    render(<ContentRouter />)
+
+    expect(screen.getByTestId('market-page')).toBeInTheDocument()
     expect(screen.queryByTestId('active-session')).not.toBeInTheDocument()
   })
 

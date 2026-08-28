@@ -4,9 +4,13 @@ import * as path from 'path'
 import { randomBytes } from 'node:crypto'
 import { normalizeLegacyDeepSeekManagedEnv } from '../../utils/providerManagedEnvCompat.js'
 import { isOpenAIOfficialProviderId } from './openaiOfficialProvider.js'
-import { BUILT_IN_PROVIDER_IDS } from '../types/provider.js'
+import { isGrokOfficialProviderId } from './grokOfficialProvider.js'
+import {
+  BUILT_IN_PROVIDER_IDS,
+  PROVIDER_TOOL_SEARCH_OPT_IN_SCHEMA_VERSION,
+} from '../types/provider.js'
 
-export const CURRENT_PROVIDER_INDEX_SCHEMA_VERSION = 2
+export const CURRENT_PROVIDER_INDEX_SCHEMA_VERSION = PROVIDER_TOOL_SEARCH_OPT_IN_SCHEMA_VERSION
 
 type MigrationReport = {
   migratedEntries: string[]
@@ -43,6 +47,7 @@ function isProviderModels(value: unknown): value is JsonObject {
   return (
     isRecord(value) &&
     typeof value.main === 'string' &&
+    (value.fable === undefined || typeof value.fable === 'string') &&
     typeof value.haiku === 'string' &&
     typeof value.sonnet === 'string' &&
     typeof value.opus === 'string'
@@ -166,7 +171,12 @@ function migrateProvidersIndex(value: unknown): JsonObject {
     providerOrder: rawProviderOrder,
     ...rest
   } = value
-  const providers = value.providers.filter(isSavedProvider)
+  const sourceSchemaVersion = typeof value.schemaVersion === 'number' ? value.schemaVersion : 1
+  const providers = value.providers
+    .filter(isSavedProvider)
+    .map((provider) => sourceSchemaVersion < PROVIDER_TOOL_SEARCH_OPT_IN_SCHEMA_VERSION
+      ? { ...provider, toolSearchEnabled: false }
+      : provider)
   const rawActiveId =
     typeof value.activeId === 'string'
       ? value.activeId
@@ -175,7 +185,8 @@ function migrateProvidersIndex(value: unknown): JsonObject {
         : null
   const activeId = rawActiveId && (
     providers.some((provider) => provider.id === rawActiveId) ||
-    isOpenAIOfficialProviderId(rawActiveId)
+    isOpenAIOfficialProviderId(rawActiveId) ||
+    isGrokOfficialProviderId(rawActiveId)
   )
     ? rawActiveId
     : null
@@ -309,6 +320,7 @@ function buildManagedSettingsForMigratedProvider(provider: JsonObject | undefine
       ANTHROPIC_BASE_URL: baseUrl,
       ANTHROPIC_AUTH_TOKEN: apiKey,
       ANTHROPIC_MODEL: provider.models.main,
+      ...(provider.models.fable ? { ANTHROPIC_DEFAULT_FABLE_MODEL: provider.models.fable } : {}),
       ANTHROPIC_DEFAULT_HAIKU_MODEL: provider.models.haiku,
       ANTHROPIC_DEFAULT_SONNET_MODEL: provider.models.sonnet,
       ANTHROPIC_DEFAULT_OPUS_MODEL: provider.models.opus,

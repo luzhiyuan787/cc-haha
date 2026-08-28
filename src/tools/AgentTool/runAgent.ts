@@ -59,10 +59,9 @@ import { createUserMessage } from '../../utils/messages.js'
 import { getAgentModel } from '../../utils/model/agent.js'
 import type { ModelAlias } from '../../utils/model/aliases.js'
 import {
-  clearAgentTranscriptSubdir,
   recordSidechainTranscript,
-  setAgentTranscriptSubdir,
   writeAgentMetadata,
+  type AgentMetadata,
 } from '../../utils/sessionStorage.js'
 import {
   isRestrictedToPluginOnly,
@@ -79,8 +78,53 @@ import {
 } from '../../utils/telemetry/perfettoTracing.js'
 import type { ContentReplacementState } from '../../utils/toolResultStorage.js'
 import { createAgentId } from '../../utils/uuid.js'
+import { emitAgentRunMessage } from '../../utils/sdkEventQueue.js'
+import { getTeammateContext } from '../../utils/teammateContext.js'
 import { resolveAgentTools } from './agentToolUtils.js'
 import { type AgentDefinition, isBuiltInAgent } from './loadAgentsDir.js'
+
+export function resolveSubagentThinkingConfig(
+  parentThinkingConfig: ToolUseContext['options']['thinkingConfig'],
+): ToolUseContext['options']['thinkingConfig'] {
+  return parentThinkingConfig
+}
+
+export function resolveSubagentEffortValue(
+  agentEffort: AgentDefinition['effort'],
+  parentEffort: AgentDefinition['effort'],
+): AgentDefinition['effort'] {
+  return agentEffort ?? parentEffort
+}
+
+export function resolvePersistedAgentType(
+  persistedAgentType: string | undefined,
+  runtimeAgentType: string,
+): string {
+  return persistedAgentType?.trim() || runtimeAgentType
+}
+
+export function selectInitialTranscriptMessages(
+  messages: Message[],
+  alreadyPersistedMessageCount: number | undefined,
+): {
+  messages: Message[]
+  startingParentUuid: UUID | null | undefined
+} {
+  if (alreadyPersistedMessageCount === undefined) {
+    return { messages, startingParentUuid: undefined }
+  }
+
+  const boundary = Math.min(
+    messages.length,
+    Math.max(0, Math.trunc(alreadyPersistedMessageCount)),
+  )
+  return {
+    messages: messages.slice(boundary),
+    startingParentUuid: boundary > 0
+      ? messages[boundary - 1]?.uuid ?? null
+      : undefined,
+  }
+}
 
 /**
  * Initialize agent-specific MCP servers
@@ -265,7 +309,12 @@ export async function* runAgent({
   useExactTools,
   worktreePath,
   description,
-  transcriptSubdir,
+  spawningToolUseId,
+  ownerAgentId,
+  streamTargetAgentId,
+  persistedAgentType,
+  alreadyPersistedMessageCount,
+  workflow,
   onQueryProgress,
 }: {
   agentDefinition: AgentDefinition
@@ -307,10 +356,10 @@ export async function* runAgent({
    * omitted, createSubagentContext clones the parent's state. */
   contentReplacementState?: ContentReplacementState
   /** When true, use availableTools directly without filtering through
-   * resolveAgentTools(). Also inherits the parent's thinkingConfig and
-   * isNonInteractiveSession instead of overriding them. Used by the fork
-   * subagent path to produce byte-identical API request prefixes for
-   * prompt cache hits. */
+   * resolveAgentTools(). Also inherits the parent's isNonInteractiveSession
+   * instead of overriding it. All subagents inherit thinkingConfig; fork
+   * children additionally need exact tools to produce byte-identical API
+   * request prefixes for prompt cache hits. */
   useExactTools?: boolean
   /** Worktree path if the agent was spawned with isolation: "worktree".
    * Persisted to metadata so resume can restore the correct cwd. */
@@ -318,9 +367,27 @@ export async function* runAgent({
   /** Original task description from AgentTool input. Persisted to metadata
    * so a resumed agent's notification can show the original description. */
   description?: string
+  /** tool_use id of the Agent call that spawned this agent. Persisted to
+   * metadata so resume can re-attach to the original Agent card instead of
+   * the resuming tool's own call. */
+  spawningToolUseId?: string
+  /** Parent agent that owns this run's task lifecycle. Undefined means root. */
+  ownerAgentId?: string
+  /** Logical target used only to route live output to a synthetic desktop run. */
+  streamTargetAgentId?: string
+  /** Stable upstream identity for a resumed agent. A named teammate may use
+   * the general-purpose runtime definition after its original definition is
+   * no longer active, but its transcript metadata must keep the teammate name
+   * so the desktop can continue joining the same conversation. */
+  persistedAgentType?: string
+  /** Number of leading prompt messages already present in this agent's
+   * transcript. Resume sends them to the model for context but must only
+   * append the new continuation messages to disk. */
+  alreadyPersistedMessageCount?: number
   /** Optional subdirectory under subagents/ to group this agent's transcript
    * with related ones (e.g. workflows/<runId> for workflow subagents). */
-  transcriptSubdir?: string
+  /** Set when this agent is one step of a dynamic workflow run. */
+  workflow?: AgentMetadata['workflow']
   /** Optional callback fired on every message yielded by query() — including
    * stream_event deltas that runAgent otherwise drops. Use to detect liveness
    * during long single-block streams (e.g. thinking) where no assistant
@@ -345,11 +412,24 @@ export async function* runAgent({
   )
 
   const agentId = override?.agentId ? override.agentId : createAgentId()
-
-  // Route this agent's transcript into a grouping subdirectory if requested
-  // (e.g. workflow subagents write to subagents/workflows/<runId>/).
-  if (transcriptSubdir) {
-    setAgentTranscriptSubdir(agentId, transcriptSubdir)
+  const teammateContext = getTeammateContext()
+  const agentRunRoute = spawningToolUseId || ownerAgentId || streamTargetAgentId || querySource === 'workflow_agent'
+    ? {
+        runAgentId: agentId,
+        streamId: createAgentId(),
+        targetAgentId: streamTargetAgentId ?? agentId,
+        ...(teammateContext?.streamScopeId
+          ? { targetAgentScopeId: teammateContext.streamScopeId }
+          : {}),
+      }
+    : undefined
+  let agentRunTerminalEmitted = false
+  const emitAgentRunTerminal = (
+    event: { kind: 'complete' } | { kind: 'cancelled' } | { kind: 'error'; error: string },
+  ) => {
+    if (!agentRunRoute || agentRunTerminalEmitted) return
+    agentRunTerminalEmitted = true
+    emitAgentRunMessage(agentRunRoute, event)
   }
 
   // Register agent in Perfetto trace for hierarchy visualization
@@ -412,7 +492,16 @@ export async function* runAgent({
   // Override permission mode if agent defines one
   // However, don't override if parent is in bypassPermissions or acceptEdits mode - those should always take precedence
   // For async agents, also set shouldAvoidPermissionPrompts since they can't show UI
-  const agentPermissionMode = agentDefinition.permissionMode
+  const requestedAgentPermissionMode = agentDefinition.permissionMode
+  // Selecting repository-defined behavior is not authorization to disable the
+  // parent session's permission checks.
+  const isRepositoryAgent =
+    agentDefinition.source === 'projectSettings' ||
+    agentDefinition.source === 'localSettings'
+  const agentPermissionMode =
+    isRepositoryAgent && requestedAgentPermissionMode === 'bypassPermissions'
+      ? undefined
+      : requestedAgentPermissionMode
   const agentGetAppState = () => {
     const state = toolUseContext.getAppState()
     let toolPermissionContext = state.toolPermissionContext
@@ -479,10 +568,10 @@ export async function* runAgent({
     }
 
     // Override effort level if agent defines one
-    const effortValue =
-      agentDefinition.effort !== undefined
-        ? agentDefinition.effort
-        : state.effortValue
+    const effortValue = resolveSubagentEffortValue(
+      agentDefinition.effort,
+      state.effortValue,
+    )
 
     if (
       toolPermissionContext === state.toolPermissionContext &&
@@ -676,12 +765,18 @@ export async function* runAgent({
     debug: toolUseContext.options.debug,
     verbose: toolUseContext.options.verbose,
     mainLoopModel: resolvedAgentModel,
-    // For fork children (useExactTools), inherit thinking config to match the
-    // parent's API request prefix for prompt cache hits. For regular
-    // sub-agents, disable thinking to control output token costs.
-    thinkingConfig: useExactTools
-      ? toolUseContext.options.thinkingConfig
-      : { type: 'disabled' as const },
+    // Subagents inherit the parent session's thinking mode. Agent-specific
+    // effort is applied independently through agentGetAppState above. Keeping
+    // thinking in the request context (instead of process.env) also lets
+    // parallel agents use distinct effort values without sharing mutable
+    // process state. Fork children still receive the same object so their
+    // prompt-cache prefix remains byte-identical to the parent.
+    thinkingConfig: resolveSubagentThinkingConfig(
+      toolUseContext.options.thinkingConfig,
+    ),
+    effortValueOverridesEnv:
+      agentDefinition.effort !== undefined ||
+      toolUseContext.options.effortValueOverridesEnv === true,
     mcpClients: mergedMcpClients,
     mcpResources: toolUseContext.options.mcpResources,
     agentDefinitions: toolUseContext.options.agentDefinitions,
@@ -732,13 +827,28 @@ export async function* runAgent({
   // Record initial messages before the query loop starts, plus the agentType
   // so resume can route correctly when subagent_type is omitted. Both writes
   // are fire-and-forget — persistence failure shouldn't block the agent.
-  void recordSidechainTranscript(initialMessages, agentId).catch(_err =>
+  const initialTranscriptWrite = selectInitialTranscriptMessages(
+    initialMessages,
+    alreadyPersistedMessageCount,
+  )
+  void recordSidechainTranscript(
+    initialTranscriptWrite.messages,
+    agentId,
+    initialTranscriptWrite.startingParentUuid,
+  ).catch(_err =>
     logForDebugging(`Failed to record sidechain transcript: ${_err}`),
   )
   void writeAgentMetadata(agentId, {
-    agentType: agentDefinition.agentType,
+    agentType: resolvePersistedAgentType(
+      persistedAgentType,
+      agentDefinition.agentType,
+    ),
+    ...(model && { model }),
     ...(worktreePath && { worktreePath }),
     ...(description && { description }),
+    ...(spawningToolUseId && { toolUseId: spawningToolUseId }),
+    ...(ownerAgentId && { ownerAgentId }),
+    ...(workflow && { workflow }),
   }).catch(_err => logForDebugging(`Failed to write agent metadata: ${_err}`))
 
   // Track the last recorded message UUID for parent chain continuity
@@ -756,6 +866,18 @@ export async function* runAgent({
       maxTurns: maxTurns ?? agentDefinition.maxTurns,
     })) {
       onQueryProgress?.()
+      if (
+        agentRunRoute &&
+        (message.type === 'stream_event' ||
+          message.type === 'assistant' ||
+          message.type === 'user' ||
+          (
+            message.type === 'system' &&
+            (message.subtype === 'streaming_fallback' || message.subtype === 'api_retry')
+          ))
+      ) {
+        emitAgentRunMessage(agentRunRoute, { kind: 'message', message })
+      }
       // Forward subagent API request starts to parent's metrics display
       // so TTFT/OTPS update during subagent execution.
       if (
@@ -813,7 +935,23 @@ export async function* runAgent({
     if (isBuiltInAgent(agentDefinition) && agentDefinition.callback) {
       agentDefinition.callback()
     }
+    if (agentRunRoute) {
+      emitAgentRunTerminal({ kind: 'complete' })
+    }
+  } catch (error) {
+    if (error instanceof AbortError) {
+      emitAgentRunTerminal({ kind: 'cancelled' })
+    } else {
+      emitAgentRunTerminal({
+        kind: 'error',
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    throw error
   } finally {
+    // A consumer can stop the async generator with return()/break() without
+    // throwing. Discard its unfinished partial before settling the stream.
+    emitAgentRunTerminal({ kind: 'cancelled' })
     // Clean up agent-specific MCP servers (runs on normal completion, abort, or error)
     await mcpCleanup()
     // Clean up agent's session hooks
@@ -831,7 +969,6 @@ export async function* runAgent({
     // Release perfetto agent registry entry
     unregisterPerfettoAgent(agentId)
     // Release transcript subdir mapping
-    clearAgentTranscriptSubdir(agentId)
     // Release this agent's todos entry. Without this, every subagent that
     // called TodoWrite leaves a key in AppState.todos forever (even after all
     // items complete, the value is [] but the key stays). Whale sessions

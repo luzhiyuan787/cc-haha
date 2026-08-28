@@ -24,9 +24,7 @@ vi.mock('../stores/providerStore', () => ({
     activeId: null,
     presets: [],
     isLoading: false,
-    isPresetsLoading: false,
     fetchProviders: vi.fn(),
-    fetchPresets: vi.fn(),
     deleteProvider: vi.fn(),
     activateProvider: vi.fn(),
     activateOfficial: vi.fn(),
@@ -54,9 +52,11 @@ const MOCK_AGENTS = [
     tools: ['Read', 'Grep', 'Glob'],
     systemPrompt: '# Code Reviewer\n\nYou are an expert code reviewer.',
     color: 'blue',
+    effort: 'high',
     source: 'userSettings' as const,
     baseDir: '~/.claude/agents',
     isActive: true,
+    editable: true,
   },
   {
     agentType: 'doc-writer',
@@ -69,6 +69,7 @@ const MOCK_AGENTS = [
     source: 'built-in' as const,
     baseDir: 'built-in',
     isActive: true,
+    editable: false,
   },
   {
     agentType: 'plain-agent',
@@ -82,6 +83,7 @@ const MOCK_AGENTS = [
     baseDir: '/workspace/project/.claude/agents',
     isActive: false,
     overriddenBy: 'userSettings' as const,
+    editable: true,
   },
   {
     agentType: 'telegram:pairing',
@@ -94,6 +96,7 @@ const MOCK_AGENTS = [
     source: 'plugin' as const,
     baseDir: '/Users/test/.claude/plugins/cache/telegram',
     isActive: true,
+    editable: false,
   },
 ]
 
@@ -176,21 +179,14 @@ describe('Settings > Agents tab', () => {
       activeAgents: [],
       allAgents: [],
       isLoading: false,
+      isMutating: false,
       error: null,
+      mutationError: null,
+      mutationWarning: null,
       selectedAgent: null,
       selectedAgentReturnTab: 'agents',
       fetchAgents: noopFetch,
       selectAgent: (agent) => useAgentStore.setState({ selectedAgent: agent }),
-    })
-    useSkillStore.setState({
-      skills: [],
-      selectedSkill: null,
-      isLoading: false,
-      isDetailLoading: false,
-      error: null,
-      fetchSkills: noopFetch,
-      fetchSkillDetail: noopFetch,
-      clearSelection: () => useSkillStore.setState({ selectedSkill: null }),
     })
   })
 
@@ -232,7 +228,8 @@ describe('Settings > Agents tab', () => {
     render(<Settings />)
     switchToAgentsTab()
 
-    expect(screen.getByText('Network error')).toBeInTheDocument()
+    expect(screen.getByText('Failed to load agents')).toBeInTheDocument()
+    expect(screen.queryByText('Network error')).not.toBeInTheDocument()
     expect(screen.getByText('Retry')).toBeInTheDocument()
   })
 
@@ -365,7 +362,6 @@ describe('Settings > Skills tab', () => {
     render(<Settings />)
     switchToSkillsTab()
 
-    expect(screen.getByText('Skill metadata')).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Heading' })).toBeInTheDocument()
 
     const rendererRoot = screen.getByRole('heading', { name: 'Heading' }).closest('div[class*="prose"]')
@@ -375,7 +371,7 @@ describe('Settings > Skills tab', () => {
     expect(screen.getByText('Helpful quote')).toBeInTheDocument()
   })
 
-  it('keeps code files rendered in CodeViewer instead of markdown prose', () => {
+  it('keeps code files rendered in CodeViewer instead of markdown prose', async () => {
     useSkillStore.setState({
       selectedSkill: MOCK_SKILL_DETAIL,
       clearSelection: () => useSkillStore.setState({ selectedSkill: null }),
@@ -384,9 +380,10 @@ describe('Settings > Skills tab', () => {
     render(<Settings />)
     switchToSkillsTab()
 
-    fireEvent.click(screen.getAllByText('helper.ts')[0]!)
+    fireEvent.click(screen.getByTestId('skill-detail-tab-files'))
+    fireEvent.click(await screen.findByTestId('market-file-item-helper.ts'))
 
-    expect(screen.getByTestId('code-viewer')).toHaveTextContent('export const helper = true')
+    expect(await screen.findByTestId('code-viewer')).toHaveTextContent('export const helper = true')
     expect(screen.queryByRole('heading', { name: 'Heading' })).not.toBeInTheDocument()
   })
 })

@@ -10,7 +10,10 @@ import {
 import { isEnvTruthy } from './envUtils.js'
 import { getCanonicalName } from './model/model.js'
 import { getModelCapability } from './model/modelCapabilities.js'
-import { getConfiguredOrBuiltInModelContextWindow } from './model/modelContextWindows.js'
+import {
+  getBuiltInModelContextWindow,
+  getConfiguredModelContextWindow,
+} from './model/modelContextWindows.js'
 
 // Default fallback when the model-specific capability is unknown.
 export const MODEL_CONTEXT_WINDOW_DEFAULT = 200_000
@@ -52,7 +55,23 @@ export function modelSupports1M(model: string): boolean {
     return false
   }
   const canonical = getCanonicalName(model)
-  return canonical.includes('claude-sonnet-4') || canonical.includes('opus-4-6')
+  return (
+    canonical.includes('claude-fable-5') ||
+    canonical.includes('claude-sonnet-5') ||
+    canonical.includes('claude-opus-4-8') ||
+    canonical.includes('claude-opus-4-7') ||
+    canonical.includes('claude-sonnet-4') ||
+    canonical.includes('opus-4-6')
+  )
+}
+
+// C4E admins can disable extended context for HIPAA compliance; configured
+// windows above the default are capped rather than ignored.
+function capToDefaultIfExtendedContextDisabled(window: number): number {
+  if (window > MODEL_CONTEXT_WINDOW_DEFAULT && is1mContextDisabled()) {
+    return MODEL_CONTEXT_WINDOW_DEFAULT
+  }
+  return window
 }
 
 export function getContextWindowForModel(
@@ -73,20 +92,26 @@ export function getContextWindowForModel(
     }
   }
 
-  // [1m] suffix — explicit client-side opt-in, respected over all detection
+  // Explicit per-model configuration (CLAUDE_CODE_MODEL_CONTEXT_WINDOWS) wins
+  // over the [1m] marker: the marker gets appended automatically by provider
+  // settings, while a configured window states the model's real limit. A 256K
+  // model pinned at 1M never reaches the auto-compact threshold and dies at
+  // the provider's hard cap instead (#1162).
+  const userConfiguredWindow = getConfiguredModelContextWindow(model)
+  if (userConfiguredWindow !== undefined) {
+    return capToDefaultIfExtendedContextDisabled(userConfiguredWindow)
+  }
+
+  // [1m] suffix — explicit client-side opt-in, respected over built-in tables
+  // so that models whose table entry predates extended-context support (e.g.
+  // claude-sonnet-4-6 at 200K) can still opt in to 1M.
   if (has1mContext(model)) {
     return 1_000_000
   }
 
-  const configuredWindow = getConfiguredOrBuiltInModelContextWindow(model)
-  if (configuredWindow !== undefined) {
-    if (
-      configuredWindow > MODEL_CONTEXT_WINDOW_DEFAULT &&
-      is1mContextDisabled()
-    ) {
-      return MODEL_CONTEXT_WINDOW_DEFAULT
-    }
-    return configuredWindow
+  const builtInWindow = getBuiltInModelContextWindow(model)
+  if (builtInWindow !== undefined) {
+    return capToDefaultIfExtendedContextDisabled(builtInWindow)
   }
 
   const openAIContextWindow = getOpenAICodexContextWindowForModel(model)
@@ -181,19 +206,34 @@ export function calculateCurrentContextTokenTotal(
     cache_read_input_tokens: number
   } | null,
   contextWindow?: number,
-  options?: { hasMediaInput?: boolean; usageTrust?: ProviderUsageTrust },
+  options?: {
+    hasMediaInput?: boolean
+    usageTrust?: ProviderUsageTrust
+    canonicalTokens?: number
+  },
 ): number {
   const hasMediaInput = options?.hasMediaInput ?? false
   const usageTrust = options?.usageTrust ?? 'high'
 
   if (contextWindow !== undefined) {
-    return calculateContextBudget({
+    const budget = calculateContextBudget({
       estimatedTokens,
       contextWindow,
       currentUsage,
       usageTrust,
       hasMediaInput,
-    }).usedTokens
+    })
+    if (
+      budget.ignoredUsageReason ||
+      !currentUsage ||
+      options?.canonicalTokens === undefined
+    ) {
+      return budget.usedTokens
+    }
+    return Math.min(
+      Math.max(budget.usedTokens, options.canonicalTokens),
+      contextWindow,
+    )
   }
 
   if (!currentUsage) return estimatedTokens
@@ -228,7 +268,13 @@ export function getModelMaxOutputTokens(model: string): {
 
   const m = getCanonicalName(model)
 
-  if (m.includes('opus-4-6')) {
+  if (
+    m.includes('fable-5') ||
+    m.includes('opus-4-8') ||
+    m.includes('opus-4-7') ||
+    m.includes('opus-4-6') ||
+    m.includes('sonnet-5')
+  ) {
     defaultTokens = 64_000
     upperLimit = 128_000
   } else if (m.includes('sonnet-4-6')) {

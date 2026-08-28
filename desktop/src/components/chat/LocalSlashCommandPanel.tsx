@@ -7,6 +7,11 @@ import {
   type SessionInspectionResponse,
   type SessionUsageSnapshot,
 } from '../../api/sessions'
+import { Badge } from '@/components/ui/Badge'
+import { EmptyState } from '@/components/ui/EmptyState'
+import { ErrorState } from '@/components/ui/ErrorState'
+import { LoadingState } from '@/components/ui/LoadingState'
+import { mcpStatusTone } from '@/lib/mcpStatus'
 import { useTranslation, type TranslationKey } from '../../i18n'
 import { useUIStore } from '../../stores/uiStore'
 import { SETTINGS_TAB_ID, useTabStore } from '../../stores/tabStore'
@@ -15,8 +20,17 @@ import { useSkillStore } from '../../stores/skillStore'
 import type { McpServerRecord } from '../../types/mcp'
 import type { SkillMeta } from '../../types/skill'
 import type { SlashCommandOption } from './composerUtils'
+import { SlashCommandPanelShell as PanelShell } from './SlashCommandPanelShell'
+import { WorkflowSavePanel } from './WorkflowSavePanel'
 
-export type LocalSlashCommandName = 'mcp' | 'skills' | 'help' | 'status' | 'cost' | 'context'
+export type LocalSlashCommandName =
+  | 'mcp'
+  | 'skills'
+  | 'help'
+  | 'status'
+  | 'cost'
+  | 'context'
+  | 'save-workflow'
 
 type Props = {
   command: LocalSlashCommandName
@@ -28,21 +42,6 @@ type Props = {
 
 type SessionInspectorTab = 'status' | 'usage' | 'context'
 type Translate = ReturnType<typeof useTranslation>
-
-function toneForStatus(status: McpServerRecord['status']) {
-  switch (status) {
-    case 'connected':
-      return 'bg-[var(--color-inspector-success-bg)] text-[var(--color-inspector-success)] border-[var(--color-inspector-border)]'
-    case 'needs-auth':
-      return 'bg-[var(--color-surface-container-low)] text-[var(--color-warning)] border-[var(--color-border)]'
-    case 'failed':
-      return 'bg-[var(--color-inspector-danger-bg)] text-[var(--color-inspector-danger)] border-[var(--color-inspector-border)]'
-    case 'disabled':
-      return 'bg-[var(--color-surface-hover)] text-[var(--color-text-secondary)] border-[var(--color-border)]'
-    default:
-      return ''
-  }
-}
 
 function scopeLabel(scope: string, t: ReturnType<typeof useTranslation>) {
   switch (scope) {
@@ -61,63 +60,6 @@ function projectBadge(path?: string, t?: ReturnType<typeof useTranslation>) {
   if (!path || !t) return null
   const label = path.replace(/\/$/, '').split('/').pop() || path
   return t('slash.mcp.projectBadge', { name: label })
-}
-
-function PanelShell({
-  title,
-  subtitle,
-  children,
-  onClose,
-}: {
-  title: string
-  subtitle: string
-  children: React.ReactNode
-  onClose: () => void
-}) {
-  return (
-    <div className="absolute bottom-full left-0 right-0 z-50 mb-3 overflow-hidden rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] shadow-[var(--shadow-dropdown)]">
-      <div className="flex items-start justify-between gap-4 border-b border-[var(--color-border)] px-5 py-4">
-        <div>
-          <h3 className="text-lg font-semibold text-[var(--color-text-primary)]">{title}</h3>
-          <p className="mt-1 text-sm text-[var(--color-text-tertiary)]">{subtitle}</p>
-        </div>
-        <button
-          type="button"
-          onClick={onClose}
-          className="flex h-9 w-9 items-center justify-center rounded-full text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]"
-        >
-          <span className="material-symbols-outlined text-[18px]">close</span>
-        </button>
-      </div>
-      <div className="max-h-[min(620px,72vh)] overflow-y-auto px-5 py-4">{children}</div>
-    </div>
-  )
-}
-
-function LoadingState({ label }: { label: string }) {
-  return (
-    <div className="flex items-center justify-center py-12 text-sm text-[var(--color-text-tertiary)]">
-      <div className="mr-3 h-5 w-5 animate-spin rounded-full border-2 border-[var(--color-brand)] border-t-transparent" />
-      {label}
-    </div>
-  )
-}
-
-function EmptyState({ title, body }: { title: string; body: string }) {
-  return (
-    <div className="rounded-2xl border border-dashed border-[var(--color-border)] bg-[var(--color-surface)] px-5 py-10 text-center">
-      <div className="text-sm font-semibold text-[var(--color-text-primary)]">{title}</div>
-      <div className="mt-2 text-xs leading-6 text-[var(--color-text-tertiary)]">{body}</div>
-    </div>
-  )
-}
-
-function ErrorState({ message }: { message: string }) {
-  return (
-    <div className="rounded-2xl border border-[var(--color-inspector-border)] bg-[var(--color-inspector-panel)] px-5 py-4 text-sm text-[var(--color-inspector-danger)]">
-      {message}
-    </div>
-  )
 }
 
 function formatNumber(value: number | undefined) {
@@ -217,9 +159,9 @@ function UsageTab({
   error?: string
   t: Translate
 }) {
-  if (error && !usage) return <ErrorState message={error} />
+  if (error && !usage) return <ErrorState title={error} />
   if (!usage) {
-    return <EmptyState title={t('slash.inspector.usage.emptyTitle')} body={t('slash.inspector.usage.emptyBody')} />
+    return <EmptyState title={t('slash.inspector.usage.emptyTitle')} description={t('slash.inspector.usage.emptyBody')} />
   }
 
   const usageHasTokens = (
@@ -291,7 +233,7 @@ function UsageTab({
       <section>
         <div className="mb-3 text-[22px] font-semibold text-[var(--color-inspector-text)]">{t('slash.inspector.usage.byModel')}</div>
         {models.length === 0 ? (
-          <EmptyState title={t('slash.inspector.usage.noModelTitle')} body={t('slash.inspector.usage.noModelBody')} />
+          <EmptyState title={t('slash.inspector.usage.noModelTitle')} description={t('slash.inspector.usage.noModelBody')} />
         ) : (
           <div className="overflow-hidden rounded-md border border-[var(--color-inspector-border)] bg-[var(--color-inspector-surface)] font-mono">
             {models.map((model) => (
@@ -363,7 +305,7 @@ function ContextStackedBar({ categories, rawMaxTokens }: { categories: ContextCa
 function CategoryBreakdown({ categories, rawMaxTokens, t }: { categories: ContextCategory[]; rawMaxTokens: number; t: Translate }) {
   const visibleCategories = categories.filter((category) => category.tokens > 0)
   if (visibleCategories.length === 0) {
-    return <EmptyState title={t('slash.inspector.context.noCategoriesTitle')} body={t('slash.inspector.context.noCategoriesBody')} />
+    return <EmptyState title={t('slash.inspector.context.noCategoriesTitle')} description={t('slash.inspector.context.noCategoriesBody')} />
   }
 
   return (
@@ -569,10 +511,10 @@ function ContextTab({
   loading?: boolean
   t: Translate
 }) {
-  if (error && !context) return <ErrorState message={error} />
+  if (error && !context) return <ErrorState title={error} />
   if (loading && !context) return <LoadingState label={t('slash.inspector.context.loading')} />
   if (!context) {
-    return <EmptyState title={t('slash.inspector.context.emptyTitle')} body={t('slash.inspector.context.emptyBody')} />
+    return <EmptyState title={t('slash.inspector.context.emptyTitle')} description={t('slash.inspector.context.emptyBody')} />
   }
 
   const categories = Array.isArray(context.categories) ? context.categories : []
@@ -697,7 +639,7 @@ function SessionInspectorShell({
 }) {
   return (
     <div
-      className="absolute bottom-full left-0 right-0 z-50 mb-4 overflow-hidden rounded-[10px] border border-[var(--color-inspector-border)] bg-[var(--color-inspector-surface)] text-[var(--color-inspector-text)] shadow-[var(--shadow-inspector)]"
+      className="absolute bottom-full left-0 right-0 z-[var(--z-dropdown)] mb-4 overflow-hidden rounded-[var(--radius-md)] border border-[var(--color-inspector-border)] bg-[var(--color-inspector-surface)] text-[var(--color-inspector-text)] shadow-[var(--shadow-inspector)]"
     >
       <div className="grid min-h-[64px] grid-cols-[1fr_auto_1fr] items-center border-b border-[var(--color-inspector-border)] bg-[var(--color-inspector-surface)] px-6">
         <div className="font-mono text-[16px] font-semibold uppercase text-[var(--color-inspector-accent)]">{t('slash.inspector.title')}</div>
@@ -822,7 +764,7 @@ function SessionInspectorPanel({
   return (
     <SessionInspectorShell selectedTab={selectedTab} tabs={tabs} onSelectTab={setSelectedTab} onClose={onClose} t={t}>
       {error ? (
-        <ErrorState message={error} />
+        <ErrorState title={error} />
       ) : data === null ? (
         <LoadingState label={t('slash.inspector.loading')} />
       ) : selectedTab === 'usage' ? (
@@ -900,11 +842,11 @@ function McpPanel({ cwd, onClose }: { cwd?: string; onClose: () => void }) {
       onClose={onClose}
     >
       {error ? (
-        <ErrorState message={error} />
+        <ErrorState title={error} />
       ) : servers === null ? (
         <LoadingState label={t('common.loading')} />
       ) : servers.length === 0 ? (
-        <EmptyState title={t('slash.mcp.emptyTitle')} body={t('slash.mcp.emptyBody')} />
+        <EmptyState title={t('slash.mcp.emptyTitle')} description={t('slash.mcp.emptyBody')} />
       ) : (
         <div className="space-y-5">
           {['user', 'local', 'project'].filter((scope) => grouped.has(scope)).map((scope) => (
@@ -913,7 +855,7 @@ function McpPanel({ cwd, onClose }: { cwd?: string; onClose: () => void }) {
                 <div className="text-sm font-semibold text-[var(--color-text-primary)]">{scopeLabel(scope, t)}</div>
                 <div className="text-xs text-[var(--color-text-tertiary)]">{grouped.get(scope)?.length ?? 0}</div>
               </div>
-              <div className="overflow-hidden rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)]">
+              <div className="overflow-hidden rounded-[var(--radius-xl)] border border-[var(--color-border)] bg-[var(--color-surface)]">
                 {grouped.get(scope)?.map((server) => (
                   <button
                     type="button"
@@ -928,16 +870,16 @@ function McpPanel({ cwd, onClose }: { cwd?: string; onClose: () => void }) {
                   >
                     <div className="flex items-center gap-3">
                       <div className="text-sm font-semibold text-[var(--color-text-primary)]">{server.name}</div>
-                      <span className={`inline-flex items-center rounded-full border px-2 py-1 text-[11px] font-semibold ${toneForStatus(server.status)}`}>
+                      <Badge tone={mcpStatusTone(server.status)} size="md" bordered className="font-semibold">
                         {server.statusLabel}
-                      </span>
+                      </Badge>
                     </div>
                     <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-[var(--color-text-tertiary)]">
-                      <span className="rounded-full bg-[var(--color-surface-hover)] px-2 py-1">{server.transport}</span>
+                      <Badge size="md">{server.transport}</Badge>
                       {server.projectPath && (
-                        <span className="rounded-full bg-[var(--color-surface-hover)] px-2 py-1" title={server.projectPath}>
+                        <Badge size="md" title={server.projectPath}>
                           {projectBadge(server.projectPath, t)}
-                        </span>
+                        </Badge>
                       )}
                       <span className="truncate">{server.summary}</span>
                     </div>
@@ -954,7 +896,6 @@ function McpPanel({ cwd, onClose }: { cwd?: string; onClose: () => void }) {
 
 function SkillsPanel({ cwd, onClose }: { cwd?: string; onClose: () => void }) {
   const t = useTranslation()
-  const setPendingSettingsTab = useUIStore((s) => s.setPendingSettingsTab)
   const fetchSkillDetail = useSkillStore((s) => s.fetchSkillDetail)
   const [skills, setSkills] = useState<SkillMeta[] | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -982,20 +923,20 @@ function SkillsPanel({ cwd, onClose }: { cwd?: string; onClose: () => void }) {
       onClose={onClose}
     >
       {error ? (
-        <ErrorState message={error} />
+        <ErrorState title={error} />
       ) : skills === null ? (
         <LoadingState label={t('common.loading')} />
       ) : skills.length === 0 ? (
-        <EmptyState title={t('slash.skills.emptyTitle')} body={t('slash.skills.emptyBody')} />
+        <EmptyState title={t('slash.skills.emptyTitle')} description={t('slash.skills.emptyBody')} />
       ) : (
-        <div className="overflow-hidden rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)]">
+        <div className="overflow-hidden rounded-[var(--radius-xl)] border border-[var(--color-border)] bg-[var(--color-surface)]">
           {skills.map((skill) => (
             <button
               type="button"
               key={`${skill.source}:${skill.name}`}
               onClick={async () => {
                 await fetchSkillDetail(skill.source, skill.name, cwd, 'skills')
-                setPendingSettingsTab('skills')
+                useUIStore.getState().setPendingSettingsTab('skills')
                 useTabStore.getState().openTab(SETTINGS_TAB_ID, 'Settings', 'settings')
                 onClose()
               }}
@@ -1003,9 +944,7 @@ function SkillsPanel({ cwd, onClose }: { cwd?: string; onClose: () => void }) {
             >
               <div className="flex items-center gap-3">
                 <div className="text-sm font-semibold text-[var(--color-text-primary)]">/{skill.name}</div>
-                <span className="rounded-full bg-[var(--color-surface-hover)] px-2 py-1 text-[11px] text-[var(--color-text-secondary)]">
-                  {skill.source}
-                </span>
+                <Badge size="md">{skill.source}</Badge>
               </div>
               <div className="mt-2 text-xs leading-6 text-[var(--color-text-tertiary)]">{skill.description}</div>
             </button>
@@ -1027,7 +966,7 @@ const COMMAND_GROUPS = [
   },
   {
     titleKey: 'slash.help.group.desktop',
-    names: ['mcp', 'skills', 'plugin', 'help'],
+    names: ['mcp', 'skills', 'save-workflow', 'plugin', 'help'],
   },
 ] satisfies Array<{ titleKey: TranslationKey; names: string[] }>
 
@@ -1083,7 +1022,7 @@ function HelpPanel({
           return (
             <section key={group.titleKey}>
               <div className="mb-2 text-sm font-semibold text-[var(--color-text-primary)]">{t(group.titleKey)}</div>
-              <div className="overflow-hidden rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)]">
+              <div className="overflow-hidden rounded-[var(--radius-xl)] border border-[var(--color-border)] bg-[var(--color-surface)]">
                 {entries.map(renderCommand)}
               </div>
             </section>
@@ -1093,7 +1032,7 @@ function HelpPanel({
         {otherCommands.length > 0 && (
           <section>
             <div className="mb-2 text-sm font-semibold text-[var(--color-text-primary)]">{t('slash.help.group.more')}</div>
-            <div className="overflow-hidden rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)]">
+            <div className="overflow-hidden rounded-[var(--radius-xl)] border border-[var(--color-border)] bg-[var(--color-surface)]">
               {otherCommands.map(renderCommand)}
             </div>
             {hiddenOtherCommandCount > 0 && (
@@ -1111,6 +1050,16 @@ function HelpPanel({
 export function LocalSlashCommandPanel({ command, sessionId, cwd, commands, onClose }: Props) {
   if (command === 'mcp') return <McpPanel cwd={cwd} onClose={onClose} />
   if (command === 'skills') return <SkillsPanel cwd={cwd} onClose={onClose} />
+  if (command === 'save-workflow') {
+    return (
+      <WorkflowSavePanel
+        sessionId={sessionId}
+        cwd={cwd}
+        commands={commands}
+        onClose={onClose}
+      />
+    )
+  }
   if (command === 'status' || command === 'cost' || command === 'context') {
     return <SessionInspectorPanel command={command} sessionId={sessionId} commands={commands} onClose={onClose} />
   }

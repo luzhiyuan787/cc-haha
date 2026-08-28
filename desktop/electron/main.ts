@@ -1,10 +1,14 @@
-import { app, BrowserWindow, clipboard, ipcMain, Notification, screen, session, WebContentsView } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, screen, session, WebContentsView } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import path from 'node:path'
 import { ELECTRON_EVENT_CHANNELS, ELECTRON_INTERNAL_CHANNELS, ELECTRON_IPC_CHANNELS, type ElectronIpcChannel } from './ipc/channels'
-import { isElectronIpcChannel, validateElectronIpcPayload } from './ipc/capabilities'
+import {
+  isElectronIpcChannel,
+  isElectronIpcChannelAllowedForPetWindow,
+  validateElectronIpcPayload,
+} from './ipc/capabilities'
 import { ElectronServerRuntime } from './services/serverRuntime'
-import { probeServerHealth, performHttpRequest } from './services/sidecarManager'
+import { appendHostDiagnostic, electronHostDiagnosticsFile, sanitizeHostDiagnostic } from './services/sidecarManager'
 import { openDialog, saveDialog } from './services/dialogs'
 import { openExternalUrl, openSystemPath, openSystemSettingsUrl } from './services/shell'
 import {
@@ -12,28 +16,64 @@ import {
   requestNotificationPermission,
   sendDesktopNotification,
 } from './services/notifications'
-import { installApplicationMenu } from './services/menu'
+import { installApplicationMenu, installRendererContextMenu } from './services/menu'
 import { acquireSingleInstanceLock } from './services/singleInstance'
 import { installTray, shouldInstallTray, type TrayController } from './services/tray'
-import { ElectronUpdaterService } from './services/updater'
+import { ElectronUpdaterService, updaterSessionProxyConfig } from './services/updater'
 import { createUpdateSmokeUpdaterFromEnv } from './services/updateSmoke'
 import { ElectronTerminalService, type TerminalSpawnInput } from './services/terminal'
 import { ElectronPreviewService, type PreviewBounds } from './services/preview'
 import {
+  configureLocalServerRequestAuth,
+  configurePreviewSessionPermissions,
+  createPreviewSessionPartition,
+  isAllowlistedMainRendererMediaRequest,
+  type PreviewLocalAccess,
+} from './services/previewSession'
+import {
   applyStartupPortableMode,
-  detectPortableDir,
   getAppMode,
   setAppMode,
-  type PortableDetection,
 } from './services/appMode'
 import { installMacOsChromiumKeychainPromptGuard } from './services/keychain'
+import { installStdioWriteFailureGuards } from './services/stdioGuards'
 import { applyWindowsAppUserModelId } from './services/appIdentity'
 import { installMainWindowNavigationGuards, installPreviewNavigationGuards } from './services/navigationGuards'
 import { installPreviewCleanupOnRendererNavigation } from './services/previewLifecycle'
 import { logNotificationSmokeRendererAck, scheduleNotificationSmoke } from './services/notificationSmoke'
 import { normalizeZoomFactor } from './services/zoom'
+import {
+  applyAppliedAppearance,
+  isAppliedAppearance,
+  readAppearanceState,
+  startupWindowBackground,
+  type AppliedAppearance,
+} from './services/nativeAppearance'
 import { resolveRendererEntry } from './services/rendererEntry'
+import { installRendererLifecycle } from './services/rendererLifecycle'
 import { writeWindowSmokeSnapshot } from './services/windowSmoke'
+import { loadAndRevealMainWindow } from './services/windowStartup'
+import {
+  PetWindowController,
+  readPetWindowPosition,
+  writePetWindowPosition,
+  type PetWindowDragPayload,
+} from './services/petWindow'
+import {
+  readLocalePreference,
+  writeLocalePreference,
+} from './services/localePreference'
+import type { Locale } from '../src/i18n/locale'
+import {
+  createCustomPetCatalogLoader,
+  createCustomPetFromAtlas,
+  createCustomPetFromAtlasBytes,
+  createCustomPetFromImage,
+  ensureCustomPetsRoot,
+  getPetPackageErrorCode,
+  loadCustomPets,
+  readCustomPetSourceImage,
+} from './services/pets'
 import {
   installWindowLifecycle,
   readWindowState,
@@ -52,21 +92,14 @@ let serverRuntime: ElectronServerRuntime | null = null
 let updaterService: ElectronUpdaterService | null = null
 let terminalService: ElectronTerminalService | null = null
 let previewService: ElectronPreviewService | null = null
+let petWindowController: PetWindowController | null = null
 const traceWindows = new Map<string, BrowserWindow>()
 let isQuitting = false
 let trayController: TrayController | null = null
 
-// Force every network request from this Electron session — including the
-// renderer process's fetch AND WebSocket — to bypass any system proxy and
-// go direct to loopback. Without this, on Windows machines whose system
-// proxy is set, the renderer cannot dial 127.0.0.1 and either surfaces
-// `TypeError: Failed to fetch` (HTTP) or silently hangs the WebSocket
-// upgrade (chat stream), making the UI spin forever (#953 follow-up; also
-// blocks chat streaming).
-app.commandLine.appendSwitch('proxy-server', 'direct://')
-app.commandLine.appendSwitch('proxy-bypass-list', '<local>;127.0.0.1;localhost;::1;*.localhost')
-app.commandLine.appendSwitch('no-proxy-server')
-
+// Must run before anything logs: a Finder/Dock launch inherits unreadable
+// stdio, and an unguarded write failure there surfaces as a crash dialog.
+installStdioWriteFailureGuards()
 installMacOsChromiumKeychainPromptGuard(app)
 
 function appRoot() {
@@ -86,6 +119,10 @@ function previewPreloadPath() {
   return path.join(appRoot(), 'electron-dist', 'preview-preload.cjs')
 }
 
+function petPreloadPath() {
+  return path.join(appRoot(), 'electron-dist', 'pet-preload.cjs')
+}
+
 function previewAgentPath() {
   return path.join(appRoot(), 'src-tauri', 'resources', 'preview-agent.js')
 }
@@ -95,6 +132,47 @@ function rendererEntry() {
     isPackaged: app.isPackaged,
     appRoot: appRoot(),
     env: process.env,
+  })
+}
+
+/**
+ * Last appearance the renderer reported, kept in memory so the OS-flip watcher
+ * does not have to re-read the cache file (and race with its own write).
+ * Seeded from disk on first use because the renderer has not reported yet.
+ */
+let lastAppliedAppearance: AppliedAppearance | null = null
+
+function currentAppearance(): AppliedAppearance | null {
+  if (!lastAppliedAppearance) lastAppliedAppearance = readAppearanceState(app)
+  return lastAppliedAppearance
+}
+
+/**
+ * The renderer keeps its theme in localStorage, which the main process cannot
+ * read, so the last applied appearance is replayed from cache to pick the
+ * pre-paint window background. First launch falls back to the OS setting.
+ *
+ * `shouldUseDarkColors` is the true OS setting here because `themeSource` is
+ * never pinned — see services/nativeAppearance.ts.
+ */
+function resolveStartupWindowBackground(): string {
+  return startupWindowBackground(currentAppearance(), nativeTheme.shouldUseDarkColors)
+}
+
+/**
+ * While the user follows the OS, repaint window backgrounds the moment the OS
+ * flips instead of waiting for the renderer to notice and report back — that
+ * round-trip is visible as a flash of the old color when resizing.
+ */
+function installSystemAppearanceWatch() {
+  nativeTheme.on('updated', () => {
+    const current = currentAppearance()
+    if (current && !current.followSystem) return
+    const background = startupWindowBackground(current, nativeTheme.shouldUseDarkColors)
+    for (const window of [mainWindow, ...traceWindows.values()]) {
+      if (!window || window.isDestroyed()) continue
+      window.setBackgroundColor(background)
+    }
   })
 }
 
@@ -129,6 +207,7 @@ async function openTraceWindow(sessionId: string) {
     title: 'Trace',
     autoHideMenuBar: true,
     show: false,
+    backgroundColor: resolveStartupWindowBackground(),
     webPreferences: {
       preload: preloadPath(),
       contextIsolation: true,
@@ -153,23 +232,35 @@ function getServerRuntime() {
     desktopRoot: unpackedRoot(),
     appRoot: appRoot(),
     h5DistDir: path.join(unpackedRoot(), 'dist'),
+    diagnosticsFile: electronHostDiagnosticsFile(process.env),
     resolveSystemProxy: (url) => session.defaultSession.resolveProxy(url),
   })
   return serverRuntime
+}
+
+function resolvePetServerAccess(): PreviewLocalAccess | null {
+  const runtime = getServerRuntime()
+  const serverUrl = runtime.getActiveServerUrl()
+  return serverUrl
+    ? { serverUrl, token: runtime.getPetAccessToken() }
+    : null
+}
+
+function resolveMainRendererServerAccess(): PreviewLocalAccess | null {
+  const runtime = getServerRuntime()
+  const serverUrl = runtime.getActiveServerUrl()
+  return serverUrl
+    ? { serverUrl, token: runtime.getLocalAccessToken() }
+    : null
 }
 
 function getUpdaterService() {
   const smokeUpdater = createUpdateSmokeUpdaterFromEnv(process.env)
   updaterService ??= new ElectronUpdaterService(smokeUpdater ?? autoUpdater, {
     async apply(proxy) {
-      const config = proxy
-        ? { proxyRules: proxy, proxyBypassRules: '<local>' }
-        : {}
-      await Promise.all([
-        app.setProxy(config),
-        session.defaultSession.setProxy(config),
-      ])
-      await session.defaultSession.forceReloadProxyConfig()
+      // Update traffic runs on electron-updater's own session partition;
+      // configuring app/defaultSession proxies never reaches it.
+      await autoUpdater.netSession.setProxy(updaterSessionProxyConfig(proxy))
     },
   }, {
     updateConfigPath: !smokeUpdater && app.isPackaged ? path.join(process.resourcesPath, 'app-update.yml') : undefined,
@@ -194,20 +285,69 @@ function getTerminalService() {
 function getPreviewService() {
   previewService ??= new ElectronPreviewService({
     previewScriptPath: previewAgentPath(),
+    resolveScaleFactor: parent => {
+      const bounds = parent.getBounds?.()
+      return bounds ? screen.getDisplayMatching(bounds).scaleFactor : 1
+    },
     createView: () => {
       const view = new WebContentsView({
         webPreferences: {
           preload: previewPreloadPath(),
+          partition: createPreviewSessionPartition(),
           contextIsolation: true,
           nodeIntegration: false,
           sandbox: true,
         },
       })
+      configurePreviewSessionPermissions(view.webContents.session)
       installPreviewNavigationGuards(view.webContents, { openExternal: openExternalUrl })
       return view
     },
   })
   return previewService
+}
+
+function getPetWindowController() {
+  petWindowController ??= new PetWindowController({
+    createWindow: options => new BrowserWindow(options),
+    getCursorScreenPoint: () => screen.getCursorScreenPoint(),
+    getCurrentWorkArea: () => screen.getDisplayNearestPoint(
+      screen.getCursorScreenPoint(),
+    ).workArea,
+    getWorkAreaForPoint: point => screen.getDisplayNearestPoint(point).workArea,
+    preloadPath: petPreloadPath(),
+    platform: process.platform,
+    readPosition: () => readPetWindowPosition(process.env, app.getPath('home')),
+    writePosition: position => writePetWindowPosition(position, process.env, app.getPath('home')),
+    onCreated: (window) => {
+      configurePreviewSessionPermissions(window.webContents.session)
+      configureLocalServerRequestAuth(
+        window.webContents.session.webRequest,
+        resolvePetServerAccess,
+      )
+      installMainWindowNavigationGuards(window.webContents, { openExternal: openExternalUrl })
+    },
+    load: window => loadRendererEntry(window, { petWindow: '1' }),
+    onPanelPlacementChanged: (window, placement) => {
+      if (window.isDestroyed()) return
+      window.webContents.send(ELECTRON_EVENT_CHANNELS.petPanelPlacementChanged, placement)
+    },
+  })
+  return petWindowController
+}
+
+const loadCustomPetCatalog = createCustomPetCatalogLoader(() => loadCustomPets({
+    inspectImageSize: ({ data }) => nativeImage.createFromBuffer(data).getSize(),
+  }))
+
+async function listCustomPets() {
+  const { pets, errors } = await loadCustomPetCatalog()
+  return { pets, errors }
+}
+
+function focusPetSession(sessionId: string) {
+  showMainWindow(mainWindow, app)
+  mainWindow?.webContents.send(ELECTRON_EVENT_CHANNELS.petNavigateSession, sessionId)
 }
 
 function currentWindow(event: Electron.IpcMainInvokeEvent) {
@@ -224,6 +364,13 @@ function registerHandler<T>(
     if (!isElectronIpcChannel(channel) || !validateElectronIpcPayload(channel, payload)) {
       throw new Error(`Invalid Electron IPC payload for ${channel}`)
     }
+    const senderWindow = BrowserWindow.fromWebContents(event.sender)
+    if (
+      petWindowController?.owns(senderWindow) &&
+      !isElectronIpcChannelAllowedForPetWindow(channel)
+    ) {
+      throw new Error(`Electron IPC channel ${channel} is not available to the pet window`)
+    }
     return handler(event, payload)
   })
 }
@@ -235,6 +382,13 @@ function unsupported(name: string): never {
 function emitNotificationAction(payload: unknown) {
   showMainWindow(mainWindow, app)
   mainWindow?.webContents.send(ELECTRON_EVENT_CHANNELS.notificationAction, payload)
+}
+
+function broadcastLocaleChanged(locale: Locale) {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (window.isDestroyed()) continue
+    window.webContents.send(ELECTRON_EVENT_CHANNELS.appLocaleChanged, locale)
+  }
 }
 
 async function handleCommandInvoke(payload: unknown): Promise<unknown> {
@@ -268,12 +422,30 @@ function registerIpcHandlers() {
     void getPreviewService().sendMessageToRenderer(event.sender, raw, mainWindow?.webContents)
   })
   registerHandler(ELECTRON_IPC_CHANNELS.appGetVersion, () => app.getVersion())
-  registerHandler(ELECTRON_IPC_CHANNELS.runtimeGetServerUrl, () => getServerRuntime().getServerUrl())
-  registerHandler(ELECTRON_IPC_CHANNELS.runtimeCheckServerHealth, (_event, serverUrl) =>
-    probeServerHealth(String(serverUrl)),
+  registerHandler(
+    ELECTRON_IPC_CHANNELS.appGetLocalePreference,
+    () => readLocalePreference(app),
   )
-  registerHandler(ELECTRON_IPC_CHANNELS.runtimeHttpRequest, (_event, payload) =>
-    performHttpRequest(payload as Parameters<typeof performHttpRequest>[0]),
+  registerHandler(ELECTRON_IPC_CHANNELS.appSetLocalePreference, (event, payload) => {
+    if (currentWindow(event) !== mainWindow) {
+      throw new Error('Only the main window can change the locale preference')
+    }
+    const locale = payload as Locale
+    writeLocalePreference(app, locale)
+    broadcastLocaleChanged(locale)
+  })
+  registerHandler(
+    ELECTRON_IPC_CHANNELS.appGetPreferredSystemLanguages,
+    () => app.getPreferredSystemLanguages(),
+  )
+  registerHandler(ELECTRON_IPC_CHANNELS.runtimeGetServerUrl, () => getServerRuntime().getServerUrl())
+  registerHandler(
+    ELECTRON_IPC_CHANNELS.runtimeGetLocalAccessToken,
+    () => getServerRuntime().getLocalAccessToken(),
+  )
+  registerHandler(
+    ELECTRON_IPC_CHANNELS.runtimeGetPetAccessToken,
+    () => getServerRuntime().getPetAccessToken(),
   )
   registerHandler(ELECTRON_IPC_CHANNELS.commandInvoke, (_event, payload) => handleCommandInvoke(payload))
   registerHandler(ELECTRON_IPC_CHANNELS.clipboardReadText, () => clipboard.readText())
@@ -281,6 +453,149 @@ function registerIpcHandlers() {
   registerHandler(ELECTRON_IPC_CHANNELS.shellOpen, (_event, payload) => openExternalUrl(String(payload)))
   registerHandler(ELECTRON_IPC_CHANNELS.shellOpenPath, (_event, payload) => openSystemPath(String(payload)))
   registerHandler(ELECTRON_IPC_CHANNELS.traceOpenWindow, (_event, payload) => openTraceWindow(String(payload)))
+  registerHandler(ELECTRON_IPC_CHANNELS.petsList, () => listCustomPets())
+  registerHandler(ELECTRON_IPC_CHANNELS.petsCreateFromImage, async (event, payload) => {
+    const input = payload as {
+      slug: string
+      displayName: string
+      description: string
+      dialogTitle?: string
+      dialogFilterName?: string
+    }
+    const imagePath = await openDialog(currentWindow(event), {
+      title: input.dialogTitle || 'Choose a transparent pet image',
+      filters: [{ name: input.dialogFilterName || 'Pet image', extensions: ['png', 'webp'] }],
+    })
+    if (typeof imagePath !== 'string') return null
+    try {
+      const pet = await loadCustomPetCatalog.invalidateAfter(() =>
+        createCustomPetFromImage({
+          slug: input.slug,
+          displayName: input.displayName,
+          description: input.description,
+          imagePath,
+        }, {
+          inspectImageSize: ({ data }) => nativeImage.createFromBuffer(data).getSize(),
+        }))
+      return { id: pet.id }
+    } catch (error) {
+      return { errorCode: getPetPackageErrorCode(error) }
+    }
+  })
+  registerHandler(ELECTRON_IPC_CHANNELS.petsCreateFromAtlas, async (event, payload) => {
+    const input = payload as {
+      slug: string
+      displayName: string
+      description: string
+      dialogTitle?: string
+      dialogFilterName?: string
+    }
+    const atlasPath = await openDialog(currentWindow(event), {
+      title: input.dialogTitle || 'Choose a v2 pet animation atlas',
+      filters: [{ name: input.dialogFilterName || 'Pet animation atlas', extensions: ['png', 'webp'] }],
+    })
+    if (typeof atlasPath !== 'string') return null
+    try {
+      const pet = await loadCustomPetCatalog.invalidateAfter(() =>
+        createCustomPetFromAtlas({
+          slug: input.slug,
+          displayName: input.displayName,
+          description: input.description,
+          atlasPath,
+        }, {
+          inspectImageSize: ({ data }) => nativeImage.createFromBuffer(data).getSize(),
+        }))
+      return { id: pet.id }
+    } catch (error) {
+      return { errorCode: getPetPackageErrorCode(error) }
+    }
+  })
+  registerHandler(ELECTRON_IPC_CHANNELS.petsPickSourceSheet, async (event, payload) => {
+    const input = payload as { dialogTitle?: string, dialogFilterName?: string }
+    const imagePath = await openDialog(currentWindow(event), {
+      title: input.dialogTitle || 'Choose a pet action sheet',
+      filters: [{ name: input.dialogFilterName || 'Pet action sheet', extensions: ['png', 'webp'] }],
+    })
+    if (typeof imagePath !== 'string') return null
+    try {
+      const source = await readCustomPetSourceImage(imagePath)
+      // The renderer needs the pixels to assemble the atlas on a canvas; the path
+      // itself is deliberately never handed over.
+      return {
+        bytes: source.data,
+        mimeType: source.mimeType,
+        width: source.width,
+        height: source.height,
+      }
+    } catch (error) {
+      return { errorCode: getPetPackageErrorCode(error) }
+    }
+  })
+  registerHandler(ELECTRON_IPC_CHANNELS.petsCreateFromAtlasBytes, async (_event, payload) => {
+    const input = payload as {
+      slug: string
+      displayName: string
+      description: string
+      atlasData: Uint8Array
+      mimeType: 'image/png' | 'image/webp'
+    }
+    try {
+      const pet = await loadCustomPetCatalog.invalidateAfter(() =>
+        createCustomPetFromAtlasBytes({
+          slug: input.slug,
+          displayName: input.displayName,
+          description: input.description,
+          atlasData: input.atlasData,
+          mimeType: input.mimeType,
+        }, {
+          inspectImageSize: ({ data }) => nativeImage.createFromBuffer(data).getSize(),
+        }))
+      return { id: pet.id }
+    } catch (error) {
+      return { errorCode: getPetPackageErrorCode(error) }
+    }
+  })
+  registerHandler(ELECTRON_IPC_CHANNELS.petsOpenFolder, async () => {
+    const root = await ensureCustomPetsRoot()
+    await openSystemPath(root)
+  })
+  registerHandler(ELECTRON_IPC_CHANNELS.petsShow, async () => {
+    await getPetWindowController().show()
+    mainWindow?.webContents.send(ELECTRON_EVENT_CHANNELS.petVisibilityChanged, true)
+  })
+  registerHandler(ELECTRON_IPC_CHANNELS.petsHide, () => {
+    getPetWindowController().hide()
+    mainWindow?.webContents.send(ELECTRON_EVENT_CHANNELS.petVisibilityChanged, false)
+  })
+  registerHandler(ELECTRON_IPC_CHANNELS.petsShowContextMenu, (event, payload) => {
+    const { closeLabel } = payload as { closeLabel: string }
+    return getPetWindowController().showContextMenu(
+      currentWindow(event),
+      closeLabel.trim(),
+      Menu,
+    )
+  })
+  registerHandler(ELECTRON_IPC_CHANNELS.petsDragWindow, (event, payload) =>
+    getPetWindowController().dragWindow(
+      currentWindow(event),
+      payload as PetWindowDragPayload,
+    ))
+  registerHandler(ELECTRON_IPC_CHANNELS.petsSetIgnoreMouseEvents, (event, payload) => {
+    getPetWindowController().setIgnoreMouseEvents(currentWindow(event), Boolean(payload))
+  })
+  registerHandler(ELECTRON_IPC_CHANNELS.petsSetInteractiveRegions, (event, payload) =>
+    getPetWindowController().setInteractiveRegions(
+      currentWindow(event),
+      payload as Electron.Rectangle[],
+    ))
+  registerHandler(ELECTRON_IPC_CHANNELS.petsFocusMainWindow, (event) => {
+    if (!getPetWindowController().owns(currentWindow(event))) {
+      throw new Error('Pet window IPC sender does not own the companion window')
+    }
+    showMainWindow(mainWindow, app)
+  })
+  registerHandler(ELECTRON_IPC_CHANNELS.petsFocusSession, (_event, payload) =>
+    focusPetSession(String(payload)))
   registerHandler(ELECTRON_IPC_CHANNELS.dialogOpen, (event, payload) =>
     openDialog(currentWindow(event), payload as Parameters<typeof openDialog>[1]))
   registerHandler(ELECTRON_IPC_CHANNELS.dialogSave, (event, payload) =>
@@ -324,17 +639,17 @@ function registerIpcHandlers() {
   registerHandler(ELECTRON_IPC_CHANNELS.windowIsMaximized, event => currentWindow(event).isMaximized())
   registerHandler(ELECTRON_IPC_CHANNELS.terminalSpawn, (event, payload) =>
     getTerminalService().spawn((payload ?? {}) as TerminalSpawnInput, event.sender))
-  registerHandler(ELECTRON_IPC_CHANNELS.terminalWrite, (_event, payload) => {
+  registerHandler(ELECTRON_IPC_CHANNELS.terminalWrite, (event, payload) => {
     const { sessionId, data } = payload as { sessionId: number, data: string }
-    return getTerminalService().write(sessionId, data)
+    return getTerminalService().write(sessionId, data, event.sender)
   })
-  registerHandler(ELECTRON_IPC_CHANNELS.terminalResize, (_event, payload) => {
+  registerHandler(ELECTRON_IPC_CHANNELS.terminalResize, (event, payload) => {
     const { sessionId, cols, rows } = payload as { sessionId: number, cols: number, rows: number }
-    return getTerminalService().resize(sessionId, cols, rows)
+    return getTerminalService().resize(sessionId, cols, rows, event.sender)
   })
-  registerHandler(ELECTRON_IPC_CHANNELS.terminalKill, (_event, payload) => {
+  registerHandler(ELECTRON_IPC_CHANNELS.terminalKill, (event, payload) => {
     const { sessionId } = payload as { sessionId: number }
-    return getTerminalService().kill(sessionId)
+    return getTerminalService().kill(sessionId, event.sender)
   })
   registerHandler(ELECTRON_IPC_CHANNELS.terminalGetBashPath, () => getTerminalService().getBashPath())
   registerHandler(ELECTRON_IPC_CHANNELS.terminalSetBashPath, (_event, payload) => getTerminalService().setBashPath(payload as string | null))
@@ -350,8 +665,7 @@ function registerIpcHandlers() {
   registerHandler(ELECTRON_IPC_CHANNELS.previewMessage, (event, payload) => getPreviewService().message(payload, event.sender))
   registerHandler(ELECTRON_IPC_CHANNELS.appModeGet, () => getAppMode(app))
   registerHandler(ELECTRON_IPC_CHANNELS.appModeSet, (_event, payload) => setAppMode(app, payload as Parameters<typeof setAppMode>[1]))
-  registerHandler(ELECTRON_IPC_CHANNELS.appModeDetectPortableDir, () => detectPortableDir(app) as PortableDetection)
-  registerHandler(ELECTRON_IPC_CHANNELS.appModePrepareRestart, () => getServerRuntime().stopAll())
+  registerHandler(ELECTRON_IPC_CHANNELS.appModePrepareRestart, () => getServerRuntime().stopAll(true))
   registerHandler(ELECTRON_IPC_CHANNELS.appModeRestart, () => {
     isQuitting = true
     app.relaunch()
@@ -359,6 +673,15 @@ function registerIpcHandlers() {
   })
   registerHandler(ELECTRON_IPC_CHANNELS.adaptersRestartSidecar, () => getServerRuntime().restartAdaptersSidecars())
   registerHandler(ELECTRON_IPC_CHANNELS.zoomSet, (event, payload) => currentWindow(event).webContents.setZoomFactor(normalizeZoomFactor(payload)))
+  registerHandler(ELECTRON_IPC_CHANNELS.appearanceSetApplied, (_event, payload) => {
+    if (!isAppliedAppearance(payload)) return
+    lastAppliedAppearance = payload
+    applyAppliedAppearance(payload, {
+      app,
+      // The pet window is deliberately transparent, so it stays out of this.
+      windows: () => [mainWindow, ...traceWindows.values()].filter((window): window is BrowserWindow => !!window),
+    })
+  })
 }
 
 async function createMainWindow() {
@@ -369,6 +692,9 @@ async function createMainWindow() {
     minWidth: MIN_WINDOW_WIDTH,
     minHeight: MIN_WINDOW_HEIGHT,
     show: false,
+    // Painted before the renderer produces its first frame; without it a
+    // dark-theme user gets a white flash on every launch.
+    backgroundColor: resolveStartupWindowBackground(),
     ...windowChromeOptionsForPlatform(process.platform),
     webPreferences: {
       preload: preloadPath(),
@@ -377,8 +703,16 @@ async function createMainWindow() {
       sandbox: true,
     },
   })
-
+  configureLocalServerRequestAuth(
+    mainWindow.webContents.session.webRequest,
+    resolveMainRendererServerAccess,
+    details => isAllowlistedMainRendererMediaRequest(
+      details,
+      mainWindow!.webContents.id,
+    ),
+  )
   installMainWindowNavigationGuards(mainWindow.webContents, { openExternal: openExternalUrl })
+  await installRendererContextMenu(mainWindow)
   installPreviewCleanupOnRendererNavigation(mainWindow.webContents, () => {
     previewService?.close()
   })
@@ -389,37 +723,50 @@ async function createMainWindow() {
     shouldQuit: () => isQuitting,
   })
 
-  mainWindow.on('resize', () => {
-    mainWindow?.webContents.send(ELECTRON_EVENT_CHANNELS.windowResized)
-  })
-  mainWindow.webContents.on('did-finish-load', () => {
-    writeWindowSmokeSnapshot(mainWindow, 'did-finish-load')
-  })
-  mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
-    writeWindowSmokeSnapshot(mainWindow, `did-fail-load:${errorCode}:${errorDescription}:${validatedURL}`)
-  })
+  const window = mainWindow
+  const diagnosticsFile = electronHostDiagnosticsFile(process.env)
+  const recordRendererDiagnostic = (detail: string) => {
+    const sanitized = sanitizeHostDiagnostic(detail)
+    appendHostDiagnostic(diagnosticsFile, `[renderer] ${sanitized}`)
+    return sanitized
+  }
 
-  // F12 toggles DevTools. Without this, users on Windows cannot diagnose
-  // renderer-side issues (WebSocket state, fetch errors, console logs). The
-  // toggle is bound to the main window's webContents and only fires when the
-  // window itself is focused, so it does not interfere with other shortcuts.
-  mainWindow.webContents.on('before-input-event', (_event, input) => {
-    if (input.type !== 'keyDown') return
-    if (input.key === 'F12') {
-      if (mainWindow?.webContents.isDevToolsOpened()) {
-        mainWindow.webContents.closeDevTools()
-      } else {
-        mainWindow?.webContents.openDevTools({ mode: 'detach' })
-      }
-    }
+  window.on('resize', () => {
+    if (window.isDestroyed()) return
+    window.webContents.send(ELECTRON_EVENT_CHANNELS.windowResized)
   })
-
+  installRendererLifecycle({
+    window,
+    isQuitting: () => isQuitting,
+    recordDiagnostic: recordRendererDiagnostic,
+    writeSnapshot: reason => writeWindowSmokeSnapshot(window, reason),
+    onRendererProcessGone: detail => {
+      console.error(`[desktop] Electron renderer process exited: ${detail}`)
+    },
+    onRecoveryExhausted: detail => {
+      console.error(`[desktop] Electron renderer recovery exhausted: ${detail}`)
+      dialog.showErrorBox(
+        '界面恢复失败 / Interface Recovery Failed',
+        `桌面界面意外退出或持续无响应，自动恢复未能解决问题。请重启应用；如果问题持续存在，请附上诊断日志反馈。\n\nThe desktop interface exited unexpectedly or remained unresponsive, and automatic recovery did not resolve it. Restart the app and include diagnostics when reporting the problem.\n\n${detail}`,
+      )
+    },
+  })
   writeWindowSmokeSnapshot(mainWindow, 'after-create')
 
-  await loadRendererEntry(mainWindow)
-
-  restoreWindowMaximized(mainWindow, restoredState)
-  showMainWindow(mainWindow, app)
+  await loadAndRevealMainWindow({
+    load: () => loadRendererEntry(mainWindow!),
+    beforeReveal: () => restoreWindowMaximized(mainWindow!, restoredState),
+    reveal: () => showMainWindow(mainWindow, app),
+    onLoadFailure: (error) => {
+      const detail = sanitizeHostDiagnostic(error instanceof Error ? error.message : String(error))
+      console.error(`[desktop] failed to load Electron renderer: ${detail}`)
+      writeWindowSmokeSnapshot(mainWindow, 'renderer-load-failed')
+      dialog.showErrorBox(
+        '启动错误 / Startup Error',
+        `桌面界面加载失败，请重启应用。如果问题持续存在，请附上诊断日志反馈。\n\nThe desktop interface could not be loaded. Restart the app and include diagnostics when reporting the problem.\n\n${detail}`,
+      )
+    },
+  })
   refreshWindowsDragHitTest(mainWindow, process.platform)
   writeWindowSmokeSnapshot(mainWindow, 'after-final-show')
 }
@@ -431,24 +778,14 @@ if (!acquireSingleInstanceLock(app, () => mainWindow)) {
 registerIpcHandlers()
 
 app.whenReady().then(async () => {
-  // Force every network request from this Electron session — including the
-  // renderer process's fetch AND WebSocket — to bypass the system proxy
-  // when the target is loopback. Without this, on Windows machines whose
-  // system proxy is set, the renderer cannot dial 127.0.0.1 and surfaces
-  // `TypeError: Failed to fetch` plus silently hanging WebSocket upgrade
-  // attempts (#953 follow-up; also blocks chat streaming).
-  try {
-    await session.defaultSession.setProxy({
-      proxyRules: 'direct://',
-      proxyBypassRules: '<local>;127.0.0.1;localhost;::1;*.localhost',
-    })
-    await session.defaultSession.forceReloadProxyConfig()
-  } catch (error) {
-    console.error('[desktop] failed to install loopback proxy bypass', error)
-  }
-
   applyWindowsAppUserModelId(app)
   applyStartupPortableMode(app)
+  installSystemAppearanceWatch()
+  screen.on('display-metrics-changed', (_event, _display, changedMetrics) => {
+    if (changedMetrics.includes('scaleFactor') || changedMetrics.includes('bounds')) {
+      previewService?.refreshBounds()
+    }
+  })
   await getServerRuntime().startServer().catch(error => {
     console.error('[desktop] failed to start Electron server sidecar', error)
   })
@@ -494,6 +831,8 @@ app.on('before-quit', () => {
   trayController = null
   terminalService?.killAll()
   previewService?.close()
+  petWindowController?.dispose()
+  petWindowController = null
   // Synchronous on quit so the Windows taskkill completes before the process
   // exits, otherwise the fire-and-forget kill can leave orphaned sidecars.
   getServerRuntime().stopAll(true)

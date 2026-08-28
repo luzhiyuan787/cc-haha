@@ -18,6 +18,15 @@ const taskFixture = (overrides: Record<string, unknown>) => ({
   ...overrides,
 })
 
+async function rmWithRetry(targetPath: string): Promise<void> {
+  await fs.rm(targetPath, {
+    recursive: true,
+    force: true,
+    maxRetries: process.platform === 'win32' ? 5 : 0,
+    retryDelay: 100,
+  })
+}
+
 // ============================================================================
 // TaskService unit tests
 // ============================================================================
@@ -135,8 +144,10 @@ describe('Tasks API', () => {
   })
 
   afterEach(async () => {
-    server?.stop()
-    await fs.rm(tmpDir, { recursive: true, force: true })
+    server?.stop(true)
+    const { stopServerRuntimeForShutdown } = await import('../../server/index.js')
+    await stopServerRuntimeForShutdown()
+    await rmWithRetry(tmpDir)
     delete process.env.CLAUDE_CONFIG_DIR
   })
 
@@ -165,6 +176,35 @@ describe('Tasks API', () => {
   it('should return 404 for unknown task', async () => {
     const res = await fetch(`${baseUrl}/api/tasks/lists/default-list/nonexistent`)
     expect(res.status).toBe(404)
+  })
+
+  it('should reset a persisted task list', async () => {
+    const taskListDir = path.join(tmpDir, 'tasks', 'desktop-session-1')
+    await fs.mkdir(taskListDir, { recursive: true })
+    await fs.writeFile(path.join(taskListDir, '1.json'), JSON.stringify(taskFixture({
+      id: '1',
+      subject: 'First task',
+      status: 'completed',
+    })))
+    await fs.writeFile(path.join(taskListDir, '2.json'), JSON.stringify(taskFixture({
+      id: '2',
+      subject: 'Second task',
+      status: 'completed',
+    })))
+
+    const before = await fetch(`${baseUrl}/api/tasks/lists/desktop-session-1`)
+    expect(before.status).toBe(200)
+    expect((await before.json()).tasks).toHaveLength(2)
+
+    const reset = await fetch(`${baseUrl}/api/tasks/lists/desktop-session-1/reset`, {
+      method: 'POST',
+    })
+    expect(reset.status).toBe(200)
+    expect(await reset.json()).toEqual({ ok: true })
+
+    const after = await fetch(`${baseUrl}/api/tasks/lists/desktop-session-1`)
+    expect(after.status).toBe(200)
+    expect((await after.json()).tasks).toEqual([])
   })
 
   it('should reject non-GET methods', async () => {

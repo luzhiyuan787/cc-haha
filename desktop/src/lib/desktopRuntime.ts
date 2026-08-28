@@ -163,9 +163,17 @@ export async function initializeDesktopServerUrl() {
   }
 
   try {
-    const serverUrl = await host.runtime.getServerUrl()
+    const [serverUrl, localAccessToken] = await Promise.all([
+      host.runtime.getServerUrl(),
+      // The process token only *raises* what the shell may do; loopback is
+      // trusted without it. Losing it must not take the whole app down with it.
+      host.runtime.getLocalAccessToken().catch((error) => {
+        console.warn('[desktop] local access token unavailable, continuing on loopback trust', error)
+        return null
+      }),
+    ])
     setBaseUrl(serverUrl)
-    setAuthToken(null)
+    setAuthToken(localAccessToken)
     await waitForHealth(serverUrl)
     markDesktopServerReady()
     return serverUrl
@@ -196,15 +204,13 @@ async function initializeBrowserServerUrl(fallbackUrl: string) {
     !hasExplicitDefaultBaseUrl() &&
     !!sameOriginUrl &&
     requestedUrl === sameOriginUrl
-  const token = queryToken ?? stored.token
+  // A bearer token belongs to exactly one H5 server. A query-selected server
+  // must never inherit credentials paired with a different authority.
+  const token = queryToken ?? (stored.serverUrl === requestedUrl ? stored.token : null)
   const browserH5Runtime = requiresH5AuthForServerUrl(requestedUrl)
 
   setBaseUrl(requestedUrl)
   setAuthToken(browserH5Runtime ? token : null)
-  if (browserH5Runtime) {
-    rememberStoredH5ServerUrl(requestedUrl)
-  }
-
   try {
     await waitForHealth(requestedUrl)
   } catch (error) {
@@ -236,6 +242,9 @@ async function initializeBrowserServerUrl(fallbackUrl: string) {
   }
 
   if (!token) {
+    // Keep the existing recovery UX for a first-time connection, but never
+    // replace a paired server while withholding its token from a new one.
+    if (!stored.token) rememberStoredH5ServerUrl(requestedUrl)
     clearStoredH5Token()
     throw new H5ConnectionRequiredError(
       'Enter your H5 token to continue.',
@@ -251,6 +260,8 @@ async function initializeBrowserServerUrl(fallbackUrl: string) {
     throw normalizeBrowserH5Error(error, requestedUrl)
   }
 
+  rememberStoredH5ServerUrl(requestedUrl)
+
   if (queryToken && typeof window !== 'undefined') {
     try {
       window.localStorage.setItem(H5_TOKEN_STORAGE_KEY, queryToken)
@@ -264,19 +275,28 @@ async function initializeBrowserServerUrl(fallbackUrl: string) {
 }
 
 async function waitForHealth(serverUrl: string) {
-  // Probe via the desktop host (IPC under Electron, fetch in the browser
-  // fallback). Routing the probe through the main process avoids the
-  // Electron renderer's fetch being affected by the app/session proxy
-  // configuration, which on Windows-on-corp-network causes `Failed to fetch`
-  // even though the sidecar is reachable on loopback (#953 follow-up).
-  const host = getDetectedDesktopHost()
   let lastError: unknown
 
   for (let attempt = 0; attempt < 30; attempt++) {
     try {
-      const result = await host.runtime.checkServerHealth(serverUrl)
-      if (result.ok) return
-      lastError = new Error(result.reason)
+      const response = await fetch(`${serverUrl}/health`, {
+        cache: 'no-store',
+      })
+      if (response.ok) {
+        const contentType = response.headers.get('content-type') ?? ''
+        if (!contentType.toLowerCase().includes('application/json')) {
+          lastError = new Error(`healthcheck returned non-JSON response from ${serverUrl}/health`)
+          break
+        } else {
+          const body = await response.json().catch(() => null)
+          if (body && typeof body === 'object' && 'status' in body && body.status === 'ok') {
+            return
+          }
+          lastError = new Error(`healthcheck returned invalid response from ${serverUrl}/health`)
+        }
+      } else {
+        lastError = new Error(`healthcheck returned ${response.status}`)
+      }
     } catch (error) {
       lastError = error
     }

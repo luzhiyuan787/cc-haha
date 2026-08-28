@@ -54,12 +54,12 @@ export const TaskGetTool = buildTool({
   userFacingName() {
     return 'TaskGet'
   },
-  shouldDefer: true,
+  alwaysLoad: true,
   isEnabled() {
     return isTodoV2Enabled()
   },
   isConcurrencySafe() {
-    return true
+    return false
   },
   isReadOnly() {
     return true
@@ -70,8 +70,8 @@ export const TaskGetTool = buildTool({
   renderToolUseMessage() {
     return null
   },
-  async call({ taskId }) {
-    const taskListId = getTaskListId()
+  async call({ taskId }, context) {
+    const taskListId = getTaskListId(context?.agentId)
 
     const task = await getTask(taskListId, taskId)
 

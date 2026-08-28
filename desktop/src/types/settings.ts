@@ -1,13 +1,54 @@
 // Source: src/server/api/models.ts, src/server/api/settings.ts
 
-export type PermissionMode = 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions' | 'dontAsk'
+export type PermissionMode = 'default' | 'acceptEdits' | 'auto' | 'plan' | 'bypassPermissions' | 'dontAsk'
 
-export type EffortLevel = 'low' | 'medium' | 'high' | 'max'
-export const THEME_MODES = ['white', 'light', 'dark'] as const
+export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+export type ReasoningEffortLevel = EffortLevel
+/**
+ * The six 「纸 · 墨 · 印」 palettes, in the order the appearance picker shows
+ * them: four paper grounds, then two ink ones. Each name matches a
+ * `[data-theme]` block in theme/globals.css.
+ *
+ * `light` was the pre-redesign key for the warm workspace; it migrates to
+ * `warm-classic` (see lib/persistenceMigrations.ts).
+ */
+export const THEME_MODES = ['white', 'paper', 'warm-classic', 'celadon', 'dark', 'ink-blue'] as const
 export type ThemeMode = (typeof THEME_MODES)[number]
+
+/** The two themes on a dark ground. Drives `color-scheme` and Mermaid. */
+export const DARK_THEME_MODES = ['dark', 'ink-blue'] as const
+export type DarkThemeMode = (typeof DARK_THEME_MODES)[number]
+
+/**
+ * The four paper grounds. Following the system only yields a dark/light
+ * signal, so each half carries its own preference — these are the values the
+ * light half can resolve to.
+ */
+export const LIGHT_THEME_MODES = ['white', 'paper', 'warm-classic', 'celadon'] as const
+export type LightThemeMode = (typeof LIGHT_THEME_MODES)[number]
+
+/**
+ * Every palette belongs to exactly one half. This fails to compile if a
+ * seventh theme is added without deciding which ground it sits on — the
+ * appearance switch would otherwise silently never resolve to it.
+ */
+const _everyThemeHasAGround: ThemeMode extends LightThemeMode | DarkThemeMode ? true : never = true
+void _everyThemeHasAGround
 
 export function isThemeMode(value: unknown): value is ThemeMode {
   return typeof value === 'string' && (THEME_MODES as readonly string[]).includes(value)
+}
+
+export function isDarkTheme(theme: ThemeMode): boolean {
+  return (DARK_THEME_MODES as readonly string[]).includes(theme)
+}
+
+export function isLightThemeMode(value: unknown): value is LightThemeMode {
+  return typeof value === 'string' && (LIGHT_THEME_MODES as readonly string[]).includes(value)
+}
+
+export function isDarkThemeMode(value: unknown): value is DarkThemeMode {
+  return typeof value === 'string' && (DARK_THEME_MODES as readonly string[]).includes(value)
 }
 
 export type WebSearchMode = 'auto' | 'anthropic' | 'tavily' | 'brave' | 'disabled'
@@ -102,6 +143,8 @@ export type ModelInfo = {
   name: string
   description: string
   context: string
+  defaultReasoningEffort?: ReasoningEffortLevel
+  supportedReasoningEfforts?: ReasoningEffortLevel[]
 }
 
 export type UserSettings = {
@@ -109,7 +152,9 @@ export type UserSettings = {
   modelContext?: string
   effort?: EffortLevel
   alwaysThinkingEnabled?: boolean
+  workflowKeywordTriggerEnabled?: boolean
   autoDreamEnabled?: boolean
+  skipAutoPermissionPrompt?: boolean
   permissionMode?: PermissionMode
   theme?: ThemeMode
   chatSendBehavior?: ChatSendBehavior
@@ -132,7 +177,6 @@ export type AppMode = 'default' | 'portable'
 export type AppModeConfig = {
   mode: AppMode
   portableDir: string | null
-  defaultPortableDir: string | null
   activeConfigDir?: string | null
   configDirSource?: 'system' | 'environment' | 'portable'
 }

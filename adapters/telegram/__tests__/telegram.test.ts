@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test'
-import { splitMessage, formatPermissionRequest, truncateInput, escapeMarkdownV2 } from '../../common/format.js'
+import { splitMessage, formatPermissionRequest, escapeMarkdownV2 } from '../../common/format.js'
 import { parsePermitCallbackData } from '../../common/permission.js'
 import {
   buildTelegramThinkingUpdate,
@@ -180,22 +180,4 @@ describe('Telegram message formatting', () => {
     })
   })
 
-  describe('whitelist logic', () => {
-    it('empty allowedUsers means allow all', () => {
-      const allowedUsers: number[] = []
-      const isAllowed = (userId: number) =>
-        allowedUsers.length === 0 || allowedUsers.includes(userId)
-      expect(isAllowed(12345)).toBe(true)
-      expect(isAllowed(99999)).toBe(true)
-    })
-
-    it('non-empty allowedUsers filters correctly', () => {
-      const allowedUsers = [111, 222]
-      const isAllowed = (userId: number) =>
-        allowedUsers.length === 0 || allowedUsers.includes(userId)
-      expect(isAllowed(111)).toBe(true)
-      expect(isAllowed(222)).toBe(true)
-      expect(isAllowed(333)).toBe(false)
-    })
-  })
 })

@@ -1,5 +1,6 @@
 import type { DesktopUpdateDownloadEvent } from '../../src/lib/desktopHost/types'
 import { existsSync } from 'node:fs'
+import { clearAppManagedPortableEnv } from './appMode'
 
 export type ElectronUpdateInfo = {
   version: string
@@ -17,6 +18,7 @@ export type ElectronUpdateCheckOptions = {
 
 export type ElectronUpdaterLike = {
   autoDownload: boolean
+  disableDifferentialDownload?: boolean
   logger?: unknown
   checkForUpdates(): Promise<ElectronUpdateCheckResult>
   downloadUpdate(): Promise<unknown>
@@ -36,6 +38,22 @@ export type ElectronUpdaterProxyController = {
 
 export type ElectronUpdaterRuntimeOptions = {
   updateConfigPath?: string
+}
+
+export type UpdaterSessionProxyConfig = {
+  mode?: 'system'
+  proxyRules?: string
+  proxyBypassRules?: string
+}
+
+// electron-updater performs all update traffic (metadata + downloads) on its
+// own session partition, so proxy settings must target that session. Passing
+// an empty config would mean fixed_servers with no rules (= direct), so the
+// system fallback has to be an explicit `mode: 'system'`.
+export function updaterSessionProxyConfig(proxy: string | null): UpdaterSessionProxyConfig {
+  return proxy
+    ? { proxyRules: proxy, proxyBypassRules: '<local>' }
+    : { mode: 'system' }
 }
 
 export function normalizeUpdateInfo(info: ElectronUpdateInfo | undefined): ElectronUpdateMetadata | null {
@@ -86,6 +104,9 @@ export class ElectronUpdaterService {
     this.proxyController = proxyController
     this.updateConfigPath = runtimeOptions.updateConfigPath
     this.updater.autoDownload = false
+    // Differential download issues many small sequential range requests and is
+    // RTT-bound against the GitHub CDN, so it downloads far below line speed.
+    this.updater.disableDifferentialDownload = true
     this.updater.logger = null
   }
 
@@ -173,8 +194,13 @@ export class ElectronUpdaterService {
     return !!this.pendingUpdate && this.downloaded
   }
 
-  quitAndInstallDownloadedUpdate() {
+  quitAndInstallDownloadedUpdate(env: NodeJS.ProcessEnv = process.env) {
     this.stageDownloadedUpdate()
+    // The NSIS installer spawned here inherits this process's environment.
+    // Hand it the same clean environment a manually launched setup gets, so
+    // its legacy-data checks read the persisted app-mode.json instead of a
+    // process-local snapshot that may disagree with it (#1160).
+    clearAppManagedPortableEnv(env)
     this.updater.quitAndInstall(false, true)
   }
 }

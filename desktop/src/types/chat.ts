@@ -7,6 +7,7 @@ import type { RuntimeSelection } from './runtime'
 
 export type ClientMessage =
   | { type: 'prewarm_session' }
+  | { type: 'sync_state' }
   | { type: 'user_message'; content: string; attachments?: AttachmentRef[] }
   | {
       type: 'permission_response'
@@ -25,6 +26,7 @@ export type ClientMessage =
   | { type: 'set_permission_mode'; mode: PermissionMode }
   | ({ type: 'set_runtime_config' } & RuntimeSelection)
   | { type: 'stop_generation' }
+  | { type: 'stop_background_task'; taskId: string }
   | { type: 'ping' }
 
 export type AttachmentRef = {
@@ -36,8 +38,11 @@ export type AttachmentRef = {
   isDirectory?: boolean
   lineStart?: number
   lineEnd?: number
+  diffSide?: 'old' | 'new'
+  hunkId?: string
   note?: string
   quote?: string
+  selectionNumber?: number
 }
 
 export type PermissionUpdate =
@@ -67,18 +72,34 @@ export type UIAttachment = {
   isDirectory?: boolean
   lineStart?: number
   lineEnd?: number
+  diffSide?: 'old' | 'new'
+  hunkId?: string
   note?: string
   quote?: string
+  selectionNumber?: number
 }
 
 // ─── Server → Client ──────────────────────────────────────────────
 
 export type ServerMessage =
   | { type: 'connected'; sessionId: string }
-  | { type: 'content_start'; blockType: 'text' | 'tool_use'; toolName?: string; toolUseId?: string; parentToolUseId?: string }
+  | {
+      type: 'session_state'
+      turnState: 'running' | 'idle'
+      activeBackgroundTaskIds?: string[]
+    }
+  | {
+      type: 'agent_run_event'
+      runAgentId: string
+      streamId: string
+      targetAgentId: string
+      targetAgentScopeId?: string
+      event: AgentRunStreamMessage
+    }
+  | { type: 'content_start'; blockType: 'text' | 'tool_use'; toolName?: string; toolUseId?: string; originalToolUseId?: string; parentToolUseId?: string }
   | { type: 'content_delta'; text?: string; toolInput?: string }
-  | { type: 'tool_use_complete'; toolName: string; toolUseId: string; input: unknown; parentToolUseId?: string }
-  | { type: 'tool_result'; toolUseId: string; content: unknown; isError: boolean; parentToolUseId?: string }
+  | { type: 'tool_use_complete'; toolName: string; toolUseId: string; originalToolUseId?: string; input: unknown; parentToolUseId?: string }
+  | { type: 'tool_result'; toolUseId: string; originalToolUseId?: string; content: unknown; isError: boolean; parentToolUseId?: string }
   | {
       type: 'permission_request'
       requestId: string
@@ -92,10 +113,29 @@ export type ServerMessage =
       requestId: string
       request: ComputerUsePermissionRequest
     }
+  | {
+      type: 'permission_resolved'
+      requestId: string
+      permissionType: 'tool' | 'computer_use'
+      allowed?: boolean
+    }
+  | {
+      type: 'permission_requests_snapshot'
+      toolRequestIds: string[]
+      computerUseRequestIds: string[]
+      turnActive: boolean
+    }
   | { type: 'user_message_replay'; content: string }
   | { type: 'message_complete'; usage: TokenUsage }
-  | { type: 'thinking'; text: string }
-  | { type: 'status'; state: ChatState; verb?: string }
+  /** `complete` marks a whole thinking block; without it `text` is a stream fragment. */
+  | { type: 'thinking'; text: string; complete?: boolean }
+  | { type: 'status'; state: ChatState; verb?: string; attemptStart?: boolean }
+  | {
+      type: 'runtime_config_applied'
+      providerId: string | null
+      modelId: string
+      effortLevel?: string
+    }
   // CLI 回传的权限模式变化（如 ExitPlanMode 退出 plan 后恢复、Shift+Tab）。
   // 桌面端据此把选择器校正回 CLI 的真实权限，避免本地影子值漂移。
   | { type: 'permission_mode_changed'; mode: PermissionMode }
@@ -108,16 +148,29 @@ export type ServerMessage =
       errorType?: string
       errorMessage?: string
     }
-  // 流式请求失败、CLI 已降级为非流式重试：完整响应一次性返回，期间无增量输出。
+  // 流式请求失败后的恢复状态：可能安全重试流，也可能降级为非流式请求。
   | { type: 'streaming_fallback'; cause: StreamingFallbackCause }
   | { type: 'error'; message: string; code: string; retryable?: boolean; businessErrorCode?: string }
+  | { type: 'background_task_stop_failed'; taskId: string; message: string }
   | { type: 'system_notification'; subtype: string; message?: string; data?: unknown }
   | { type: 'pong' }
-  | { type: 'team_update'; teamName: string; members: TeamMemberStatus[] }
-  | { type: 'team_created'; teamName: string }
-  | { type: 'team_deleted'; teamName: string }
+  | { type: 'team_update'; teamName: string; members: TeamMemberStatus[]; incarnationId?: string; leadSessionId?: string; createdAt?: number }
+  | { type: 'team_created'; teamName: string; incarnationId?: string; leadSessionId?: string; createdAt?: number }
+  | { type: 'team_workbench_updated'; teamName: string; incarnationId?: string; leadSessionId?: string; createdAt?: number }
+  | { type: 'team_deleted'; teamName: string; incarnationId?: string; leadSessionId?: string; createdAt?: number }
   | { type: 'task_update'; taskId: string; status: string; progress?: string }
   | { type: 'session_title_updated'; sessionId: string; title: string }
+
+export type AgentRunStreamMessage =
+  | { type: 'content_start'; blockType: 'text' | 'tool_use'; toolName?: string; toolUseId?: string; originalToolUseId?: string; parentToolUseId?: string }
+  | { type: 'content_delta'; text?: string; toolInput?: string }
+  | { type: 'tool_use_complete'; toolName: string; toolUseId: string; originalToolUseId?: string; input: unknown; parentToolUseId?: string }
+  | { type: 'tool_result'; toolUseId: string; originalToolUseId?: string; content: unknown; isError: boolean; parentToolUseId?: string }
+  | { type: 'thinking'; text: string; complete?: boolean }
+  | { type: 'status'; state: ChatState; verb?: string; attemptStart?: boolean }
+  | { type: 'api_retry'; attempt: number; maxRetries: number; retryDelayMs: number; errorStatus: number | null; errorType?: string; errorMessage?: string }
+  | { type: 'streaming_fallback'; cause: StreamingFallbackCause }
+  | { type: 'error'; message: string; code: string; retryable?: boolean; businessErrorCode?: string }
 
 export type TokenUsage = {
   input_tokens: number
@@ -138,7 +191,7 @@ export type ApiRetryState = {
   receivedAt: number
 }
 
-export type StreamingFallbackCause = 'watchdog' | 'stream_error' | '404_stream_creation' | 'unknown'
+export type StreamingFallbackCause = 'watchdog' | 'stream_error' | '404_stream_creation' | 'stream_retry' | 'unknown'
 
 // 活动回合状态（与 apiRetry 同生命周期），不进消息历史。
 export type StreamingFallbackState = {
@@ -150,6 +203,11 @@ export type TeamMemberStatus = {
   agentId: string
   role: string
   status: 'running' | 'idle' | 'completed' | 'error'
+  /**
+   * Omitted when the watcher cannot tell from the roster alone, so a receiver
+   * keeps whatever the last full team read established.
+   */
+  activity?: 'active' | 'idle' | 'exited' | 'unknown'
   currentTask?: string
 }
 
@@ -206,7 +264,10 @@ export type ComputerUsePermissionResponse = {
 export type AgentTaskNotification = {
   taskId: string
   toolUseId: string
+  /** Runtime agent whose transcript owns this lifecycle. Undefined is root or legacy. */
+  ownerAgentId?: string
   status: 'completed' | 'failed' | 'stopped'
+  workflowRunId?: string
   summary?: string
   result?: string
   outputFile?: string
@@ -227,6 +288,7 @@ export type BackgroundAgentTask = {
   description?: string
   taskType?: string
   workflowName?: string
+  workflowRunId?: string
   prompt?: string
   result?: string
   summary?: string
@@ -266,7 +328,13 @@ export type TaskSummaryItem = {
 }
 
 export type UIMessage =
-  | { id: string; type: 'user_text'; content: string; modelContent?: string; transcriptMessageId?: string; timestamp: number; attachments?: UIAttachment[]; pending?: boolean; optimisticQueued?: boolean }
+  /**
+   * `teammateFrom` marks a turn that arrived from another agent rather than
+   * from the person at the keyboard. Without it a teammate's instruction and
+   * the user's own prompt render identically, which is what flattened the
+   * member transcript.
+   */
+  | { id: string; type: 'user_text'; content: string; modelContent?: string; transcriptMessageId?: string; timestamp: number; attachments?: UIAttachment[]; pending?: boolean; optimisticQueued?: boolean; teammateFrom?: string }
   | { id: string; type: 'assistant_text'; content: string; transcriptMessageId?: string; timestamp: number; model?: string }
   | { id: string; type: 'thinking'; content: string; timestamp: number }
   | {
@@ -274,6 +342,7 @@ export type UIMessage =
       type: 'tool_use'
       toolName: string
       toolUseId: string
+      originalToolUseId?: string
       input: unknown
       timestamp: number
       parentToolUseId?: string
@@ -281,7 +350,7 @@ export type UIMessage =
       status?: 'stopped'
       partialInput?: string
     }
-  | { id: string; type: 'tool_result'; toolUseId: string; content: unknown; isError: boolean; timestamp: number; parentToolUseId?: string }
+  | { id: string; type: 'tool_result'; toolUseId: string; originalToolUseId?: string; content: unknown; isError: boolean; timestamp: number; parentToolUseId?: string }
   | { id: string; type: 'background_task'; task: BackgroundAgentTask; timestamp: number }
   | { id: string; type: 'system'; content: string; timestamp: number }
   | {

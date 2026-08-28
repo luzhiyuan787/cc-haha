@@ -1,11 +1,19 @@
 import type { SettingsTab } from '../../stores/uiStore'
 import type { TranslationKey } from '../../i18n'
+import type { SlashCommandOption } from '../../types/slashCommand'
+
+export type {
+  SlashCommandKind,
+  SlashCommandOption,
+  SlashCommandSource,
+} from '../../types/slashCommand'
 
 /** Map from slash command name to its i18n description key */
 const SLASH_CMD_DESCRIPTION_KEYS: Record<string, TranslationKey> = {
   agent: 'slashCmd.agent.description',
   mcp: 'slashCmd.mcp.description',
   skills: 'slashCmd.skills.description',
+  'save-workflow': 'slashCmd.saveWorkflow.description',
   help: 'slashCmd.help.description',
   status: 'slashCmd.status.description',
   cost: 'slashCmd.cost.description',
@@ -36,6 +44,7 @@ const BUILT_IN_COMMAND_NAMES = new Set(Object.keys(SLASH_CMD_DESCRIPTION_KEYS))
 export const PANEL_SLASH_COMMANDS = [
   { name: 'mcp' },
   { name: 'skills' },
+  { name: 'save-workflow' },
   { name: 'help' },
   { name: 'status' },
   { name: 'cost' },
@@ -54,11 +63,36 @@ export const SLASH_COMMAND_ALIASES = [
   { name: 'settings', target: 'config' },
 ] as const
 
+const DESKTOP_RESERVED_SLASH_COMMAND_NAMES = new Set(
+  [
+    ...PANEL_SLASH_COMMANDS.map(command => command.name),
+    ...SETTINGS_SLASH_COMMANDS.map(command => command.name),
+    ...SLASH_COMMAND_ALIASES.map(command => command.name),
+    'model',
+  ].map(name => name.toLowerCase()),
+)
+
+export type SlashCommandNameConflict = 'reserved' | 'existing'
+
+/** A saved workflow must not claim a slash command that the desktop already owns. */
+export function getSlashCommandNameConflict(
+  name: string,
+  commands: ReadonlyArray<Pick<SlashCommandOption, 'name'>> = [],
+): SlashCommandNameConflict | null {
+  const normalized = name.trim().toLowerCase()
+  if (!normalized) return null
+  if (DESKTOP_RESERVED_SLASH_COMMAND_NAMES.has(normalized)) return 'reserved'
+  return commands.some(command => command.name.trim().toLowerCase() === normalized)
+    ? 'existing'
+    : null
+}
+
 /** Static fallback with English descriptions (for non-React contexts) */
 export const FALLBACK_SLASH_COMMANDS: SlashCommandOption[] = [
   { name: 'agent', description: 'Run a prompt with a selected Agent', argumentHint: '<agent> <prompt>' },
   { name: 'mcp', description: 'Open available MCP tools for the current chat context' },
   { name: 'skills', description: 'Browse user-invocable skills for the current chat context' },
+  { name: 'save-workflow', description: 'Save a completed Workflow for reuse' },
   { name: 'help', description: 'Show available desktop and agent commands' },
   { name: 'status', description: 'Show session status, usage, and context' },
   { name: 'cost', description: 'Show session usage and costs' },
@@ -109,14 +143,36 @@ export function getLocalizedFallbackCommands(t: (key: TranslationKey) => string)
       name: cmd.name,
       description,
       ...(cmd.argumentHint && { argumentHint: cmd.argumentHint }),
+      kind: 'command',
     }
   })
 }
 
-export type SlashCommandOption = {
-  name: string
-  description: string
-  argumentHint?: string
+export type SlashCommandGroups = {
+  system: SlashCommandOption[]
+  skills: SlashCommandOption[]
+  ordered: SlashCommandOption[]
+}
+
+export function groupSlashCommands(
+  commands: ReadonlyArray<SlashCommandOption>,
+): SlashCommandGroups {
+  const system: SlashCommandOption[] = []
+  const skills: SlashCommandOption[] = []
+
+  for (const command of commands) {
+    if (command.kind === 'skill') {
+      skills.push(command)
+    } else {
+      system.push(command)
+    }
+  }
+
+  return {
+    system,
+    skills,
+    ordered: [...system, ...skills],
+  }
 }
 
 export type AgentSlashCommandSource = {
@@ -147,6 +203,7 @@ export function buildAgentSlashCommands(
       name: `agent ${agentType}`,
       description,
       argumentHint: '<prompt>',
+      kind: 'agent',
     })
   }
 
@@ -222,6 +279,12 @@ export function mergeSlashCommands(
       name: command.name,
       description,
       ...(argumentHint && { argumentHint }),
+      ...(command.kind || localized?.kind
+        ? { kind: command.kind ?? localized?.kind }
+        : {}),
+      ...(command.source || localized?.source
+        ? { source: command.source ?? localized?.source }
+        : {}),
     })
   }
 

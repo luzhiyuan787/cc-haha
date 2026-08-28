@@ -15,10 +15,22 @@ export type DesktopProfilePreferences = {
   avatarUpdatedAt: string | null
 }
 
+export type DesktopPetPreferences = {
+  enabled: boolean
+  selectedPetId: string
+  size: number
+  showTaskPanel: boolean
+  collapsed: boolean
+  motionEnabled: boolean
+  lastSessionId: string | null
+}
+
 export type DesktopUiPreferences = {
   schemaVersion: number
   sidebar: SidebarProjectPreferences
   profile: DesktopProfilePreferences
+  pet: DesktopPetPreferences
+  projectDisplayNames: Record<string, string>
 }
 
 export type DesktopUiPreferencesResponse = {
@@ -26,9 +38,28 @@ export type DesktopUiPreferencesResponse = {
   exists: boolean
 }
 
+export type DesktopPetPreferencesResponse = {
+  exists: boolean
+  pet: DesktopPetPreferences
+}
+
+export type DesktopPetPreferencesUpdateResponse =
+  | { ok: true; preferences: DesktopUiPreferences }
+  | { ok: true; pet: DesktopPetPreferences }
+
+export type ProjectDisplayNameUpdateResponse = {
+  ok: true
+  projectKey: string
+  displayName: string | null
+}
+
 export const desktopUiPreferencesApi = {
   getPreferences() {
     return api.get<DesktopUiPreferencesResponse>('/api/desktop-ui/preferences')
+  },
+
+  getPetPreferences() {
+    return api.get<DesktopPetPreferencesResponse>('/api/desktop-ui/preferences/pet')
   },
 
   updateSidebarPreferences(sidebar: SidebarProjectPreferences) {
@@ -38,10 +69,24 @@ export const desktopUiPreferencesApi = {
     )
   },
 
+  updateProjectDisplayName(projectKey: string, displayName: string | null) {
+    return api.put<ProjectDisplayNameUpdateResponse>(
+      '/api/desktop-ui/preferences/project-display-name',
+      { projectKey, displayName },
+    )
+  },
+
   updateProfilePreferences(profile: Pick<DesktopProfilePreferences, 'displayName' | 'subtitle'>) {
     return api.put<{ ok: true; preferences: DesktopUiPreferences }>(
       '/api/desktop-ui/preferences/profile',
       profile,
+    )
+  },
+
+  updatePetPreferences(pet: Partial<DesktopPetPreferences>) {
+    return api.put<DesktopPetPreferencesUpdateResponse>(
+      '/api/desktop-ui/preferences/pet',
+      pet,
     )
   },
 

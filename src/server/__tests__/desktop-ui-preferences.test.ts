@@ -8,6 +8,16 @@ import { DesktopUiPreferencesService } from '../services/desktopUiPreferencesSer
 let tmpDir: string
 let originalConfigDir: string | undefined
 
+const DEFAULT_PET_PREFERENCES = {
+  enabled: false,
+  selectedPetId: 'dada-code',
+  size: 144,
+  showTaskPanel: false,
+  collapsed: false,
+  motionEnabled: true,
+  lastSessionId: null,
+}
+
 async function setup() {
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'desktop-ui-preferences-'))
   originalConfigDir = process.env.CLAUDE_CONFIG_DIR
@@ -56,13 +66,15 @@ describe('DesktopUiPreferencesService', () => {
 
     expect(result.exists).toBe(false)
     expect(result.preferences).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 5,
       profile: {
         displayName: 'cc-haha',
         subtitle: 'github.com/NanmiCoder/cc-haha',
         avatarFile: null,
         avatarUpdatedAt: null,
       },
+      pet: DEFAULT_PET_PREFERENCES,
+      projectDisplayNames: {},
       sidebar: {
         projectOrder: [],
         pinnedProjects: [],
@@ -78,11 +90,21 @@ describe('DesktopUiPreferencesService', () => {
     await fs.writeFile(
       path.join(tmpDir, 'cc-haha', 'desktop-ui.json'),
       JSON.stringify({
+        schemaVersion: 4,
         futureField: { keep: true },
         sidebar: {
           projectOrder: ['/workspace/alpha', 42, '/workspace/alpha', '/workspace/beta'],
           pinnedProjects: ['/workspace/beta'],
           hiddenProjects: [null, '/workspace/gamma'],
+        },
+        projectDisplayNames: {
+          '/workspace/alpha': '  Alpha project  ',
+          '/workspace/beta': 42,
+          '': 'Missing key',
+          '   ': 'Whitespace key',
+          '/workspace/blank': '   ',
+          '/workspace/too-long-name': 'n'.repeat(81),
+          ['x'.repeat(4_097)]: 'Overlong key',
         },
       }),
       'utf-8',
@@ -98,13 +120,17 @@ describe('DesktopUiPreferencesService', () => {
 
     expect(before.exists).toBe(true)
     expect(before.preferences).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 5,
       futureField: { keep: true },
       profile: {
         displayName: 'cc-haha',
         subtitle: 'github.com/NanmiCoder/cc-haha',
         avatarFile: null,
         avatarUpdatedAt: null,
+      },
+      pet: DEFAULT_PET_PREFERENCES,
+      projectDisplayNames: {
+        '/workspace/alpha': 'Alpha project',
       },
       sidebar: {
         projectOrder: ['/workspace/alpha', '/workspace/beta'],
@@ -115,13 +141,17 @@ describe('DesktopUiPreferencesService', () => {
       },
     })
     expect(after).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 5,
       futureField: { keep: true },
       profile: {
         displayName: 'cc-haha',
         subtitle: 'github.com/NanmiCoder/cc-haha',
         avatarFile: null,
         avatarUpdatedAt: null,
+      },
+      pet: DEFAULT_PET_PREFERENCES,
+      projectDisplayNames: {
+        '/workspace/alpha': 'Alpha project',
       },
       sidebar: {
         projectOrder: ['/workspace/gamma'],
@@ -145,7 +175,301 @@ describe('DesktopUiPreferencesService', () => {
     expect(result.exists).toBe(false)
     expect(result.preferences.sidebar.hiddenProjects).toEqual([])
     expect(result.preferences.profile.displayName).toBe('cc-haha')
+    expect(result.preferences.pet).toEqual(DEFAULT_PET_PREFERENCES)
+    expect(result.preferences.projectDisplayNames).toEqual({})
     expect(files.some((name) => name.startsWith('desktop-ui.json.invalid-'))).toBe(true)
+  })
+
+  test('sets and resets exact project display name keys without prototype pollution', async () => {
+    const service = new DesktopUiPreferencesService()
+    const projectKey = '  /workspace/alpha  '
+
+    await expect(service.updateProjectDisplayName({
+      projectKey,
+      displayName: '  Alpha   project  ',
+    })).resolves.toEqual({
+      projectKey,
+      displayName: 'Alpha project',
+    })
+    await service.updateProjectDisplayName({ projectKey: '__proto__', displayName: 'Prototype project' })
+    await service.updateProjectDisplayName({ projectKey: 'constructor', displayName: 'Constructor project' })
+
+    const { preferences } = await service.readPreferences()
+    expect(Object.getPrototypeOf(preferences.projectDisplayNames)).toBe(Object.prototype)
+    expect(Object.entries(preferences.projectDisplayNames)).toEqual([
+      [projectKey, 'Alpha project'],
+      ['__proto__', 'Prototype project'],
+      ['constructor', 'Constructor project'],
+    ])
+    expect(Object.hasOwn(preferences.projectDisplayNames, '__proto__')).toBe(true)
+
+    await expect(service.updateProjectDisplayName({ projectKey, displayName: null })).resolves.toEqual({
+      projectKey,
+      displayName: null,
+    })
+    expect(Object.entries((await service.readPreferences()).preferences.projectDisplayNames)).toEqual([
+      ['__proto__', 'Prototype project'],
+      ['constructor', 'Constructor project'],
+    ])
+  })
+
+  test('merges concurrent project display name changes for different keys', async () => {
+    const firstRenderer = new DesktopUiPreferencesService()
+    const secondRenderer = new DesktopUiPreferencesService()
+
+    await Promise.all([
+      firstRenderer.updateProjectDisplayName({
+        projectKey: '/workspace/alpha',
+        displayName: 'Alpha',
+      }),
+      secondRenderer.updateProjectDisplayName({
+        projectKey: '/workspace/beta',
+        displayName: 'Beta',
+      }),
+    ])
+
+    expect((await firstRenderer.readPreferences()).preferences.projectDisplayNames).toEqual({
+      '/workspace/alpha': 'Alpha',
+      '/workspace/beta': 'Beta',
+    })
+  })
+
+  test('preserves project display names when updating sidebar, profile, and pet preferences', async () => {
+    const service = new DesktopUiPreferencesService()
+    await service.updateProjectDisplayName({
+      projectKey: '/workspace/alpha',
+      displayName: 'Alpha',
+    })
+    await service.updateSidebarPreferences({ projectOrder: ['/workspace/alpha'] })
+    await service.updateProfilePreferences({ displayName: 'Local Operator' })
+    await service.updatePetPreferences({ collapsed: true })
+
+    expect((await service.readPreferences()).preferences.projectDisplayNames).toEqual({
+      '/workspace/alpha': 'Alpha',
+    })
+  })
+
+  test('normalizes invalid pet preferences while preserving unrelated fields', async () => {
+    await fs.mkdir(path.join(tmpDir, 'cc-haha'), { recursive: true })
+    await fs.writeFile(
+      path.join(tmpDir, 'cc-haha', 'desktop-ui.json'),
+      JSON.stringify({
+        schemaVersion: 3,
+        futureField: { keep: true },
+        pet: {
+          enabled: 'yes',
+          selectedPetId: '../escape',
+          size: 144.5,
+          collapsed: 1,
+          motionEnabled: null,
+          lastSessionId: 's'.repeat(240),
+        },
+      }),
+      'utf-8',
+    )
+
+    const result = await new DesktopUiPreferencesService().readPreferences()
+
+    expect(result.preferences.futureField).toEqual({ keep: true })
+    expect(result.preferences.pet).toEqual({
+      ...DEFAULT_PET_PREFERENCES,
+      lastSessionId: 's'.repeat(200),
+    })
+  })
+
+  test('normalizes and persists pet preferences without touching sidebar, profile, or unknown fields', async () => {
+    const service = new DesktopUiPreferencesService()
+    await service.updateSidebarPreferences({
+      projectOrder: ['/workspace/alpha'],
+      pinnedProjects: ['/workspace/alpha'],
+      hiddenProjects: [],
+      projectOrganization: 'project',
+      projectSortBy: 'createdAt',
+    })
+    await service.updateProfilePreferences({
+      displayName: 'Local Operator',
+      subtitle: 'operator.example',
+    })
+    const current = await readDesktopUiFile()
+    await fs.writeFile(
+      path.join(tmpDir, 'cc-haha', 'desktop-ui.json'),
+      JSON.stringify({ ...current, futureField: { keep: true } }),
+      'utf-8',
+    )
+
+    const after = await service.updatePetPreferences({
+      enabled: true,
+      selectedPetId: '  custom:rocky-bot  ',
+      size: 999,
+      collapsed: true,
+      motionEnabled: false,
+      lastSessionId: '',
+    })
+
+    expect(after).toMatchObject({
+      schemaVersion: 5,
+      futureField: { keep: true },
+      profile: {
+        displayName: 'Local Operator',
+        subtitle: 'operator.example',
+      },
+      sidebar: {
+        projectOrder: ['/workspace/alpha'],
+        pinnedProjects: ['/workspace/alpha'],
+        projectOrganization: 'project',
+        projectSortBy: 'createdAt',
+      },
+      pet: {
+        enabled: true,
+        selectedPetId: 'custom:rocky-bot',
+        size: 192,
+        collapsed: true,
+        motionEnabled: false,
+        lastSessionId: null,
+      },
+    })
+    expect(await readDesktopUiFile()).toEqual(after)
+
+  })
+
+  test('merges concurrent pet field patches without reverting either renderer update', async () => {
+    const settingsRenderer = new DesktopUiPreferencesService()
+    const petRenderer = new DesktopUiPreferencesService()
+
+    await settingsRenderer.updatePetPreferences({
+      enabled: false,
+      selectedPetId: 'huhu-plan',
+      size: 144,
+      showTaskPanel: false,
+      collapsed: false,
+      motionEnabled: true,
+      lastSessionId: 'session-before',
+    })
+
+    await Promise.all([
+      settingsRenderer.updatePetPreferences({ size: 176, showTaskPanel: true, motionEnabled: false }),
+      petRenderer.updatePetPreferences({ collapsed: true, lastSessionId: 'session-after' }),
+    ])
+
+    const { preferences } = await settingsRenderer.readPreferences()
+    expect(preferences.pet).toEqual({
+      enabled: false,
+      selectedPetId: 'huhu-plan',
+      size: 176,
+      showTaskPanel: true,
+      collapsed: true,
+      motionEnabled: false,
+      lastSessionId: 'session-after',
+    })
+  })
+
+  test('migrates a schema-3 pet to a hidden task panel while preserving other and unknown fields', async () => {
+    await fs.mkdir(path.join(tmpDir, 'cc-haha'), { recursive: true })
+    await fs.writeFile(
+      path.join(tmpDir, 'cc-haha', 'desktop-ui.json'),
+      JSON.stringify({
+        schemaVersion: 3,
+        futureField: { keep: true },
+        pet: {
+          futurePetField: { keep: 'pet-too' },
+          enabled: false,
+          selectedPetId: 'custom:rocky-bot',
+          size: 168,
+          collapsed: true,
+          motionEnabled: false,
+          lastSessionId: 'session-old',
+        },
+      }),
+      'utf-8',
+    )
+
+    const after = await new DesktopUiPreferencesService().updatePetPreferences({ enabled: true })
+
+    expect(after).toMatchObject({
+      schemaVersion: 5,
+      futureField: { keep: true },
+      pet: {
+        futurePetField: { keep: 'pet-too' },
+        enabled: true,
+        selectedPetId: 'custom:rocky-bot',
+        size: 168,
+        showTaskPanel: false,
+        collapsed: true,
+        motionEnabled: false,
+        lastSessionId: 'session-old',
+      },
+    })
+    expect(await readDesktopUiFile()).toEqual(after)
+
+  })
+
+  test('patches pet preferences without downgrading future schema or sibling fields', async () => {
+    await fs.mkdir(path.join(tmpDir, 'cc-haha'), { recursive: true })
+    await fs.writeFile(
+      path.join(tmpDir, 'cc-haha', 'desktop-ui.json'),
+      JSON.stringify({
+        schemaVersion: 99,
+        futureRoot: { keep: 'root' },
+        sidebar: {
+          projectOrder: [],
+          pinnedProjects: [],
+          hiddenProjects: [],
+          projectOrganization: 'recentProject',
+          projectSortBy: 'updatedAt',
+          futureSidebar: { keep: 'sidebar' },
+        },
+        profile: {
+          displayName: 'Future Operator',
+          subtitle: 'future.example',
+          avatarFile: null,
+          avatarUpdatedAt: null,
+          futureProfile: { keep: 'profile' },
+        },
+        pet: {
+          ...DEFAULT_PET_PREFERENCES,
+          futurePet: { keep: 'pet' },
+        },
+        projectDisplayNames: {
+          '/workspace/future': 'Future project',
+        },
+      }),
+      'utf-8',
+    )
+
+    const after = await new DesktopUiPreferencesService().updatePetPreferences({ enabled: true })
+
+    expect(after).toMatchObject({
+      schemaVersion: 99,
+      futureRoot: { keep: 'root' },
+      sidebar: { futureSidebar: { keep: 'sidebar' } },
+      profile: { futureProfile: { keep: 'profile' } },
+      pet: {
+        enabled: true,
+        futurePet: { keep: 'pet' },
+      },
+      projectDisplayNames: {
+        '/workspace/future': 'Future project',
+      },
+    })
+    expect(await readDesktopUiFile()).toEqual(after)
+
+    const afterSidebarPatch = await new DesktopUiPreferencesService().updateSidebarPreferences({
+      projectOrder: ['/workspace/future'],
+      pinnedProjects: [],
+      hiddenProjects: [],
+      projectOrganization: 'project',
+      projectSortBy: 'createdAt',
+    })
+    expect(afterSidebarPatch).toMatchObject({
+      schemaVersion: 99,
+      sidebar: {
+        projectOrder: ['/workspace/future'],
+        futureSidebar: { keep: 'sidebar' },
+      },
+      profile: { futureProfile: { keep: 'profile' } },
+      pet: { futurePet: { keep: 'pet' } },
+      projectDisplayNames: { '/workspace/future': 'Future project' },
+    })
   })
 
   test('normalizes and persists profile preferences without touching sidebar preferences', async () => {
@@ -158,13 +482,15 @@ describe('DesktopUiPreferencesService', () => {
     })
 
     expect(after).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 5,
       profile: {
         displayName: 'Claude Captain',
         subtitle: 'local.example/profile',
         avatarFile: null,
         avatarUpdatedAt: null,
       },
+      pet: DEFAULT_PET_PREFERENCES,
+      projectDisplayNames: {},
       sidebar: {
         projectOrder: [],
         pinnedProjects: [],
@@ -174,6 +500,27 @@ describe('DesktopUiPreferencesService', () => {
       },
     })
     expect(await readDesktopUiFile()).toEqual(after)
+  })
+
+  test('rejects malformed profile patches without overwriting stored values', async () => {
+    const service = new DesktopUiPreferencesService()
+    const before = await service.updateProfilePreferences({
+      displayName: 'Local Operator',
+      subtitle: 'operator.example',
+    })
+
+    await expect(service.updateProfilePreferences({
+      displayName: 42,
+      subtitle: 'replacement.example',
+    })).rejects.toThrow('displayName must be a string')
+    await expect(service.updateProfilePreferences({
+      displayName: '   ',
+    })).rejects.toThrow('displayName must be between 1 and 80 characters')
+    await expect(service.updateProfilePreferences([])).rejects.toThrow(
+      'Profile preferences must be an object',
+    )
+
+    expect(await readDesktopUiFile()).toEqual(before)
   })
 
   test('stores uploaded profile avatars under cc-haha profile storage', async () => {
@@ -228,13 +575,15 @@ describe('desktop UI preferences API', () => {
     expect(putBody).toEqual({
       ok: true,
       preferences: {
-        schemaVersion: 2,
+        schemaVersion: 5,
         profile: {
           displayName: 'cc-haha',
           subtitle: 'github.com/NanmiCoder/cc-haha',
           avatarFile: null,
           avatarUpdatedAt: null,
         },
+        pet: DEFAULT_PET_PREFERENCES,
+        projectDisplayNames: {},
         sidebar: {
           projectOrder: ['/workspace/beta', '/workspace/alpha'],
           pinnedProjects: ['/workspace/beta'],
@@ -253,19 +602,174 @@ describe('desktop UI preferences API', () => {
     expect(getBody).toEqual({
       exists: true,
       preferences: {
-        schemaVersion: 2,
+        schemaVersion: 5,
         profile: {
           displayName: 'cc-haha',
           subtitle: 'github.com/NanmiCoder/cc-haha',
           avatarFile: null,
           avatarUpdatedAt: null,
         },
+        pet: DEFAULT_PET_PREFERENCES,
+        projectDisplayNames: {},
         sidebar: {
           projectOrder: ['/workspace/beta', '/workspace/alpha'],
           pinnedProjects: ['/workspace/beta'],
           hiddenProjects: ['/workspace/old'],
           projectOrganization: 'project',
           projectSortBy: 'createdAt',
+        },
+      },
+    })
+  })
+
+  test('sets and resets a project display name through the API without canonicalizing its key', async () => {
+    const projectKey = '  /workspace/alpha  '
+    const setReq = makeRequest('PUT', '/api/desktop-ui/preferences/project-display-name', {
+      projectKey,
+      displayName: '  Alpha   project  ',
+    })
+
+    const setRes = await handleDesktopUiApi(setReq.req, setReq.url, setReq.segments)
+    expect(setRes.status).toBe(200)
+    await expect(setRes.json()).resolves.toEqual({
+      ok: true,
+      projectKey,
+      displayName: 'Alpha project',
+    })
+    expect((await new DesktopUiPreferencesService().readPreferences()).preferences.projectDisplayNames).toEqual({
+      [projectKey]: 'Alpha project',
+    })
+
+    const resetReq = makeRequest('PUT', '/api/desktop-ui/preferences/project-display-name', {
+      projectKey,
+      displayName: null,
+    })
+    const resetRes = await handleDesktopUiApi(resetReq.req, resetReq.url, resetReq.segments)
+    expect(resetRes.status).toBe(200)
+    await expect(resetRes.json()).resolves.toEqual({
+      ok: true,
+      projectKey,
+      displayName: null,
+    })
+    expect((await new DesktopUiPreferencesService().readPreferences()).preferences.projectDisplayNames).toEqual({})
+  })
+
+  test('rejects invalid project display name updates without overwriting stored names', async () => {
+    const validReq = makeRequest('PUT', '/api/desktop-ui/preferences/project-display-name', {
+      projectKey: '/workspace/alpha',
+      displayName: 'Alpha',
+    })
+    expect((await handleDesktopUiApi(validReq.req, validReq.url, validReq.segments)).status).toBe(200)
+
+    for (const [body, message] of [
+      [{ projectKey: '', displayName: 'Replacement' }, 'projectKey must be a non-empty string up to 4096 characters'],
+      [{ projectKey: '   ', displayName: 'Replacement' }, 'projectKey must be a non-empty string up to 4096 characters'],
+      [{ projectKey: '/workspace/alpha', displayName: '   ' }, 'displayName must be a non-empty string up to 80 characters'],
+      [{ projectKey: '/workspace/alpha', displayName: 42 }, 'displayName must be a non-empty string up to 80 characters'],
+      [{ projectKey: '/workspace/alpha', displayName: 'n'.repeat(81) }, 'displayName must be a non-empty string up to 80 characters'],
+      [{ projectKey: 'x'.repeat(4_097), displayName: 'Replacement' }, 'projectKey must be a non-empty string up to 4096 characters'],
+    ] as const) {
+      const invalidReq = makeRequest('PUT', '/api/desktop-ui/preferences/project-display-name', body)
+      const invalidRes = await handleDesktopUiApi(invalidReq.req, invalidReq.url, invalidReq.segments)
+      expect(invalidRes.status).toBe(400)
+      await expect(invalidRes.json()).resolves.toMatchObject({
+        error: 'BAD_REQUEST',
+        message,
+      })
+    }
+
+    expect((await new DesktopUiPreferencesService().readPreferences()).preferences.projectDisplayNames).toEqual({
+      '/workspace/alpha': 'Alpha',
+    })
+  })
+
+  test('persists normalized pet preferences through the API', async () => {
+    const putReq = makeRequest('PUT', '/api/desktop-ui/preferences/pet', {
+      enabled: true,
+      selectedPetId: '  seedy  ',
+      size: 40,
+      showTaskPanel: true,
+      collapsed: false,
+      motionEnabled: true,
+      lastSessionId: 'session-42',
+    })
+
+    const putRes = await handleDesktopUiApi(putReq.req, putReq.url, putReq.segments)
+
+    expect(putRes.status).toBe(200)
+    await expect(putRes.json()).resolves.toMatchObject({
+      ok: true,
+      preferences: {
+        schemaVersion: 5,
+        pet: {
+          enabled: true,
+          selectedPetId: 'seedy',
+          size: 96,
+          showTaskPanel: true,
+          collapsed: false,
+          motionEnabled: true,
+          lastSessionId: 'session-42',
+        },
+      },
+    })
+  })
+
+  test('reads the pet projection without exposing sidebar or profile preferences', async () => {
+    const service = new DesktopUiPreferencesService()
+    await service.updateSidebarPreferences({
+      projectOrder: ['/workspace/private'],
+      pinnedProjects: ['/workspace/private'],
+      hiddenProjects: [],
+    })
+    await service.updateProfilePreferences({
+      displayName: 'Private Operator',
+      subtitle: 'private.example',
+    })
+    await service.updatePetPreferences({ selectedPetId: 'huhu-plan' })
+    const getReq = makeRequest('GET', '/api/desktop-ui/preferences/pet')
+
+    const getRes = await handleDesktopUiApi(getReq.req, getReq.url, getReq.segments)
+    const body = await getRes.json() as Record<string, unknown>
+
+    expect(getRes.status).toBe(200)
+    expect(body).toEqual({
+      exists: true,
+      pet: {
+        ...DEFAULT_PET_PREFERENCES,
+        selectedPetId: 'huhu-plan',
+      },
+    })
+    expect(body).not.toHaveProperty('profile')
+    expect(body).not.toHaveProperty('sidebar')
+  })
+
+  test('applies pet API bodies as field patches', async () => {
+    const service = new DesktopUiPreferencesService()
+    await service.updatePetPreferences({
+      enabled: true,
+      selectedPetId: 'huhu-plan',
+      size: 152,
+      collapsed: false,
+      motionEnabled: true,
+      lastSessionId: 'session-1',
+    })
+    const patchReq = makeRequest('PUT', '/api/desktop-ui/preferences/pet', {
+      collapsed: true,
+    })
+
+    const patchRes = await handleDesktopUiApi(patchReq.req, patchReq.url, patchReq.segments)
+
+    expect(patchRes.status).toBe(200)
+    await expect(patchRes.json()).resolves.toMatchObject({
+      ok: true,
+      preferences: {
+        pet: {
+          enabled: true,
+          selectedPetId: 'huhu-plan',
+          size: 152,
+          collapsed: true,
+          motionEnabled: true,
+          lastSessionId: 'session-1',
         },
       },
     })
@@ -318,6 +822,33 @@ describe('desktop UI preferences API', () => {
     expect(getAvatarRes.status).toBe(200)
     expect(getAvatarRes.headers.get('Content-Type')).toBe('image/jpeg')
     expect([...new Uint8Array(await getAvatarRes.arrayBuffer())]).toEqual([255, 216, 255])
+  })
+
+  test('returns 400 for malformed profile fields and preserves the prior profile', async () => {
+    const validReq = makeRequest('PUT', '/api/desktop-ui/preferences/profile', {
+      displayName: 'Local Operator',
+      subtitle: 'operator.example',
+    })
+    const validRes = await handleDesktopUiApi(validReq.req, validReq.url, validReq.segments)
+    expect(validRes.status).toBe(200)
+
+    const invalidReq = makeRequest('PUT', '/api/desktop-ui/preferences/profile', {
+      displayName: 42,
+      subtitle: 'replacement.example',
+    })
+    const invalidRes = await handleDesktopUiApi(invalidReq.req, invalidReq.url, invalidReq.segments)
+
+    expect(invalidRes.status).toBe(400)
+    await expect(invalidRes.json()).resolves.toMatchObject({
+      error: 'BAD_REQUEST',
+      message: 'displayName must be a string',
+    })
+    await expect(readDesktopUiFile()).resolves.toMatchObject({
+      profile: {
+        displayName: 'Local Operator',
+        subtitle: 'operator.example',
+      },
+    })
   })
 
   test('returns API errors for missing avatars, invalid JSON, and unknown routes', async () => {

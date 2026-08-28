@@ -65,6 +65,46 @@ describe('AssistantMessage link routing', () => {
     fireEvent.click(screen.getByRole('link', { name: '预览' }))
     expect(openBrowser).toHaveBeenCalledWith('s1', 'http://localhost:5173/')
   })
+
+  // #1145. Every case above this one leaves a space on both sides of the URL,
+  // which is exactly why the CJK-adjacency bug shipped: the anchor rendered, but
+  // its href carried the rest of the sentence, so the in-app browser opened a
+  // percent-encoded 404 instead of the dev server.
+  it('opens a clean URL when Chinese punctuation follows the bare link', () => {
+    render(
+      <AssistantMessage
+        sessionId="s1"
+        content={'打开 http://localhost:5173，然后刷新页面'}
+        isStreaming={false}
+      />,
+    )
+    fireEvent.click(screen.getByRole('link', { name: 'http://localhost:5173' }))
+    expect(openBrowser).toHaveBeenCalledWith('s1', 'http://localhost:5173/')
+  })
+
+  it('opens a clean URL when Han characters run straight into the link', () => {
+    render(
+      <AssistantMessage
+        sessionId="s1"
+        content={'服务在http://localhost:3000上运行'}
+        isStreaming={false}
+      />,
+    )
+    fireEvent.click(screen.getByRole('link', { name: 'http://localhost:3000' }))
+    expect(openBrowser).toHaveBeenCalledWith('s1', 'http://localhost:3000/')
+  })
+
+  it('routes an inline-code URL through the same preview handler', () => {
+    render(
+      <AssistantMessage
+        sessionId="s1"
+        content={'访问 `http://localhost:3000` 就能看到'}
+        isStreaming={false}
+      />,
+    )
+    fireEvent.click(screen.getByRole('link', { name: 'http://localhost:3000' }))
+    expect(openBrowser).toHaveBeenCalledWith('s1', 'http://localhost:3000/')
+  })
 })
 
 describe('AssistantMessage output-target cards', () => {
@@ -129,6 +169,46 @@ describe('AssistantMessage output-target cards', () => {
     expect(screen.queryByText('assistantOutputs.kind.image')).toBeNull()
   })
 
+  it('hands a Markdown image to the inline gallery without leaving a source-less duplicate', () => {
+    const { container, rerender } = render(
+      <AssistantMessage
+        sessionId="s1"
+        content={'![preview](outputs/foo/preview_frame.png "Rendered frame")'}
+        isStreaming
+      />,
+    )
+
+    expect(container.querySelectorAll('img')).toHaveLength(0)
+
+    rerender(
+      <AssistantMessage
+        sessionId="s1"
+        content={'![preview](outputs/foo/preview_frame.png "Rendered frame")'}
+        isStreaming={false}
+      />,
+    )
+
+    const images = Array.from(container.querySelectorAll('img'))
+    expect(images).toHaveLength(1)
+    expect(images[0]).toHaveAttribute(
+      'src',
+      'http://127.0.0.1:4321/preview-fs/s1/outputs/foo/preview_frame.png',
+    )
+    expect(container.querySelector('img:not([src])')).toBeNull()
+  })
+
+  it('does not leave image nodes for remote or loopback sources rejected by assistant Markdown', () => {
+    const { container } = render(
+      <AssistantMessage
+        sessionId="s1"
+        content={'![loopback](http://127.0.0.1:3456/status) ![remote](https://attacker.example/track.png)'}
+        isStreaming={false}
+      />,
+    )
+
+    expect(container.querySelectorAll('img')).toHaveLength(0)
+  })
+
   it('renders a relative video inline (a <video>) but NOT as a card', () => {
     const { container } = render(
       <AssistantMessage
@@ -144,6 +224,23 @@ describe('AssistantMessage output-target cards', () => {
     expect(video.getAttribute('src')).toBe('http://127.0.0.1:4321/preview-fs/s1/outputs/demo.mp4')
     // ...and is NOT duplicated as an output-target card (no extra open/copy controls).
     expect(screen.queryByText('assistantOutputs.kind.image')).toBeNull()
+  })
+
+  it('treats an empty turnChangedFiles as no evidence and keeps legacy inline media', () => {
+    // The checkpoint only sees TRACKED file changes — Bash-written files are
+    // invisible to it — so an empty list must not hide mentioned media. Broken
+    // references still self-hide via the <img>/<video> onError handlers.
+    const { container } = render(
+      <AssistantMessage
+        sessionId="s1"
+        content={'旧图 /work/old.png、相对图 outputs/relative.png、旧视频 outputs/old.mp4'}
+        isStreaming={false}
+        turnChangedFiles={[]}
+      />,
+    )
+
+    expect(screen.queryAllByRole('img')).toHaveLength(2)
+    expect(container.querySelector('video')).not.toBeNull()
   })
 
   it('still renders md/html/localhost cards when those references are present', () => {

@@ -1,8 +1,8 @@
 import { useMemo, useRef, useState } from 'react'
-import { useChatStore } from '../../stores/chatStore'
+import { listPendingPermissions, useChatStore } from '../../stores/chatStore'
 import { useTabStore } from '../../stores/tabStore'
 import { useTranslation } from '../../i18n'
-import { Button } from '../shared/Button'
+import { Button } from '@/components/ui/Button'
 
 type QuestionOption = {
   label: string
@@ -68,7 +68,10 @@ export function AskUserQuestion({ sessionId, toolUseId, input, result }: Props) 
   const { respondToPermission } = useChatStore()
   const activeTabId = useTabStore((s) => s.activeTabId)
   const targetSessionId = sessionId ?? activeTabId
-  const pendingPermission = useChatStore((s) => targetSessionId ? s.sessions[targetSessionId]?.pendingPermission : undefined)
+  const pendingRequest = useChatStore((s) => targetSessionId
+    ? listPendingPermissions(s.sessions[targetSessionId])
+      .find((permission) => permission.toolUseId === toolUseId) ?? null
+    : null)
   const t = useTranslation()
   const questions = parseInput(input)
   const inputObject = (input && typeof input === 'object') ? input as Record<string, unknown> : {}
@@ -76,11 +79,8 @@ export function AskUserQuestion({ sessionId, toolUseId, input, result }: Props) 
   const [selections, setSelections] = useState<QuestionSelections>({})
   const [freeTexts, setFreeTexts] = useState<QuestionFreeTexts>({})
   const [hasSubmitted, setHasSubmitted] = useState(false)
+  const [hasRequestedChat, setHasRequestedChat] = useState(false)
   const composingRef = useRef(false)
-
-  if (questions.length === 0) return null
-  const safeActiveTab = Math.min(activeTab, questions.length - 1)
-  const activeQuestion = questions[safeActiveTab]
 
   const resultAnswers = useMemo(() => {
     if (!result || typeof result !== 'object') return {}
@@ -93,7 +93,6 @@ export function AskUserQuestion({ sessionId, toolUseId, input, result }: Props) 
   const hasStructuredAnswers = Object.keys(resultAnswers).length > 0
   const hasTerminalResult = hasStructuredAnswers || resultText.length > 0
 
-  const pendingRequest = pendingPermission?.toolUseId === toolUseId ? pendingPermission : null
   const answeredText = useMemo(() => {
     if (hasStructuredAnswers) {
       return questions
@@ -107,7 +106,18 @@ export function AskUserQuestion({ sessionId, toolUseId, input, result }: Props) 
       .filter(Boolean)
       .join('; ')
   }, [freeTexts, hasStructuredAnswers, questions, resultAnswers, resultText, selections])
-  const submitted = hasTerminalResult || hasSubmitted
+
+  // Every hook above this line runs unconditionally, and it has to stay that way.
+  // `input` is not fixed for the lifetime of the instance: chatStore rebuilds tool_use
+  // messages from the transcript under a stable id (`${messageId}-block-${index}`), so
+  // the same mounted component can see its question count cross zero in either
+  // direction. With the early return above the useMemo calls, that transition threw
+  // "Rendered fewer/more hooks than expected" and took the whole message list down.
+  if (questions.length === 0) return null
+  const safeActiveTab = Math.min(activeTab, questions.length - 1)
+  const activeQuestion = questions[safeActiveTab]
+
+  const submitted = hasTerminalResult || hasSubmitted || hasRequestedChat
   const terminalWithoutAnswers = submitted && !hasStructuredAnswers && resultText.length > 0
 
   const handleSelect = (qIndex: number, label: string) => {
@@ -196,6 +206,37 @@ export function AskUserQuestion({ sessionId, toolUseId, input, result }: Props) 
     })
   }
 
+  /**
+   * Hands the questions back to the model as a conversation instead of an
+   * answer — the user doesn't think any option fits and wants to talk first.
+   *
+   * Travels as a denial because that's the only channel that carries free text
+   * back to the model, but the server rewrites it (buildDenyMessage) into
+   * "ask them what they'd like to clarify" rather than the usual "STOP and
+   * wait". Deliberately not gated on `allAnswered`: not recognising your own
+   * question in any of the options is exactly when nothing is filled in.
+   */
+  const handleChatAboutThis = () => {
+    if (submitted) return
+    if (!targetSessionId || !pendingRequest) return
+
+    // Carry whatever was already picked, so switching to a conversation isn't
+    // punished by losing the partial answers.
+    const questionsWithAnswers = questions
+      .map((question, index) => {
+        const answer = freeTexts[index]?.trim() || getSelectedAnswer(question, selections[index])
+        return answer
+          ? `- "${question.question}"\n  Answer: ${answer}`
+          : `- "${question.question}"\n  (No answer provided)`
+      })
+      .join('\n')
+
+    setHasRequestedChat(true)
+    respondToPermission(targetSessionId, pendingRequest.requestId, false, {
+      denyMessage: questionsWithAnswers,
+    })
+  }
+
   // All questions must be answered (via selection or free text) to enable submit
   const allAnswered = questions.every((_, i) =>
     Boolean(freeTexts[i]?.trim()) || (selections[i]?.length ?? 0) > 0,
@@ -204,9 +245,9 @@ export function AskUserQuestion({ sessionId, toolUseId, input, result }: Props) 
   if (!activeQuestion) return null
 
   return (
-    <div className={`mb-4 rounded-[var(--radius-lg)] border overflow-hidden ${
+    <div className={`rounded-[var(--radius-lg)] border overflow-hidden ${
       submitted
-        ? 'border-[var(--color-outline-variant)]/40 bg-[var(--color-surface-container-low)] opacity-70'
+        ? 'border-[var(--color-border)] bg-[var(--color-surface-container-low)] opacity-70'
         : 'border-[var(--color-secondary)] bg-[var(--color-surface-container-lowest)]'
     }`}>
       {/* Header */}
@@ -215,7 +256,7 @@ export function AskUserQuestion({ sessionId, toolUseId, input, result }: Props) 
           ? 'bg-[var(--color-surface-container-low)]'
           : 'bg-[var(--color-surface-container)]'
       }`}>
-        <div className="flex items-center justify-center w-8 h-8 rounded-[var(--radius-md)] bg-[var(--color-secondary)]/10">
+        <div className="flex items-center justify-center w-8 h-8 rounded-[var(--radius-md)] bg-[var(--color-secondary-container)]">
           <span className="material-symbols-outlined text-[18px] text-[var(--color-secondary)]">
             help
           </span>
@@ -226,7 +267,11 @@ export function AskUserQuestion({ sessionId, toolUseId, input, result }: Props) 
           </span>
           {submitted && (
             <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-[var(--color-surface-container-high)] text-[var(--color-text-tertiary)]">
-              {t(terminalWithoutAnswers ? 'question.completed' : 'question.answered')}
+              {/* handing the question back is not an answer — saying "answered"
+                  there misreports what the user did */}
+              {t(hasRequestedChat
+                ? 'question.chatBadge'
+                : terminalWithoutAnswers ? 'question.completed' : 'question.answered')}
             </span>
           )}
         </div>
@@ -234,7 +279,7 @@ export function AskUserQuestion({ sessionId, toolUseId, input, result }: Props) 
 
       {/* Question tabs — horizontal tab bar (only show when multiple questions) */}
       {questions.length > 1 && (
-        <div className="flex px-4 border-b border-[var(--color-outline-variant)]/20 bg-[var(--color-surface-container-low)] overflow-x-auto">
+        <div className="flex px-4 border-b border-[var(--color-border)] bg-[var(--color-surface-container-low)] overflow-x-auto">
           {questions.map((q, i) => {
             const isActive = safeActiveTab === i
             const isAnswered = Boolean(freeTexts[i]?.trim()) || (selections[i]?.length ?? 0) > 0
@@ -281,8 +326,8 @@ export function AskUserQuestion({ sessionId, toolUseId, input, result }: Props) 
                   disabled={submitted}
                   className={`w-full text-left px-4 py-3 rounded-[var(--radius-md)] border transition-all duration-150 cursor-pointer ${
                     isSelected
-                      ? 'border-[var(--color-secondary)] bg-[var(--color-secondary)]/8 ring-1 ring-[var(--color-secondary)]/30'
-                      : 'border-[var(--color-outline-variant)]/40 bg-[var(--color-surface)] hover:border-[var(--color-outline-variant)] hover:bg-[var(--color-surface-container-low)]'
+                      ? 'border-[var(--color-secondary)] bg-[var(--color-secondary-container)]'
+                      : 'border-[var(--color-border)] bg-[var(--color-surface)] hover:border-[var(--color-outline)] hover:bg-[var(--color-surface-container-low)]'
                   } ${submitted ? 'cursor-default' : ''}`}
                 >
                   <div className="flex items-start gap-3">
@@ -340,25 +385,32 @@ export function AskUserQuestion({ sessionId, toolUseId, input, result }: Props) 
               placeholder={t('question.typePlaceholder')}
               rows={3}
               wrap="soft"
-              className="max-h-48 min-h-[84px] w-full resize-y rounded-[var(--radius-md)] border border-[var(--color-outline-variant)]/40 bg-[var(--color-surface)] px-3 py-2 text-sm leading-relaxed text-[var(--color-text-primary)] placeholder:text-[var(--color-text-tertiary)] focus:border-[var(--color-secondary)] focus:outline-none focus:ring-1 focus:ring-[var(--color-secondary)]/30"
+              className="max-h-48 min-h-[84px] w-full resize-y rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-sm leading-relaxed text-[var(--color-text-primary)] placeholder:text-[var(--color-text-tertiary)] focus:border-[var(--color-border-focus)] focus:outline-none focus:shadow-[var(--shadow-focus-ring)]"
             />
           </div>
         )}
 
-        {/* Submitted answer display */}
-        {submitted && (
+        {/* Submitted answer display — the chat handoff wins over any terminal
+            result, whose text is the deny payload and not worth showing. */}
+        {submitted && (hasRequestedChat ? (
+          <div className="flex items-center gap-2 text-xs text-[var(--color-text-secondary)]">
+            <span className="material-symbols-outlined text-[14px] text-[var(--color-secondary)]">forum</span>
+            <span>{t('question.chatRequested')}</span>
+          </div>
+        ) : (
           <div className="flex items-center gap-2 text-xs text-[var(--color-text-secondary)]">
             <span className="material-symbols-outlined text-[14px] text-[var(--color-success)]">check_circle</span>
             <span>
               {t(terminalWithoutAnswers ? 'question.resultPrefix' : 'question.answeredPrefix')}<strong>{answeredText}</strong>
             </span>
           </div>
-        )}
+        ))}
       </div>
 
-      {/* Submit button */}
+      {/* Action bar. Wraps rather than overflows: two buttons plus a translated
+          label (kr/jp run long) can outgrow a narrow side-by-side pane. */}
       {!submitted && (
-        <div className="flex items-center gap-2 px-4 py-3 border-t border-[var(--color-outline-variant)]/20 bg-[var(--color-surface-container-low)]">
+        <div className="flex flex-wrap items-center gap-2 px-4 py-3 border-t border-[var(--color-border)] bg-[var(--color-surface-container-low)]">
           <Button
             variant="primary"
             size="sm"
@@ -369,6 +421,18 @@ export function AskUserQuestion({ sessionId, toolUseId, input, result }: Props) 
             }
           >
             {t('question.submit')}
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={!pendingRequest}
+            onClick={handleChatAboutThis}
+            title={t('question.chatAboutThisHint')}
+            icon={
+              <span className="material-symbols-outlined text-[14px]">forum</span>
+            }
+          >
+            {t('question.chatAboutThis')}
           </Button>
         </div>
       )}

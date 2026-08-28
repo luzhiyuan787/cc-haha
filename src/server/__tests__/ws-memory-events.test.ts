@@ -1,12 +1,53 @@
-import { describe, expect, it } from 'bun:test'
+import { afterEach, describe, expect, it } from 'bun:test'
 import {
+  __markActiveTurnForTests,
+  __resetWebSocketHandlerStateForTests,
   createCurrentTurnLocalCommandForwarder,
-  shouldRestartForPermissionMode,
+  shouldFallbackToPermissionRestart,
   translateCliMessage,
 } from '../ws/handler.js'
 import { parseSlashCommand } from '../../utils/slashCommandParsing.js'
 
+afterEach(() => {
+  __resetWebSocketHandlerStateForTests()
+})
+
 describe('WebSocket memory events', () => {
+  it('forwards nested task ownership without marking the main turn as tool executing', () => {
+    const sessionId = 'nested-task-owner-session'
+    __markActiveTurnForTests(sessionId)
+    const rootMessages = translateCliMessage({
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'root-agent',
+      task_type: 'local_agent',
+      description: 'Root work',
+    }, sessionId)
+    const messages = translateCliMessage({
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'nested-agent',
+      task_type: 'local_agent',
+      owner_agent_id: 'parent-agent',
+      description: 'Nested work',
+    }, sessionId)
+
+    expect(rootMessages).toContainEqual({
+      type: 'status',
+      state: 'tool_executing',
+      verb: 'Root work',
+    })
+    expect(messages).toEqual([{
+      type: 'system_notification',
+      subtype: 'task_started',
+      message: 'Nested work',
+      data: expect.objectContaining({
+        task_id: 'nested-agent',
+        owner_agent_id: 'parent-agent',
+      }),
+    }])
+  })
+
   it('forwards assistant business error codes to the desktop client', () => {
     expect(translateCliMessage({
       type: 'assistant',
@@ -23,6 +64,65 @@ describe('WebSocket memory events', () => {
         message: 'This model does not support images.',
         code: 'invalid_request',
         businessErrorCode: 'image_unsupported',
+      },
+    ])
+  })
+
+  it('maps watchdog API errors to stable desktop error codes', () => {
+    expect(translateCliMessage({
+      type: 'assistant',
+      error: 'server_error',
+      isApiErrorMessage: true,
+      message: {
+        role: 'assistant',
+        content: [{
+          type: 'text',
+          text: 'API Error: Provider stream stalled after partial response - no new chunks for 240s (last event: text_delta, content deltas: 1)',
+        }],
+      },
+    }, 'session-1')).toEqual([
+      {
+        type: 'error',
+        message: 'API Error: Provider stream stalled after partial response - no new chunks for 240s (last event: text_delta, content deltas: 1)',
+        code: 'STREAM_IDLE_TIMEOUT',
+      },
+    ])
+
+    expect(translateCliMessage({
+      type: 'assistant',
+      error: 'server_error',
+      isApiErrorMessage: true,
+      message: {
+        role: 'assistant',
+        content: [{
+          type: 'text',
+          text: 'API Error: Stream max duration exceeded - no completion received after 600s (last event: text_delta)',
+        }],
+      },
+    }, 'session-1')).toEqual([
+      {
+        type: 'error',
+        message: 'API Error: Stream max duration exceeded - no completion received after 600s (last event: text_delta)',
+        code: 'STREAM_MAX_DURATION',
+      },
+    ])
+
+    expect(translateCliMessage({
+      type: 'assistant',
+      error: 'server_error',
+      isApiErrorMessage: true,
+      message: {
+        role: 'assistant',
+        content: [{
+          type: 'text',
+          text: 'API Error: Tool input generation exceeded 120s - aborting incomplete tool call (last event: input_json_delta)',
+        }],
+      },
+    }, 'session-1')).toEqual([
+      {
+        type: 'error',
+        message: 'API Error: Tool input generation exceeded 120s - aborting incomplete tool call (last event: input_json_delta)',
+        code: 'STREAM_TOOL_INPUT_DURATION',
       },
     ])
   })
@@ -224,6 +324,15 @@ describe('WebSocket compact events', () => {
       { type: 'permission_mode_changed', mode: 'bypassPermissions' },
     ])
 
+    expect(translateCliMessage({
+      type: 'system',
+      subtype: 'status',
+      status: null,
+      permissionMode: 'auto',
+    }, 'session-1')).toEqual([
+      { type: 'permission_mode_changed', mode: 'auto' },
+    ])
+
     // 普通 thinking（无 permissionMode）仍走原路径，不受影响。
     expect(translateCliMessage({
       type: 'system',
@@ -269,29 +378,29 @@ describe('WebSocket compact events', () => {
   })
 })
 
-describe('WebSocket permission mode restart policy', () => {
-  it('restarts the CLI only when entering bypassPermissions', () => {
-    // 进入 bypass 需要带 --dangerously-skip-permissions 重启子进程。
-    expect(shouldRestartForPermissionMode('default', 'bypassPermissions')).toBe(true)
-    expect(shouldRestartForPermissionMode('plan', 'bypassPermissions')).toBe(true)
-    expect(shouldRestartForPermissionMode('acceptEdits', 'bypassPermissions')).toBe(true)
+describe('WebSocket permission mode compatibility fallback', () => {
+  it('restarts only when an old CLI session lacks the bypass launch capability', () => {
+    expect(shouldFallbackToPermissionRestart(
+      'bypassPermissions',
+      new Error(
+        'Cannot set permission mode to bypassPermissions because the session was not launched with --dangerously-skip-permissions',
+      ),
+    )).toBe(true)
   })
 
-  it('does NOT restart when leaving bypassPermissions for a stricter mode', () => {
-    // 从 bypass 切出不重启——否则会冲掉进程内 prePlanMode，导致 ExitPlanMode 后
-    // 恢复成 default 而非进入 plan 前的 bypassPermissions。这正是桌面端退出 plan
-    // 权限回不到 bypass 的根因。
-    expect(shouldRestartForPermissionMode('bypassPermissions', 'plan')).toBe(false)
-    expect(shouldRestartForPermissionMode('bypassPermissions', 'default')).toBe(false)
-    expect(shouldRestartForPermissionMode('bypassPermissions', 'acceptEdits')).toBe(false)
+  it('does not restart when bypass is disabled by user settings', () => {
+    expect(shouldFallbackToPermissionRestart(
+      'bypassPermissions',
+      new Error(
+        'Cannot set permission mode to bypassPermissions because it is disabled by settings or configuration',
+      ),
+    )).toBe(false)
   })
 
-  it('does not restart for non-bypass transitions or no-op changes', () => {
-    expect(shouldRestartForPermissionMode('default', 'plan')).toBe(false)
-    expect(shouldRestartForPermissionMode('plan', 'acceptEdits')).toBe(false)
-    // 同模式（含 bypass→bypass）是 no-op，不重启。
-    expect(shouldRestartForPermissionMode('bypassPermissions', 'bypassPermissions')).toBe(false)
-    expect(shouldRestartForPermissionMode('plan', 'plan')).toBe(false)
+  it('does not restart other permission failures', () => {
+    expect(shouldFallbackToPermissionRestart('auto', new Error('classifier unavailable'))).toBe(false)
+    expect(shouldFallbackToPermissionRestart('default', new Error('mock rejection'))).toBe(false)
+    expect(shouldFallbackToPermissionRestart('bypassPermissions', new Error('mock rejection'))).toBe(false)
   })
 })
 
@@ -358,7 +467,7 @@ describe('WebSocket API retry events', () => {
 })
 
 describe('WebSocket background task events', () => {
-  it('forwards task start and progress as structured desktop notifications', () => {
+  it('forwards task start and progress without reviving an idle foreground turn', () => {
     const started = {
       type: 'system',
       subtype: 'task_started',
@@ -375,11 +484,6 @@ describe('WebSocket background task events', () => {
         subtype: 'task_started',
         message: 'Verify the todo app',
         data: started,
-      },
-      {
-        type: 'status',
-        state: 'tool_executing',
-        verb: 'Verify the todo app',
       },
     ])
 
@@ -405,12 +509,24 @@ describe('WebSocket background task events', () => {
         message: 'Running Playwright checks',
         data: progress,
       },
-      {
-        type: 'status',
-        state: 'tool_executing',
-        verb: 'Running Playwright checks',
-      },
     ])
+  })
+
+  it('keeps AutoDream lifecycle visible without reviving foreground activity', () => {
+    const started = {
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'dream-task-1',
+      description: 'dreaming',
+      task_type: 'dream',
+    }
+
+    expect(translateCliMessage(started, 'session-1')).toEqual([{
+      type: 'system_notification',
+      subtype: 'task_started',
+      message: 'dreaming',
+      data: started,
+    }])
   })
 })
 
@@ -589,6 +705,456 @@ describe('WebSocket goal command events', () => {
 })
 
 describe('WebSocket stream event translation', () => {
+  it('does not replay buffered assistant blocks after their raw stream events', () => {
+    const sessionId = `buffered-assistant-${crypto.randomUUID()}`
+
+    translateCliMessage({
+      type: 'stream_event',
+      event: { type: 'message_start', message: { id: 'msg-root' } },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'thinking', thinking: '' },
+      },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'thinking_delta', thinking: 'reasoning' },
+      },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: { type: 'content_block_stop', index: 0 },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_start',
+        index: 1,
+        content_block: { type: 'text', text: '' },
+      },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 1,
+        delta: { type: 'text_delta', text: 'hello' },
+      },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: { type: 'content_block_stop', index: 1 },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: { type: 'message_stop' },
+    }, sessionId)
+
+    expect(translateCliMessage({
+      type: 'assistant',
+      message: {
+        id: 'msg-root',
+        content: [
+          { type: 'thinking', thinking: 'reasoning' },
+          { type: 'text', text: 'hello' },
+        ],
+      },
+    }, sessionId)).toEqual([])
+  })
+
+  it('keeps synchronous subagent tools outside the root stream dedupe scope', () => {
+    const sessionId = `sync-subagent-${crypto.randomUUID()}`
+
+    translateCliMessage({
+      type: 'stream_event',
+      event: { type: 'message_start', message: { id: 'msg-root' } },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'text', text: '' },
+      },
+    }, sessionId)
+
+    for (const [parentToolUseId, toolUseId] of [
+      ['agent-1', 'grep-1'],
+      ['agent-2', 'read-1'],
+    ]) {
+      expect(translateCliMessage({
+        type: 'assistant',
+        parent_tool_use_id: parentToolUseId,
+        message: {
+          id: `msg-${toolUseId}`,
+          content: [{
+            type: 'tool_use',
+            id: toolUseId,
+            name: toolUseId.startsWith('grep') ? 'Grep' : 'Read',
+            input: { path: 'src' },
+          }],
+        },
+      }, sessionId)).toEqual([{
+        type: 'tool_use_complete',
+        toolName: toolUseId.startsWith('grep') ? 'Grep' : 'Read',
+        toolUseId: `${parentToolUseId}/${toolUseId}`,
+        originalToolUseId: toolUseId,
+        input: { path: 'src' },
+        parentToolUseId,
+      }])
+    }
+  })
+
+  it('deduplicates only the subagent API message that streamed raw events', () => {
+    const sessionId = `streamed-subagent-${crypto.randomUUID()}`
+
+    translateCliMessage({
+      type: 'stream_event',
+      parent_tool_use_id: 'agent-1',
+      event: { type: 'message_start', message: { id: 'msg-child-streamed' } },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      parent_tool_use_id: 'agent-1',
+      event: {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'read-1', name: 'Read' },
+      },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"file_path":"src/App.tsx"}' },
+      },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: { type: 'content_block_stop', index: 0 },
+    }, sessionId)
+
+    expect(translateCliMessage({
+      type: 'assistant',
+      parent_tool_use_id: 'agent-1',
+      message: {
+        id: 'msg-child-streamed',
+        content: [{
+          type: 'tool_use',
+          id: 'read-1',
+          name: 'Read',
+          input: { file_path: 'src/App.tsx' },
+        }],
+      },
+    }, sessionId)).toEqual([])
+
+    expect(translateCliMessage({
+      type: 'assistant',
+      parent_tool_use_id: 'agent-1',
+      message: {
+        id: 'msg-child-buffered',
+        content: [{
+          type: 'tool_use',
+          id: 'grep-1',
+          name: 'Grep',
+          input: { pattern: 'needle' },
+        }],
+      },
+    }, sessionId)).toEqual([{
+      type: 'tool_use_complete',
+      toolName: 'Grep',
+      toolUseId: 'agent-1/grep-1',
+      originalToolUseId: 'grep-1',
+      input: { pattern: 'needle' },
+      parentToolUseId: 'agent-1',
+    }])
+  })
+
+  it('keeps interleaved raw tool blocks isolated by parent scope', () => {
+    const sessionId = `parallel-streams-${crypto.randomUUID()}`
+
+    for (const [parentToolUseId, messageId, toolUseId, toolName] of [
+      ['agent-1', 'msg-agent-1', 'grep-1', 'Grep'],
+      ['agent-2', 'msg-agent-2', 'read-1', 'Read'],
+    ]) {
+      translateCliMessage({
+        type: 'stream_event',
+        parent_tool_use_id: parentToolUseId,
+        event: { type: 'message_start', message: { id: messageId } },
+      }, sessionId)
+      translateCliMessage({
+        type: 'stream_event',
+        parent_tool_use_id: parentToolUseId,
+        event: {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'tool_use', id: toolUseId, name: toolName },
+        },
+      }, sessionId)
+    }
+
+    translateCliMessage({
+      type: 'stream_event',
+      parent_tool_use_id: 'agent-1',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"pattern":"needle"}' },
+      },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      parent_tool_use_id: 'agent-2',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"file_path":"src/App.tsx"}' },
+      },
+    }, sessionId)
+
+    expect(translateCliMessage({
+      type: 'stream_event',
+      parent_tool_use_id: 'agent-1',
+      event: { type: 'content_block_stop', index: 0 },
+    }, sessionId)).toEqual([{
+      type: 'tool_use_complete',
+      toolName: 'Grep',
+      toolUseId: 'agent-1/grep-1',
+      originalToolUseId: 'grep-1',
+      input: { pattern: 'needle' },
+      parentToolUseId: 'agent-1',
+    }])
+    expect(translateCliMessage({
+      type: 'stream_event',
+      parent_tool_use_id: 'agent-2',
+      event: { type: 'content_block_stop', index: 0 },
+    }, sessionId)).toEqual([{
+      type: 'tool_use_complete',
+      toolName: 'Read',
+      toolUseId: 'agent-2/read-1',
+      originalToolUseId: 'read-1',
+      input: { file_path: 'src/App.tsx' },
+      parentToolUseId: 'agent-2',
+    }])
+  })
+
+  it('clears an idless stream fallback when an identified message arrives', () => {
+    const sessionId = `idless-stream-${crypto.randomUUID()}`
+
+    translateCliMessage({
+      type: 'stream_event',
+      parent_tool_use_id: 'agent-1',
+      event: { type: 'message_start' },
+    }, sessionId)
+
+    expect(translateCliMessage({
+      type: 'assistant',
+      parent_tool_use_id: 'agent-1',
+      message: {
+        id: 'msg-identified',
+        content: [{
+          type: 'tool_use',
+          id: 'read-1',
+          name: 'Read',
+          input: { file_path: 'src/App.tsx' },
+        }],
+      },
+    }, sessionId)).toEqual([{
+      type: 'tool_use_complete',
+      toolName: 'Read',
+      toolUseId: 'agent-1/read-1',
+      originalToolUseId: 'read-1',
+      input: { file_path: 'src/App.tsx' },
+      parentToolUseId: 'agent-1',
+    }])
+
+    expect(translateCliMessage({
+      type: 'assistant',
+      parent_tool_use_id: 'agent-1',
+      message: {
+        content: [{
+          type: 'tool_use',
+          id: 'grep-1',
+          name: 'Grep',
+          input: { pattern: 'needle' },
+        }],
+      },
+    }, sessionId)).toEqual([{
+      type: 'tool_use_complete',
+      toolName: 'Grep',
+      toolUseId: 'agent-1/grep-1',
+      originalToolUseId: 'grep-1',
+      input: { pattern: 'needle' },
+      parentToolUseId: 'agent-1',
+    }])
+  })
+
+  it('does not cross-wire parentless deltas while parallel scopes share an index', () => {
+    const sessionId = `ambiguous-stream-${crypto.randomUUID()}`
+
+    for (const [parentToolUseId, messageId, toolUseId, toolName] of [
+      ['agent-1', 'msg-agent-1', 'read-1', 'Read'],
+      ['agent-2', 'msg-agent-2', 'grep-1', 'Grep'],
+    ]) {
+      translateCliMessage({
+        type: 'stream_event',
+        parent_tool_use_id: parentToolUseId,
+        event: { type: 'message_start', message: { id: messageId } },
+      }, sessionId)
+      translateCliMessage({
+        type: 'stream_event',
+        parent_tool_use_id: parentToolUseId,
+        event: {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'tool_use', id: toolUseId, name: toolName },
+        },
+      }, sessionId)
+    }
+
+    expect(translateCliMessage({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"wrong":"scope"}' },
+      },
+    }, sessionId)).toEqual([])
+    expect(translateCliMessage({
+      type: 'stream_event',
+      parent_tool_use_id: 'agent-1',
+      event: { type: 'content_block_stop', index: 0 },
+    }, sessionId)).toEqual([])
+    expect(translateCliMessage({
+      type: 'stream_event',
+      parent_tool_use_id: 'agent-2',
+      event: { type: 'content_block_stop', index: 0 },
+    }, sessionId)).toEqual([])
+
+    expect(translateCliMessage({
+      type: 'assistant',
+      parent_tool_use_id: 'agent-1',
+      message: {
+        id: 'msg-agent-1',
+        content: [{
+          type: 'tool_use',
+          id: 'read-1',
+          name: 'Read',
+          input: { file_path: 'src/App.tsx' },
+        }],
+      },
+    }, sessionId)).toEqual([{
+      type: 'tool_use_complete',
+      toolName: 'Read',
+      toolUseId: 'agent-1/read-1',
+      originalToolUseId: 'read-1',
+      input: { file_path: 'src/App.tsx' },
+      parentToolUseId: 'agent-1',
+    }])
+    expect(translateCliMessage({
+      type: 'assistant',
+      parent_tool_use_id: 'agent-2',
+      message: {
+        id: 'msg-agent-2',
+        content: [{
+          type: 'tool_use',
+          id: 'grep-1',
+          name: 'Grep',
+          input: { pattern: 'needle' },
+        }],
+      },
+    }, sessionId)).toEqual([{
+      type: 'tool_use_complete',
+      toolName: 'Grep',
+      toolUseId: 'agent-2/grep-1',
+      originalToolUseId: 'grep-1',
+      input: { pattern: 'needle' },
+      parentToolUseId: 'agent-2',
+    }])
+  })
+
+  it('namespaces duplicate child ids and leaves ambiguous results unparented', () => {
+    const sessionId = `duplicate-child-id-${crypto.randomUUID()}`
+
+    for (const parentToolUseId of ['agent-1', 'agent-2']) {
+      expect(translateCliMessage({
+        type: 'assistant',
+        parent_tool_use_id: parentToolUseId,
+        message: {
+          id: `msg-${parentToolUseId}`,
+          content: [{
+            type: 'tool_use',
+            id: 'Read:0',
+            name: 'Read',
+            input: { file_path: 'src/App.tsx' },
+          }],
+        },
+      }, sessionId)).toEqual([{
+        type: 'tool_use_complete',
+        toolName: 'Read',
+        toolUseId: `${parentToolUseId}/Read:0`,
+        originalToolUseId: 'Read:0',
+        input: { file_path: 'src/App.tsx' },
+        parentToolUseId,
+      }])
+    }
+
+    expect(translateCliMessage({
+      type: 'user',
+      message: {
+        content: [{ type: 'tool_result', tool_use_id: 'Read:0', content: 'ok' }],
+      },
+    }, sessionId)).toEqual([{
+      type: 'tool_result',
+      toolUseId: 'Read:0',
+      content: 'ok',
+      isError: false,
+      parentToolUseId: undefined,
+    }])
+  })
+
+  it('accepts the complete assistant response after a non-streaming fallback', () => {
+    const sessionId = `non-stream-fallback-${crypto.randomUUID()}`
+
+    translateCliMessage({
+      type: 'stream_event',
+      event: { type: 'message_start', message: { id: 'msg-fallback' } },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'text', text: '' },
+      },
+    }, sessionId)
+
+    translateCliMessage({
+      type: 'system',
+      subtype: 'streaming_fallback',
+      cause: 'watchdog',
+    }, sessionId)
+
+    expect(translateCliMessage({
+      type: 'assistant',
+      message: {
+        id: 'msg-fallback',
+        content: [{ type: 'text', text: 'fallback answer' }],
+      },
+    }, sessionId)).toEqual([
+      { type: 'content_start', blockType: 'text' },
+      { type: 'content_delta', text: 'fallback answer' },
+    ])
+  })
+
   it('keeps subagent parent linkage when later stream events omit the parent id', () => {
     const sessionId = `subagent-parent-${crypto.randomUUID()}`
 
@@ -605,7 +1171,8 @@ describe('WebSocket stream event translation', () => {
         type: 'content_start',
         blockType: 'tool_use',
         toolName: 'Read',
-        toolUseId: 'read-1',
+        toolUseId: 'agent-1/read-1',
+        originalToolUseId: 'read-1',
         parentToolUseId: 'agent-1',
       },
     ])
@@ -628,7 +1195,8 @@ describe('WebSocket stream event translation', () => {
       {
         type: 'tool_use_complete',
         toolName: 'Read',
-        toolUseId: 'read-1',
+        toolUseId: 'agent-1/read-1',
+        originalToolUseId: 'read-1',
         input: { file_path: 'src/App.tsx' },
         parentToolUseId: 'agent-1',
       },
@@ -644,7 +1212,8 @@ describe('WebSocket stream event translation', () => {
     }, sessionId)).toEqual([
       {
         type: 'tool_result',
-        toolUseId: 'read-1',
+        toolUseId: 'agent-1/read-1',
+        originalToolUseId: 'read-1',
         content: 'ok',
         isError: false,
         parentToolUseId: 'agent-1',
@@ -659,7 +1228,7 @@ describe('WebSocket stream event translation', () => {
       type: 'stream_event',
       event: { type: 'message_start' },
     }, sessionId)).toEqual([
-      { type: 'status', state: 'thinking' },
+      { type: 'status', state: 'thinking', attemptStart: true },
     ])
 
     expect(translateCliMessage({
@@ -698,6 +1267,73 @@ describe('WebSocket stream event translation', () => {
       },
     }, sessionId)).toEqual([
       { type: 'content_start', blockType: 'text' },
+    ])
+  })
+
+  it('resets partial block accumulation before a safe stream retry', () => {
+    const sessionId = `stream-retry-${crypto.randomUUID()}`
+
+    translateCliMessage({
+      type: 'stream_event',
+      event: { type: 'message_start' },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'stale-tool', name: 'Write' },
+      },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"stale":' },
+      },
+    }, sessionId)
+
+    expect(translateCliMessage({
+      type: 'system',
+      subtype: 'streaming_fallback',
+      cause: 'stream_retry',
+    }, sessionId)).toEqual([
+      { type: 'streaming_fallback', cause: 'stream_retry' },
+    ])
+
+    translateCliMessage({
+      type: 'stream_event',
+      event: { type: 'message_start' },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'fresh-tool', name: 'Write' },
+      },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"fresh":true}' },
+      },
+    }, sessionId)
+
+    expect(translateCliMessage({
+      type: 'stream_event',
+      event: { type: 'content_block_stop', index: 0 },
+    }, sessionId)).toEqual([
+      {
+        type: 'tool_use_complete',
+        toolName: 'Write',
+        toolUseId: 'fresh-tool',
+        input: { fresh: true },
+        parentToolUseId: undefined,
+      },
     ])
   })
 })

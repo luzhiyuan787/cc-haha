@@ -37,9 +37,7 @@ import {
 import { getPlanFilePath, getPlan } from './plans.js'
 import { getConnectedIdeName } from './ide.js'
 import {
-  filterInjectedMemoryFiles,
   getManagedAndUserConditionalRules,
-  getMemoryFiles,
   getMemoryFilesForNestedDirectory,
   getConditionalRulesForCwdLevelDirectory,
   type MemoryFileInfo,
@@ -71,13 +69,8 @@ import type {
   Base64ImageSource,
 } from '@anthropic-ai/sdk/resources/messages.mjs'
 import { maybeResizeAndDownsampleImageBlock } from './imageResizer.js'
+import { registerUserProvidedImage } from './userProvidedImages.js'
 import type { PastedContent } from './config.js'
-import { getGlobalConfig } from './config.js'
-import {
-  getDefaultSonnetModel,
-  getDefaultHaikuModel,
-  getDefaultOpusModel,
-} from './model/model.js'
 import type { ReadResourceResult } from '@modelcontextprotocol/sdk/types.js'
 import { getSkillToolCommands, getMcpSkillCommands } from '../commands.js'
 import type { Command } from '../types/command.js'
@@ -208,6 +201,11 @@ const sessionTranscriptModule = feature('KAIROS')
   : null
 /* eslint-enable @typescript-eslint/no-require-imports */
 import { hasUltrathinkKeyword, isUltrathinkEnabled } from './thinking.js'
+import {
+  getWorkflowSizeGuideline,
+  isWorkflowKeywordTriggerEnabled,
+} from './workflows/enabled.js'
+import { hasWorkflowKeyword } from './workflows/keyword.js'
 import {
   tokenCountFromLastAPIResponse,
   tokenCountWithEstimation,
@@ -683,6 +681,21 @@ export type Attachment =
       level: 'high'
     }
   | {
+      type: 'workflow_keyword_request'
+    }
+  | {
+      type: 'ultra_effort_enter'
+      /** `full` on the first turn of a session; `short` on every turn after. */
+      reminderType: 'full' | 'short'
+    }
+  | {
+      type: 'ultra_effort_exit'
+    }
+  | {
+      type: 'workflow_size_guideline_change'
+      size: string
+    }
+  | {
       type: 'deferred_tools_delta'
       addedNames: string[]
       addedLines: string[]
@@ -832,6 +845,25 @@ export async function getAttachments(
     ),
     maybe('ultrathink_effort', () =>
       Promise.resolve(getUltrathinkEffortAttachment(input)),
+    ),
+    maybe('workflow_keyword_request', () =>
+      Promise.resolve(
+        getWorkflowKeywordAttachment(
+          input,
+          toolUseContext.getAppState().suppressWorkflowKeyword === true,
+        ),
+      ),
+    ),
+    maybe('ultra_effort_enter', () =>
+      Promise.resolve(
+        getUltracodeEffortAttachments(
+          messages,
+          toolUseContext.getAppState().ultracode === true,
+        ),
+      ),
+    ),
+    maybe('workflow_size_guideline_change', () =>
+      Promise.resolve(getWorkflowSizeGuidelineAttachment(messages)),
     ),
     maybe('deferred_tools_delta', () =>
       Promise.resolve(
@@ -1439,6 +1471,101 @@ export function getDateChangeAttachments(
   return [{ type: 'date_change', newDate: currentDate }]
 }
 
+/**
+ * Opt this turn into orchestration when the user typed `ultracode`.
+ *
+ * Only a prompt the human actually typed counts — a webhook payload or a
+ * relayed PR comment containing the word must not spend a hundred agents.
+ */
+function getWorkflowKeywordAttachment(
+  input: string | null,
+  suppressed: boolean,
+): Attachment[] {
+  if (suppressed) return []
+  if (!input || !isWorkflowKeywordTriggerEnabled()) return []
+  if (!hasWorkflowKeyword(input)) return []
+  logEvent('tengu_workflow_keyword', {})
+  return [{ type: 'workflow_keyword_request' }]
+}
+
+/**
+ * Announce ultracode turning on or off, once per transition.
+ *
+ * The model needs a standing instruction while it is on, but repeating the
+ * full paragraph every turn is pure token cost — so the transition gets the
+ * full text and later turns get a one-line reminder.
+ */
+function getUltracodeEffortAttachments(
+  messages: Message[] | undefined,
+  ultracodeActive: boolean,
+): Attachment[] {
+  let lastState: 'enter' | 'exit' | 'none' = 'none'
+  for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
+    const message = messages?.[i]
+    if (message?.type !== 'attachment') continue
+    if (message.attachment.type === 'ultra_effort_enter') {
+      lastState = 'enter'
+      break
+    }
+    if (message.attachment.type === 'ultra_effort_exit') {
+      lastState = 'exit'
+      break
+    }
+  }
+
+  if (ultracodeActive) {
+    return [
+      {
+        type: 'ultra_effort_enter',
+        reminderType: lastState === 'enter' ? 'short' : 'full',
+      },
+    ]
+  }
+  return lastState === 'enter' ? [{ type: 'ultra_effort_exit' }] : []
+}
+
+/**
+ * Tell the model when the size guideline changed mid-session.
+ *
+ * The guideline is baked into the Workflow tool prompt, which the model may
+ * have cached from an earlier turn — without this, changing it in `/config`
+ * has no visible effect until the next session.
+ */
+function getWorkflowSizeGuidelineAttachment(
+  messages: Message[] | undefined,
+): Attachment[] {
+  const current = getWorkflowSizeGuideline()
+  for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
+    const message = messages?.[i]
+    if (message?.type !== 'attachment') continue
+    if (message.attachment.type !== 'workflow_size_guideline_change') continue
+    return message.attachment.size === current
+      ? []
+      : [{ type: 'workflow_size_guideline_change', size: current }]
+  }
+  // Nothing announced yet: the tool prompt already carries the guideline on
+  // the first turn, so only a later change is worth a reminder.
+  return []
+}
+
+/**
+ * Test seam for the two workflow attachment producers.
+ *
+ * Both are pure given their inputs, but they sit behind `getAttachments()`,
+ * which needs a full ToolUseContext and a live session. Exposing them keeps
+ * the tests on the real functions instead of a re-implementation.
+ */
+export const getAttachmentsForTesting = {
+  atMentionedFiles: (input: string, toolUseContext: ToolUseContext) =>
+    processAtMentionedFiles(input, toolUseContext),
+  workflowKeyword: (input: string | null, opts: { suppressed: boolean }) =>
+    getWorkflowKeywordAttachment(input, opts.suppressed),
+  ultracodeEffort: (messages: Message[] | undefined, ultracodeActive: boolean) =>
+    getUltracodeEffortAttachments(messages, ultracodeActive),
+  workflowSizeGuideline: (messages: Message[] | undefined) =>
+    getWorkflowSizeGuidelineAttachment(messages),
+}
+
 function getUltrathinkEffortAttachment(input: string | null): Attachment[] {
   if (!isUltrathinkEnabled() || !input || !hasUltrathinkKeyword(input)) {
     return []
@@ -1940,7 +2067,7 @@ async function processAtMentionedFiles(
           // If stat fails, continue with file logic
         }
 
-        return await generateFileAttachment(
+        const attachment = await generateFileAttachment(
           absoluteFilename,
           toolUseContext,
           'tengu_at_mention_extracting_filename_success',
@@ -1951,6 +2078,13 @@ async function processAtMentionedFiles(
             limit: lineEnd && lineStart ? lineEnd - lineStart + 1 : undefined,
           },
         )
+        // Naming an image with @ is what authorizes ImageEdit to upload it to
+        // the image provider. A path the model found on its own stays
+        // off-limits — see utils/userProvidedImages.ts.
+        if (attachment?.type === 'file' && attachment.content.type === 'image') {
+          await registerUserProvidedImage(absoluteFilename)
+        }
+        return attachment
       } catch {
         logEvent('tengu_at_mention_extracting_filename_error', {})
       }

@@ -12,6 +12,10 @@ import { handleSettingsApi } from '../api/settings.js'
 import { handleModelsApi } from '../api/models.js'
 import { handleStatusApi, resetUsage, addUsage } from '../api/status.js'
 import { ProviderService } from '../services/providerService.js'
+import { hahaOAuthService } from '../services/hahaOAuthService.js'
+import {
+  clearOpenAICodexModelCatalogCache,
+} from '../../services/openaiAuth/modelCatalog.js'
 import {
   clearOpenAIOAuthTokenCache,
 } from '../../services/openaiAuth/storage.js'
@@ -21,7 +25,17 @@ import {
   primeKeychainCacheFromPrefetch,
 } from '../../utils/secureStorage/macOsKeychainHelpers.js'
 import type { OpenAIOAuthTokens } from '../../services/openaiAuth/types.js'
-import { getModelOptions } from '../../utils/model/modelOptions.js'
+import {
+  getMaxOpus46_1MOption,
+  getMaxSonnet46_1MOption,
+  getModelOptions,
+  getOpus46_1MOption,
+  getSonnet46_1MOption,
+} from '../../utils/model/modelOptions.js'
+import {
+  getDefaultMainLoopModelSetting,
+  parseUserSpecifiedModel,
+} from '../../utils/model/model.js'
 import {
   getSettingsForSource,
   updateSettingsForSource,
@@ -45,6 +59,9 @@ let originalAnthropicModel: string | undefined
 let originalAnthropicDefaultHaikuModel: string | undefined
 let originalAnthropicDefaultSonnetModel: string | undefined
 let originalAnthropicDefaultOpusModel: string | undefined
+let originalAnthropicDefaultFableModel: string | undefined
+let originalAnthropicDefaultFableModelName: string | undefined
+let originalDisable1mContext: string | undefined
 
 async function setup() {
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-test-'))
@@ -63,6 +80,9 @@ async function setup() {
   originalAnthropicDefaultHaikuModel = process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL
   originalAnthropicDefaultSonnetModel = process.env.ANTHROPIC_DEFAULT_SONNET_MODEL
   originalAnthropicDefaultOpusModel = process.env.ANTHROPIC_DEFAULT_OPUS_MODEL
+  originalAnthropicDefaultFableModel = process.env.ANTHROPIC_DEFAULT_FABLE_MODEL
+  originalAnthropicDefaultFableModelName = process.env.ANTHROPIC_DEFAULT_FABLE_MODEL_NAME
+  originalDisable1mContext = process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT
   process.env.CLAUDE_CONFIG_DIR = tmpDir
   process.env.HOME = tmpDir
   process.env.USERPROFILE = tmpDir
@@ -74,6 +94,9 @@ async function setup() {
   delete process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL
   delete process.env.ANTHROPIC_DEFAULT_SONNET_MODEL
   delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL
+  delete process.env.ANTHROPIC_DEFAULT_FABLE_MODEL
+  delete process.env.ANTHROPIC_DEFAULT_FABLE_MODEL_NAME
+  delete process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT
   clearKeychainCache()
   primeKeychainCacheFromPrefetch(null)
   clearOpenAIOAuthTokenCache()
@@ -159,6 +182,24 @@ async function teardown() {
     delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL
   }
 
+  if (originalAnthropicDefaultFableModel !== undefined) {
+    process.env.ANTHROPIC_DEFAULT_FABLE_MODEL = originalAnthropicDefaultFableModel
+  } else {
+    delete process.env.ANTHROPIC_DEFAULT_FABLE_MODEL
+  }
+
+  if (originalAnthropicDefaultFableModelName !== undefined) {
+    process.env.ANTHROPIC_DEFAULT_FABLE_MODEL_NAME = originalAnthropicDefaultFableModelName
+  } else {
+    delete process.env.ANTHROPIC_DEFAULT_FABLE_MODEL_NAME
+  }
+
+  if (originalDisable1mContext !== undefined) {
+    process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = originalDisable1mContext
+  } else {
+    delete process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT
+  }
+
   await fs.rm(tmpDir, { recursive: true, force: true })
 }
 
@@ -234,6 +275,44 @@ describe('SettingsService', () => {
     const settings = await svc.getUserSettings()
     expect(settings.theme).toBe('dark')
     expect(settings.model).toBe('claude-haiku-4-5')
+  })
+
+  it('should preserve unknown desktop terminal fields from older or future settings', async () => {
+    await fs.writeFile(
+      path.join(tmpDir, 'settings.json'),
+      JSON.stringify({
+        desktopTerminal: {
+          startupShell: 'system',
+          customShellPath: '',
+          legacyEncoding: 'utf-8',
+          futureProfile: {
+            id: 'work',
+            inheritEnvironment: false,
+          },
+        },
+      }),
+      'utf-8',
+    )
+
+    const svc = new SettingsService()
+    await svc.updateUserSettings({
+      desktopTerminal: {
+        startupShell: 'pwsh',
+        customShellPath: 'C:\\Program Files\\PowerShell\\7\\pwsh.exe',
+      },
+    })
+
+    expect(await svc.getUserSettings()).toMatchObject({
+      desktopTerminal: {
+        startupShell: 'pwsh',
+        customShellPath: 'C:\\Program Files\\PowerShell\\7\\pwsh.exe',
+        legacyEncoding: 'utf-8',
+        futureProfile: {
+          id: 'work',
+          inheritEnvironment: false,
+        },
+      },
+    })
   })
 
   it('should not let cached CLI settings overwrite desktop settings updates', async () => {
@@ -335,6 +414,15 @@ describe('SettingsService', () => {
     await svc.setPermissionMode('plan')
     const mode = await svc.getPermissionMode()
     expect(mode).toBe('plan')
+  })
+
+  it('should persist auto as the user default permission mode', async () => {
+    const svc = new SettingsService()
+
+    await svc.setPermissionMode('auto')
+
+    expect(await svc.getPermissionMode()).toBe('auto')
+    expect(await svc.getUserSettings()).toMatchObject({ defaultMode: 'auto' })
   })
 
   it('should reject invalid permission mode', async () => {
@@ -582,6 +670,18 @@ describe('Settings API', () => {
     expect(body.mode).toBe('bypassPermissions')
   })
 
+  it('PUT /api/permissions/mode should accept auto', async () => {
+    const { req, url, segments } = makeRequest('PUT', '/api/permissions/mode', {
+      mode: 'auto',
+    })
+
+    const res = await handleSettingsApi(req, url, segments)
+
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ ok: true, mode: 'auto' })
+    expect(await new SettingsService().getPermissionMode()).toBe('auto')
+  })
+
   it('PUT /api/permissions/mode should reject invalid mode', async () => {
     const { req, url, segments } = makeRequest('PUT', '/api/permissions/mode', {
       mode: 'yolo',
@@ -612,9 +712,107 @@ describe('Models API', () => {
 
     expect(res.status).toBe(200)
     const body = await res.json()
-    expect(body.models).toBeArray()
-    expect(body.models.length).toBe(3)
-    expect(body.models[0].id).toContain('claude')
+    expect(body.models).toEqual([
+      {
+        id: 'claude-fable-5',
+        name: 'Fable 5',
+        description: 'Highest capability for long-running tasks',
+        context: '1m',
+      },
+      {
+        id: 'claude-opus-4-8',
+        name: 'Opus 4.8',
+        description: 'Best for complex agentic coding and enterprise work',
+        context: '1m',
+        defaultReasoningEffort: 'high',
+        supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+      },
+      {
+        id: 'claude-sonnet-5',
+        name: 'Sonnet 5',
+        description: 'Best combination of speed and intelligence',
+        context: '1m',
+        defaultReasoningEffort: 'high',
+        supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+      },
+      {
+        id: 'claude-haiku-4-5',
+        name: 'Haiku 4.5',
+        description: 'Fastest with near-frontier intelligence',
+        context: '200k',
+      },
+    ])
+  })
+
+  it('GET /api/models should expose the active provider model effort catalog', async () => {
+    const providerSvc = new ProviderService()
+    const provider = await providerSvc.addProvider({
+      presetId: 'kimi',
+      name: 'Kimi',
+      baseUrl: 'https://api.kimi.com/coding/',
+      apiKey: 'test-key',
+      apiFormat: 'anthropic',
+      models: {
+        main: 'k3',
+        haiku: 'k3',
+        sonnet: 'k3',
+        opus: 'k3',
+      },
+    })
+    await providerSvc.activateProvider(provider.id)
+
+    const { req, url, segments } = makeRequest('GET', '/api/models')
+    const res = await handleModelsApi(req, url, segments)
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.models).toEqual([{
+      id: 'k3',
+      name: 'k3',
+      description: 'Main model',
+      context: '',
+      supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+    }])
+  })
+
+  it('GET /api/models should keep generic effort for compatible preset models', async () => {
+    const providerSvc = new ProviderService()
+    const provider = await providerSvc.addProvider({
+      presetId: 'xuanshuapi',
+      name: 'XuanShu API',
+      baseUrl: 'https://www.xuanshuapi.com',
+      apiKey: 'test-key',
+      apiFormat: 'anthropic',
+      models: {
+        main: 'claude-opus-5',
+        haiku: 'claude-haiku-4-5',
+        sonnet: 'claude-sonnet-5',
+        opus: 'claude-opus-5',
+      },
+    })
+    await providerSvc.activateProvider(provider.id)
+
+    const { req, url, segments } = makeRequest('GET', '/api/models')
+    const res = await handleModelsApi(req, url, segments)
+    const body = await res.json() as {
+      models: Array<{ id: string; supportedReasoningEfforts?: string[] }>
+    }
+    const modelsById = new Map(body.models.map(model => [model.id, model]))
+
+    expect(modelsById.get('claude-opus-5')?.supportedReasoningEfforts).toEqual([
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+    ])
+    expect(modelsById.get('claude-sonnet-5')?.supportedReasoningEfforts).toEqual([
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+    ])
   })
 
   it('GET /api/models should merge env-configured provider models with saved OpenAI OAuth models', async () => {
@@ -630,8 +828,14 @@ describe('Models API', () => {
       expiresAt: Date.now() + 60_000,
     })
 
+    const originalFetch = globalThis.fetch
+    clearOpenAICodexModelCatalogCache()
+    globalThis.fetch = async () => new Response('offline', { status: 503 })
     const { req, url, segments } = makeRequest('GET', '/api/models')
-    const res = await handleModelsApi(req, url, segments)
+    const res = await handleModelsApi(req, url, segments).finally(() => {
+      globalThis.fetch = originalFetch
+      clearOpenAICodexModelCatalogCache()
+    })
 
     expect(res.status).toBe(200)
     const body = await res.json()
@@ -639,10 +843,51 @@ describe('Models API', () => {
 
     expect(ids).toContain('deepseek-v4-pro')
     expect(ids).toContain('deepseek-v4-flash')
+    expect(ids).toContain('gpt-5.6-sol')
     expect(ids).toContain('gpt-5.3-codex')
     expect(ids).toContain('gpt-5.4')
     expect(ids).toContain('gpt-5.4-mini')
     expect(ids.filter((id: string) => id === 'deepseek-v4-pro')).toHaveLength(1)
+  })
+
+  it('GET /api/models should merge user settings model roles with runtime env and include Fable', async () => {
+    await new SettingsService().updateUserSettings({
+      env: {
+        ANTHROPIC_MODEL: 'claude-opus-4-8',
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5-20251001',
+        ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-4-6',
+        ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-4-8',
+        ANTHROPIC_DEFAULT_FABLE_MODEL: 'claude-fable-5',
+      },
+    })
+    process.env.ANTHROPIC_MODEL = 'claude-opus-4-8'
+
+    const { req, url, segments } = makeRequest('GET', '/api/models')
+    const res = await handleModelsApi(req, url, segments)
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.models.map((model: { id: string }) => model.id)).toEqual([
+      'claude-opus-4-8',
+      'claude-haiku-4-5-20251001',
+      'claude-sonnet-4-6',
+      'claude-fable-5',
+    ])
+  })
+
+  it('GET /api/models/current should use the configured user env model without a runtime override', async () => {
+    await new SettingsService().updateUserSettings({
+      env: { ANTHROPIC_MODEL: 'claude-sonnet-from-settings' },
+    })
+    delete process.env.ANTHROPIC_MODEL
+
+    const { req, url, segments } = makeRequest('GET', '/api/models/current')
+    const res = await handleModelsApi(req, url, segments)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({
+      model: { id: 'claude-sonnet-from-settings' },
+    })
   })
 
   it('GET /api/models/current should return default model when not set', async () => {
@@ -651,7 +896,86 @@ describe('Models API', () => {
 
     expect(res.status).toBe(200)
     const body = await res.json()
-    expect(body.model.id).toBe('claude-opus-4-7')
+    expect(body.model.id).toBe('claude-opus-4-8')
+  })
+
+  it('GET /api/models/current should replace the legacy opus[1m] default with the Claude OAuth Pro default', async () => {
+    await hahaOAuthService.saveTokens({
+      accessToken: 'claude-pro-access',
+      refreshToken: 'claude-pro-refresh',
+      expiresAt: Date.now() + 60 * 60_000,
+      scopes: ['user:inference'],
+      subscriptionType: 'pro',
+    })
+    await new SettingsService().updateUserSettings({ model: 'opus[1m]' })
+    process.env.ANTHROPIC_MODEL = 'third-party-model-must-not-leak'
+
+    const currentRequest = makeRequest('GET', '/api/models/current')
+    const currentResponse = await handleModelsApi(
+      currentRequest.req,
+      currentRequest.url,
+      currentRequest.segments,
+    )
+    const currentBody = await currentResponse.json()
+
+    expect(currentBody.model).toMatchObject({
+      id: 'claude-sonnet-5',
+      name: 'Sonnet 5',
+    })
+
+    const listRequest = makeRequest('GET', '/api/models')
+    const listResponse = await handleModelsApi(
+      listRequest.req,
+      listRequest.url,
+      listRequest.segments,
+    )
+    const listBody = await listResponse.json()
+    expect(listBody.models.map((model: { id: string }) => model.id)).toEqual([
+      'claude-fable-5',
+      'claude-opus-4-8',
+      'claude-sonnet-5',
+      'claude-haiku-4-5',
+    ])
+  })
+
+  it('GET /api/models/current should use Opus for a Claude OAuth Max account without a full model selection', async () => {
+    await hahaOAuthService.saveTokens({
+      accessToken: 'claude-max-access',
+      refreshToken: 'claude-max-refresh',
+      expiresAt: Date.now() + 60 * 60_000,
+      scopes: ['user:inference'],
+      subscriptionType: 'max',
+    })
+    await new SettingsService().updateUserSettings({ model: 'opus[1m]' })
+
+    const { req, url, segments } = makeRequest('GET', '/api/models/current')
+    const response = await handleModelsApi(req, url, segments)
+    const body = await response.json()
+
+    expect(body.model).toMatchObject({
+      id: 'claude-opus-4-8',
+      name: 'Opus 4.8',
+    })
+  })
+
+  it('GET /api/models/current should preserve an explicit full Claude model selection across subscription defaults', async () => {
+    await hahaOAuthService.saveTokens({
+      accessToken: 'claude-pro-explicit-access',
+      refreshToken: 'claude-pro-explicit-refresh',
+      expiresAt: Date.now() + 60 * 60_000,
+      scopes: ['user:inference'],
+      subscriptionType: 'pro',
+    })
+    await new SettingsService().updateUserSettings({ model: 'claude-opus-4-8' })
+
+    const { req, url, segments } = makeRequest('GET', '/api/models/current')
+    const response = await handleModelsApi(req, url, segments)
+    const body = await response.json()
+
+    expect(body.model).toMatchObject({
+      id: 'claude-opus-4-8',
+      name: 'Opus 4.8',
+    })
   })
 
   it('GET /api/models/current should respect env-configured default model when no provider is active', async () => {
@@ -690,6 +1014,13 @@ describe('Models API', () => {
   })
 
   it('GET /api/models/current should prefer cc-haha managed model over global user model when provider is active', async () => {
+    await hahaOAuthService.saveTokens({
+      accessToken: 'unrelated-claude-access',
+      refreshToken: 'unrelated-claude-refresh',
+      expiresAt: Date.now() + 60 * 60_000,
+      scopes: ['user:inference'],
+      subscriptionType: 'pro',
+    })
     const settingsSvc = new SettingsService()
     await settingsSvc.updateUserSettings({ model: 'kimi-k2.6' })
 
@@ -767,11 +1098,19 @@ describe('Models API', () => {
       name: 'ChatGPT Official',
     })
     expect(body.models.map((model) => model.id)).toEqual([
+      'gpt-5.6-sol',
+      'gpt-5.6-terra',
+      'gpt-5.6-luna',
       'gpt-5.3-codex',
       'gpt-5.4',
       'gpt-5.5',
       'gpt-5.4-mini',
     ])
+    expect(body.models[0]).toMatchObject({
+      id: 'gpt-5.6-sol',
+      defaultReasoningEffort: 'low',
+      supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+    })
   })
 
   it('PUT /api/models/current should persist GPT model to managed settings when ChatGPT Official is active', async () => {
@@ -809,6 +1148,37 @@ describe('Models API', () => {
     })
   })
 
+  it('GET /api/models should return the Grok fallback catalog when Grok Official is active', async () => {
+    const providerSvc = new ProviderService()
+    await providerSvc.activateProvider('grok-official')
+
+    const { req, url, segments } = makeRequest('GET', '/api/models')
+    const res = await handleModelsApi(req, url, segments)
+    const body = await res.json() as {
+      models: Array<{ id: string; context: string }>
+      provider: { id: string; name: string }
+    }
+    expect(body.provider).toEqual({ id: 'grok-official', name: 'Grok Official' })
+    expect(body.models.map((model) => model.id)).toEqual([
+      'grok-4.6',
+      'grok-4.5',
+      'grok-composer-2.5-fast',
+    ])
+    expect(body.models.find((model) => model.id === 'grok-4.6')?.context).toBe('500000')
+    expect(body.models.find((model) => model.id === 'grok-4.5')?.context).toBe('500000')
+  })
+
+  it('persists and reads a Grok model from managed settings', async () => {
+    const providerSvc = new ProviderService()
+    await providerSvc.activateProvider('grok-official')
+    const put = makeRequest('PUT', '/api/models/current', { modelId: 'grok-4.5' })
+    expect((await handleModelsApi(put.req, put.url, put.segments)).status).toBe(200)
+
+    const get = makeRequest('GET', '/api/models/current')
+    const body = await (await handleModelsApi(get.req, get.url, get.segments)).json()
+    expect(body.model).toMatchObject({ id: 'grok-4.5', name: 'Grok 4.5' })
+  })
+
   it('GET /api/effort should return default effort level', async () => {
     const { req, url, segments } = makeRequest('GET', '/api/effort')
     const res = await handleModelsApi(req, url, segments)
@@ -816,7 +1186,7 @@ describe('Models API', () => {
     expect(res.status).toBe(200)
     const body = await res.json()
     expect(body.level).toBe('max')
-    expect(body.available).toEqual(['low', 'medium', 'high', 'max'])
+    expect(body.available).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
   })
 
   it('GET /api/effort should fall back when stored effort is stale', async () => {
@@ -829,17 +1199,17 @@ describe('Models API', () => {
     expect(res.status).toBe(200)
     const body = await res.json()
     expect(body.level).toBe('max')
-    expect(body.available).toEqual(['low', 'medium', 'high', 'max'])
+    expect(body.available).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
   })
 
   it('PUT /api/effort should set effort level', async () => {
-    const { req, url, segments } = makeRequest('PUT', '/api/effort', { level: 'high' })
+    const { req, url, segments } = makeRequest('PUT', '/api/effort', { level: 'xhigh' })
     const res = await handleModelsApi(req, url, segments)
 
     expect(res.status).toBe(200)
     const body = await res.json()
     expect(body.ok).toBe(true)
-    expect(body.level).toBe('high')
+    expect(body.level).toBe('xhigh')
   })
 
   it('PUT /api/effort should reject invalid level', async () => {
@@ -858,6 +1228,92 @@ describe('Models API', () => {
 describe('Model Options', () => {
   beforeEach(setup)
   afterEach(teardown)
+
+  it('defaults Anthropic API users to Opus 4.8 and exposes the current official options once', () => {
+    process.env.ANTHROPIC_API_KEY = 'test-api-key'
+
+    expect(getDefaultMainLoopModelSetting()).toBe('claude-opus-4-8')
+
+    const options = getModelOptions()
+    const values = options.map(option => option.value)
+
+    expect(options[0]?.description).toContain('Opus 4.8')
+    expect(options[0]?.description).toContain('$5')
+    expect(values).toContain('fable')
+    expect(values).toContain('sonnet')
+    expect(values).not.toContain('opus')
+    expect(values).not.toContain('opus[1m]')
+  })
+
+  it('keeps Anthropic-compatible third-party URLs on lag-safe defaults', () => {
+    process.env.ANTHROPIC_API_KEY = 'third-party-key'
+    process.env.ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic'
+
+    expect(getDefaultMainLoopModelSetting()).toBe('claude-sonnet-4-5-20250929')
+    expect(parseUserSpecifiedModel('best')).toBe('claude-opus-4-7')
+    expect(parseUserSpecifiedModel('fable')).toBe('claude-opus-4-7')
+
+    const options = getModelOptions()
+    const values = options.map(option => option.value)
+
+    expect(options[0]?.description).toContain('Sonnet 4.5')
+    expect(values).not.toContain('fable')
+    expect(values).not.toContain('claude-fable-5')
+  })
+
+  it('exposes a custom Fable alias only when a third-party provider configures it', () => {
+    process.env.ANTHROPIC_API_KEY = 'third-party-key'
+    process.env.ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic'
+    process.env.ANTHROPIC_DEFAULT_FABLE_MODEL = 'deepseek-v4-fable'
+    process.env.ANTHROPIC_DEFAULT_FABLE_MODEL_NAME = 'DeepSeek Fable'
+
+    expect(parseUserSpecifiedModel('fable')).toBe('deepseek-v4-fable')
+    expect(parseUserSpecifiedModel('best')).toBe('deepseek-v4-fable')
+    expect(getModelOptions()).toContainEqual(expect.objectContaining({
+      value: 'fable',
+      label: 'DeepSeek Fable',
+    }))
+  })
+
+  it('labels extended-context options with current first-party and conservative third-party names', () => {
+    process.env.ANTHROPIC_API_KEY = 'test-api-key'
+
+    expect(getSonnet46_1MOption().description).toContain('Sonnet 5')
+    expect(getOpus46_1MOption().description).toContain('Opus 4.8')
+    expect(getMaxSonnet46_1MOption().description).toContain('Sonnet 5')
+    expect(getMaxOpus46_1MOption().description).toContain('Opus 4.8')
+
+    process.env.ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic'
+
+    expect(getSonnet46_1MOption().description).toContain('Sonnet 4.6')
+    expect(getOpus46_1MOption().description).toContain('Opus 4.7')
+  })
+
+  it('does not offer redundant Sonnet 1M choices when extended context is disabled', () => {
+    process.env.ANTHROPIC_API_KEY = 'test-api-key'
+    process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1'
+
+    expect(getModelOptions().map(option => option.value)).not.toContain('sonnet[1m]')
+  })
+
+  it('renders explicit current aliases and Fable model IDs with current marketing names', () => {
+    process.env.ANTHROPIC_API_KEY = 'test-api-key'
+
+    process.env.ANTHROPIC_MODEL = 'opus'
+    expect(getModelOptions().find(option => option.value === 'opus')?.description)
+      .toContain('Opus 4.8')
+
+    process.env.ANTHROPIC_MODEL = 'opus[1m]'
+    expect(getModelOptions().find(option => option.value === 'opus[1m]')?.description)
+      .toContain('Opus 4.8')
+
+    process.env.ANTHROPIC_MODEL = 'claude-fable-5'
+    expect(getModelOptions()).toContainEqual(expect.objectContaining({
+      value: 'claude-fable-5',
+      label: 'Fable 5',
+      description: 'claude-fable-5',
+    }))
+  })
 
   it('should keep OpenAI OAuth models visible alongside env-configured provider models', () => {
     process.env.ANTHROPIC_API_KEY = 'deepseek-key'
@@ -879,6 +1335,9 @@ describe('Model Options', () => {
     const labels = options.map(option => option.label)
 
     expect(values).toContain('gpt-5.3-codex')
+    expect(values).toContain('gpt-5.6-sol')
+    expect(values).toContain('gpt-5.6-terra')
+    expect(values).toContain('gpt-5.6-luna')
     expect(values).toContain('gpt-5.4')
     expect(values).toContain('gpt-5.4-mini')
     expect(labels).toContain('deepseek-v4-pro')

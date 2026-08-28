@@ -1,3 +1,6 @@
+import { mkdir, appendFile, readFile, writeFile } from 'node:fs/promises'
+import { dirname } from 'node:path'
+
 const args = process.argv.slice(2)
 
 function getArg(name: string): string | undefined {
@@ -23,29 +26,219 @@ function extractUserText(message: any): string {
 }
 
 const sdkUrl = getArg('--sdk-url')
-const sessionId = getArg('--session-id') || crypto.randomUUID()
+const sessionId = getArg('--session-id') || getArg('--resume') || crypto.randomUUID()
 const initMode = process.env.MOCK_SDK_INIT_MODE || 'on_open'
 const initDelayMs = Number(process.env.MOCK_SDK_INIT_DELAY_MS || '0')
 const streamDelayMs = Number(process.env.MOCK_SDK_STREAM_DELAY_MS || '0')
 const exitAfterOpenMs = Number(process.env.MOCK_SDK_EXIT_AFTER_OPEN_MS || '0')
 const exitAfterFirstUserMs = Number(process.env.MOCK_SDK_EXIT_AFTER_FIRST_USER_MS || '0')
 const mcpStatusDelayMs = Number(process.env.MOCK_SDK_MCP_STATUS_DELAY_MS || '0')
-const startupStdout = process.env.MOCK_SDK_STARTUP_STDOUT || ''
-const exitBeforeSdkMs = Number(process.env.MOCK_SDK_EXIT_BEFORE_SDK_MS || '0')
+const permissionModeBehavior = process.env.MOCK_SDK_PERMISSION_MODE_BEHAVIOR || 'confirm'
+const resumeTranscriptPath = process.env.MOCK_SDK_RESUME_TRANSCRIPT_PATH
+const resumeUpstreamUrl = process.env.MOCK_SDK_RESUME_UPSTREAM_URL
 let initSent = false
 let firstUserExitScheduled = false
+
+/**
+ * Deterministic tool-use support.
+ *
+ * The mock previously only streamed text, so `tool_use → can_use_tool →
+ * permission_request → permission_response → tool_result` — the part of an agent turn
+ * that actually touches the user's files — had no end-to-end coverage that runs
+ * without a model. A turn opts in by sending `MOCK_TOOL <json>`; every existing
+ * prompt keeps its old behavior.
+ */
+// Not exported: this file boots a WebSocket at import time and exits when
+// --sdk-url is missing, so tests must never import it. The matching type and
+// prompt builder live in scripts/quality-gate/agent-flow/scenarios.ts.
+type MockToolStep = {
+  tool: string
+  input: Record<string, unknown>
+  /** Written only after the permission request is allowed, like a real tool. */
+  write?: { path: string; content: string }
+  /** Emit an is_error tool_result even when the request is allowed. */
+  failWith?: string
+  reply?: string
+}
+
+const MOCK_TOOL_PREFIX = 'MOCK_TOOL '
+const pendingPermissions = new Map<string, (decision: { allowed: boolean; message?: string }) => void>()
+
+function parseMockToolStep(text: string): MockToolStep | null {
+  const trimmed = text.trim()
+  if (!trimmed.startsWith(MOCK_TOOL_PREFIX)) return null
+  const parsed = JSON.parse(trimmed.slice(MOCK_TOOL_PREFIX.length)) as MockToolStep
+  if (!parsed || typeof parsed.tool !== 'string') {
+    throw new Error(`MOCK_TOOL payload must include a tool name: ${trimmed}`)
+  }
+  return { ...parsed, input: parsed.input ?? {} }
+}
+
+async function runToolStep(ws: WebSocket, step: MockToolStep) {
+  const toolUseId = `toolu_${crypto.randomUUID().replace(/-/g, '').slice(0, 20)}`
+  const requestId = `req_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`
+  const inputJson = JSON.stringify(step.input)
+
+  emit(ws, { type: 'stream_event', event: { type: 'message_start' }, session_id: sessionId })
+  emit(ws, {
+    type: 'stream_event',
+    event: {
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'tool_use', id: toolUseId, name: step.tool, input: {} },
+    },
+    session_id: sessionId,
+  })
+  emit(ws, {
+    type: 'stream_event',
+    event: {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'input_json_delta', partial_json: inputJson },
+    },
+    session_id: sessionId,
+  })
+  emit(ws, { type: 'stream_event', event: { type: 'content_block_stop', index: 0 }, session_id: sessionId })
+
+  const decision = await new Promise<{ allowed: boolean; message?: string }>((resolve) => {
+    pendingPermissions.set(requestId, resolve)
+    emit(ws, {
+      type: 'control_request',
+      request_id: requestId,
+      request: {
+        subtype: 'can_use_tool',
+        tool_name: step.tool,
+        tool_use_id: toolUseId,
+        input: step.input,
+        description: `mock ${step.tool}`,
+      },
+      session_id: sessionId,
+    })
+  })
+
+  let content = decision.allowed ? (step.reply ?? `${step.tool} ok`) : (decision.message ?? 'denied')
+  let isError = !decision.allowed
+  if (decision.allowed && step.failWith) {
+    content = step.failWith
+    isError = true
+  } else if (decision.allowed && step.write) {
+    await mkdir(dirname(step.write.path), { recursive: true })
+    await writeFile(step.write.path, step.write.content)
+  }
+
+  emit(ws, {
+    type: 'user',
+    message: {
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: toolUseId, content, is_error: isError }],
+    },
+    session_id: sessionId,
+  })
+  emit(ws, {
+    type: 'result',
+    subtype: 'success',
+    is_error: false,
+    result: isError ? `tool failed: ${content}` : `tool done: ${content}`,
+    usage: { input_tokens: 5, output_tokens: 3 },
+    session_id: sessionId,
+  })
+}
+
+function transcriptText(entry: any): string {
+  const content = entry?.message?.content
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .filter((block: any) => block?.type === 'text' && typeof block.text === 'string')
+    .map((block: any) => block.text)
+    .join(' ')
+}
+
+async function readResumeHistory(): Promise<Array<{ role: string; content: string }>> {
+  if (!resumeTranscriptPath) return []
+  const raw = await readFile(resumeTranscriptPath, 'utf8').catch(() => '')
+  return raw
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .filter((entry) => entry?.type === 'user' || entry?.type === 'assistant')
+    .map((entry) => ({ role: entry.message.role, content: transcriptText(entry) }))
+}
+
+async function appendResumeTurn(userText: string, assistantText: string): Promise<void> {
+  if (!resumeTranscriptPath) return
+  const userUuid = crypto.randomUUID()
+  const now = new Date().toISOString()
+  const records = [
+    {
+      parentUuid: null,
+      isSidechain: false,
+      type: 'user',
+      message: { role: 'user', content: userText },
+      uuid: userUuid,
+      timestamp: now,
+      userType: 'external',
+      cwd: process.cwd(),
+      sessionId,
+    },
+    {
+      parentUuid: userUuid,
+      isSidechain: false,
+      type: 'assistant',
+      message: {
+        model: 'mock-opus',
+        id: `msg_${crypto.randomUUID().slice(0, 20)}`,
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text: assistantText }],
+      },
+      uuid: crypto.randomUUID(),
+      timestamp: now,
+      sessionId,
+    },
+  ]
+  await appendFile(resumeTranscriptPath, `${records.map((record) => JSON.stringify(record)).join('\n')}\n`)
+}
+
+async function runResumeTurn(ws: WebSocket, userText: string): Promise<void> {
+  const history = await readResumeHistory()
+  const upstreamBody = {
+    messages: [...history, { role: 'user', content: userText }],
+  }
+  const response = await fetch(resumeUpstreamUrl!, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(upstreamBody),
+  })
+  await response.text()
+
+  const assistantText = userText.includes('SECOND_TURN_1033')
+    ? 'SECOND_REPLY_1033'
+    : 'FIRST_REPLY_1033'
+  emit(ws, {
+    type: 'assistant',
+    message: {
+      role: 'assistant',
+      content: [{ type: 'text', text: assistantText }],
+    },
+    session_id: sessionId,
+  })
+  if (process.env.CLAUDE_CODE_EAGER_FLUSH === '1') {
+    await appendResumeTurn(userText, assistantText)
+  }
+  emit(ws, {
+    type: 'result',
+    subtype: 'success',
+    is_error: false,
+    result: assistantText,
+    usage: { input_tokens: 3, output_tokens: 2 },
+    session_id: sessionId,
+  })
+}
 
 if (!sdkUrl) {
   console.error('Missing --sdk-url')
   process.exit(1)
-}
-
-if (startupStdout) {
-  console.log(startupStdout)
-}
-
-if (exitBeforeSdkMs > 0) {
-  setTimeout(() => process.exit(1), exitBeforeSdkMs)
 }
 
 const ws = new WebSocket(sdkUrl)
@@ -91,6 +284,15 @@ ws.addEventListener('message', (event) => {
           continue
         }
         const text = extractUserText(parsed)
+        if (resumeTranscriptPath && resumeUpstreamUrl) {
+          await runResumeTurn(ws, text)
+          continue
+        }
+        const toolStep = parseMockToolStep(text)
+        if (toolStep) {
+          await runToolStep(ws, toolStep)
+          continue
+        }
         const slashCommand = text.trim()
         if (slashCommand === '/cost') {
           emit(ws, {
@@ -200,6 +402,21 @@ ws.addEventListener('message', (event) => {
         })
       }
 
+      if (parsed.type === 'control_response' && typeof parsed.response?.request_id === 'string') {
+        const resolve = pendingPermissions.get(parsed.response.request_id)
+        if (resolve) {
+          pendingPermissions.delete(parsed.response.request_id)
+          const behavior = parsed.response?.response?.behavior
+          resolve({
+            allowed: behavior === 'allow',
+            message: typeof parsed.response?.response?.message === 'string'
+              ? parsed.response.response.message
+              : undefined,
+          })
+          continue
+        }
+      }
+
       if (parsed.type === 'control_request' && parsed.request?.subtype === 'interrupt') {
         emit(ws, {
           type: 'result',
@@ -209,6 +426,73 @@ ws.addEventListener('message', (event) => {
           usage: { input_tokens: 0, output_tokens: 0 },
           session_id: sessionId,
         })
+      }
+
+      if (parsed.type === 'control_request' && parsed.request?.subtype === 'set_permission_mode') {
+        if (permissionModeBehavior === 'unavailable') {
+          emit(ws, {
+            type: 'control_response',
+            response: {
+              subtype: 'error',
+              request_id: parsed.request_id,
+              error:
+                'Cannot set permission mode to bypassPermissions because the session was not launched with --dangerously-skip-permissions',
+            },
+            session_id: sessionId,
+          })
+          continue
+        }
+        if (permissionModeBehavior === 'status-before-reject') {
+          emit(ws, {
+            type: 'system',
+            subtype: 'status',
+            status: null,
+            permissionMode: parsed.request.mode,
+            session_id: sessionId,
+          })
+          emit(ws, {
+            type: 'control_response',
+            response: {
+              subtype: 'error',
+              request_id: parsed.request_id,
+              error: 'mock permission mode rejection',
+            },
+            session_id: sessionId,
+          })
+          continue
+        }
+        if (permissionModeBehavior === 'reject') {
+          emit(ws, {
+            type: 'control_response',
+            response: {
+              subtype: 'error',
+              request_id: parsed.request_id,
+              error: 'mock permission mode rejection',
+            },
+            session_id: sessionId,
+          })
+          continue
+        }
+
+        emit(ws, {
+          type: 'control_response',
+          response: {
+            subtype: 'success',
+            request_id: parsed.request_id,
+            response: { mode: parsed.request.mode },
+          },
+          session_id: sessionId,
+        })
+        if (permissionModeBehavior === 'confirm') {
+          emit(ws, {
+            type: 'system',
+            subtype: 'status',
+            status: null,
+            permissionMode: parsed.request.mode,
+            session_id: sessionId,
+          })
+        }
+        continue
       }
 
       if (parsed.type === 'control_request' && parsed.request?.subtype === 'get_session_usage') {

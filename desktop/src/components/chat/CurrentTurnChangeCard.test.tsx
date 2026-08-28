@@ -6,22 +6,29 @@ import { act } from 'react'
 // ──────────────────────────────────────────────────────────────────────────────
 // Hoisted mocks (vi.hoisted runs before module evaluation)
 // ──────────────────────────────────────────────────────────────────────────────
-const { openPreviewSpy, browserOpenSpy, openTargetSpy, ensureTargetsMock } = vi.hoisted(() => {
+const { openPreviewSpy, browserOpenSpy, openTargetSpy, ensureTargetsMock, getTargetsForPathMock, openSystemFileSpy, panelState } = vi.hoisted(() => {
   const openPreviewSpy = vi.fn().mockResolvedValue(undefined)
   const browserOpenSpy = vi.fn()
   const openTargetSpy = vi.fn().mockResolvedValue(undefined)
   const ensureTargetsMock = vi.fn().mockResolvedValue(undefined)
-  return { openPreviewSpy, browserOpenSpy, openTargetSpy, ensureTargetsMock }
+  const getTargetsForPathMock = vi.fn().mockResolvedValue([
+    { id: 'code', kind: 'ide', label: 'VS Code', icon: '', platform: 'darwin' },
+    { id: 'system-default', kind: 'system_default', label: 'System default', icon: '', platform: 'darwin' },
+  ])
+  const openSystemFileSpy = vi.fn().mockResolvedValue(undefined)
+  const panelState = { isOpen: false }
+  return { openPreviewSpy, browserOpenSpy, openTargetSpy, ensureTargetsMock, getTargetsForPathMock, openSystemFileSpy, panelState }
 })
 
 // Mock openTargetStore
 vi.mock('../../stores/openTargetStore', () => ({
   useOpenTargetStore: Object.assign(
     // Selector hook form: useOpenTargetStore((s) => s.xxx)
-    (selector: (s: { targets: unknown[]; ensureTargets: () => Promise<void>; openTarget: () => Promise<void> }) => unknown) =>
+    (selector: (s: { targets: unknown[]; ensureTargets: () => Promise<void>; getTargetsForPath: () => Promise<unknown[]>; openTarget: () => Promise<void> }) => unknown) =>
       selector({
         targets: [{ id: 'code', kind: 'ide', label: 'VS Code', icon: '', platform: 'darwin' }],
         ensureTargets: ensureTargetsMock,
+        getTargetsForPath: getTargetsForPathMock,
         openTarget: openTargetSpy,
       }),
     {
@@ -29,6 +36,7 @@ vi.mock('../../stores/openTargetStore', () => ({
       getState: vi.fn(() => ({
         targets: [{ id: 'code', kind: 'ide', label: 'VS Code', icon: '', platform: 'darwin' }],
         ensureTargets: ensureTargetsMock,
+        getTargetsForPath: getTargetsForPathMock,
         openTarget: openTargetSpy,
       })),
     },
@@ -49,10 +57,10 @@ vi.mock('../../stores/browserPanelStore', () => ({
 // Mock workspacePanelStore
 vi.mock('../../stores/workspacePanelStore', () => ({
   useWorkspacePanelStore: Object.assign(
-    (selector: (s: { openPreview: () => Promise<void> }) => unknown) =>
-      selector({ openPreview: openPreviewSpy }),
+    (selector: (s: { openPreview: () => Promise<void>; isPanelOpen: () => boolean }) => unknown) =>
+      selector({ openPreview: openPreviewSpy, isPanelOpen: () => panelState.isOpen }),
     {
-      getState: vi.fn(() => ({ openPreview: openPreviewSpy })),
+      getState: vi.fn(() => ({ openPreview: openPreviewSpy, isPanelOpen: () => panelState.isOpen })),
     },
   ),
 }))
@@ -65,6 +73,13 @@ vi.mock('@tauri-apps/plugin-shell', () => ({
 // Mock desktopRuntime.getServerBaseUrl
 vi.mock('../../lib/desktopRuntime', () => ({
   getServerBaseUrl: vi.fn(() => 'http://127.0.0.1:4321'),
+}))
+
+vi.mock('../../lib/systemFileOpen', () => ({
+  openLocalFileWithSystem: openSystemFileSpy,
+  resolveAbsoluteOpenPath: (path: string, workDir?: string) => (
+    path.startsWith('/') || !workDir ? path : `${workDir}/${path}`
+  ),
 }))
 
 // Mock useTranslation: returns identity-ish t function
@@ -86,11 +101,20 @@ vi.mock('../../i18n', () => ({
 import { CurrentTurnChangeCard } from './CurrentTurnChangeCard'
 import { localFileUrl } from '../../lib/handlePreviewLink'
 import type { SessionTurnCheckpoint } from '../../api/sessions'
+import { en } from '../../i18n/locales/en'
+import { zh } from '../../i18n/locales/zh'
+import { zh as zhTW } from '../../i18n/locales/zh-TW'
+import { jp } from '../../i18n/locales/jp'
+import { kr } from '../../i18n/locales/kr'
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
-function makeCheckpoint(filesChanged: string[]): SessionTurnCheckpoint {
+function makeCheckpoint(
+  filesChanged: string[],
+  restoreAvailable?: boolean,
+  unverifiedChangeSources?: string[],
+): SessionTurnCheckpoint {
   return {
     code: {
       available: true,
@@ -106,11 +130,19 @@ function makeCheckpoint(filesChanged: string[]): SessionTurnCheckpoint {
     conversation: {
       messagesRemoved: 0,
     },
+    ...(restoreAvailable === undefined ? {} : { restoreAvailable }),
+    ...(unverifiedChangeSources === undefined ? {} : { unverifiedChangeSources }),
   }
 }
 
-function renderCard(filesChanged: string[]) {
-  const checkpoint = makeCheckpoint(filesChanged)
+function renderCard(
+  filesChanged: string[],
+  isLatest = true,
+  restoreAvailable?: boolean,
+  unverifiedChangeSources?: string[],
+  onUndo: () => void = vi.fn(),
+) {
+  const checkpoint = makeCheckpoint(filesChanged, restoreAvailable, unverifiedChangeSources)
   return render(
     <CurrentTurnChangeCard
       sessionId="s1"
@@ -118,8 +150,8 @@ function renderCard(filesChanged: string[]) {
       workDir="/w/proj"
       error={null}
       isUndoing={false}
-      isLatest={true}
-      onUndo={vi.fn()}
+      isLatest={isLatest}
+      onUndo={onUndo}
     />,
   )
 }
@@ -136,6 +168,7 @@ describe('CurrentTurnChangeCard – rich file row (icon / name / type)', () => {
     vi.clearAllMocks()
     ensureTargetsMock.mockResolvedValue(undefined)
     openPreviewSpy.mockResolvedValue(undefined)
+    panelState.isOpen = false
   })
 
   it('renders the filename (not just full path) for each file', () => {
@@ -178,6 +211,80 @@ describe('CurrentTurnChangeCard – rich file row (icon / name / type)', () => {
     renderCard(['/w/proj/index.html'])
     expect(screen.getByText(/HTML/)).toBeInTheDocument()
   })
+
+  it('keeps incomplete checkpoint files visible and still offers undo for the conversation', () => {
+    const onUndo = vi.fn()
+    renderCard(['/w/proj/src/main.ts', '/outside/generated.ts'], true, false, undefined, onUndo)
+
+    expect(screen.getByText('main.ts')).toBeInTheDocument()
+    expect(screen.getByText('generated.ts')).toBeInTheDocument()
+    expect(screen.getByText('chat.turnChangesConversationOnlySubtitle')).toBeInTheDocument()
+    // An unrestorable checkpoint must not cost the user the conversation
+    // rollback too — the dialog is where the remaining action is chosen.
+    const undoButton = screen.getByRole('button', { name: 'chat.turnChangesLatestUndoAria' })
+    expect(undoButton).toBeEnabled()
+    fireEvent.click(undoButton)
+    expect(onUndo).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps undo usable and warns instead of blocking when coverage is partial', () => {
+    const onUndo = vi.fn()
+    renderCard(['/w/proj/src/main.ts'], true, true, ['Bash', 'TaskCreate'], onUndo)
+
+    // Warn about what undo will NOT reverse...
+    expect(screen.getByText('chat.turnChangesPartialCoverageSubtitle')).toBeInTheDocument()
+    expect(screen.queryByText('chat.turnChangesConversationOnlySubtitle')).toBeNull()
+
+    // ...while still letting the user reverse the files it did capture.
+    const undoButton = screen.getByRole('button', { name: 'chat.turnChangesLatestUndoAria' })
+    expect(undoButton).toBeEnabled()
+    fireEvent.click(undoButton)
+    expect(onUndo).toHaveBeenCalledTimes(1)
+  })
+
+  it('names the unverified sources in every locale message', () => {
+    // Every surface that warns about partial coverage feeds the joined tool list
+    // in as {sources}; a locale that drops the placeholder would warn without
+    // saying what undo is leaving behind.
+    const keys = [
+      'chat.turnChangesPartialCoverageSubtitle',
+      'chat.turnChangesPartialCoverageConfirmBody',
+      'chat.rewindSuccessPartialCoverage',
+    ] as const
+    for (const [name, messages] of Object.entries({ en, zh, zhTW, jp, kr })) {
+      for (const key of keys) {
+        expect(messages[key], `${name}/${key} must interpolate {sources}`)
+          .toContain('{sources}')
+      }
+    }
+    // The post-undo message also has to say how much of the conversation went.
+    for (const [name, messages] of Object.entries({ en, zh, zhTW, jp, kr })) {
+      expect(
+        messages['chat.rewindSuccessPartialCoverage'],
+        `${name} must interpolate {count}`,
+      ).toContain('{count}')
+    }
+  })
+
+  it('shows no coverage warning when every change source is accounted for', () => {
+    renderCard(['/w/proj/src/main.ts'], true, true, [])
+
+    expect(screen.queryByText('chat.turnChangesPartialCoverageSubtitle', { exact: false }))
+      .toBeNull()
+    expect(screen.getByText('chat.turnChangesLatestSubtitle')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'chat.turnChangesLatestUndoAria' })).toBeEnabled()
+  })
+
+  it('prefers the conversation-only message over the coverage warning when restore is unavailable', () => {
+    renderCard(['/w/proj/src/main.ts'], true, false, ['Bash'])
+
+    // Both conditions hold, but "files cannot be restored at all" is the one
+    // that changes what the user can do, so it wins the subtitle.
+    expect(screen.getByText('chat.turnChangesConversationOnlySubtitle')).toBeInTheDocument()
+    expect(screen.queryByText('chat.turnChangesPartialCoverageSubtitle', { exact: false }))
+      .toBeNull()
+    expect(screen.getByRole('button', { name: 'chat.turnChangesLatestUndoAria' })).toBeEnabled()
+  })
 })
 
 describe('CurrentTurnChangeCard – row opens the workspace diff', () => {
@@ -192,14 +299,14 @@ describe('CurrentTurnChangeCard – row opens the workspace diff', () => {
     const row = screen.getByRole('button', { name: /turnChangesOpenInWorkspaceAria/ })
     fireEvent.click(row)
     // displayPath is the workDir-relative path (matches the workspace file tree)
-    expect(openPreviewSpy).toHaveBeenCalledWith('s1', 'src/main.ts', 'diff')
+    expect(openPreviewSpy).toHaveBeenCalledWith('s1', 'src/main.ts', 'diff', expect.objectContaining({ sourceTurnKey: 'msg-1' }))
   })
 
   it('passes the workDir-relative displayPath (not the absolute path) to openPreview', () => {
     renderCard(['/w/proj/README.md'])
     const row = screen.getByRole('button', { name: /turnChangesOpenInWorkspaceAria/ })
     fireEvent.click(row)
-    expect(openPreviewSpy).toHaveBeenCalledWith('s1', 'README.md', 'diff')
+    expect(openPreviewSpy).toHaveBeenCalledWith('s1', 'README.md', 'diff', expect.objectContaining({ sourceTurnKey: 'msg-1' }))
   })
 
   it('clicking an outside-workspace html changed file opens the in-app browser via local-file', () => {
@@ -216,7 +323,7 @@ describe('CurrentTurnChangeCard – row opens the workspace diff', () => {
     renderCard(['/other/place/notes.txt'])
     const row = screen.getByRole('button', { name: /turnChangesOpenInWorkspaceAria/ })
     fireEvent.click(row)
-    expect(openPreviewSpy).toHaveBeenCalledWith('s1', '/other/place/notes.txt', 'file')
+    expect(openPreviewSpy).toHaveBeenCalledWith('s1', '/other/place/notes.txt', 'file', expect.objectContaining({ sourceTurnKey: 'msg-1' }))
     expect(browserOpenSpy).not.toHaveBeenCalled()
   })
 
@@ -252,23 +359,29 @@ describe('CurrentTurnChangeCard – open-with buttons', () => {
     expect(buttons).toHaveLength(2)
   })
 
-  it('does NOT render an "open-with" button for a source file (row still opens workspace)', () => {
+  it('renders an "open-with" button for a source file while its row still opens workspace', () => {
     renderCard(['/w/proj/src/main.ts'])
-    expect(screen.queryAllByRole('button', { name: 'openWith.title' })).toHaveLength(0)
-    // source files keep their workspace-open row — only the open-with pill is dropped
+    expect(screen.getAllByRole('button', { name: 'openWith.title' })).toHaveLength(1)
     expect(screen.getByRole('button', { name: /turnChangesOpenInWorkspaceAria/ })).toBeInTheDocument()
   })
 
-  it('mixed turn: only previewable rows (md/html) get the open-with button, not .ts', () => {
+  it('mixed turn: every real changed file gets the open-with button', () => {
     renderCard(['/w/proj/README.md', '/w/proj/src/main.ts', '/w/proj/index.html'])
-    expect(screen.getAllByRole('button', { name: 'openWith.title' })).toHaveLength(2)
+    expect(screen.getAllByRole('button', { name: 'openWith.title' })).toHaveLength(3)
   })
 
-  it('hides the workspace chevron on rows that already show an open-with button', () => {
+  it('keeps open-with secondary while every row retains its workspace chevron', () => {
     renderCard(['/w/proj/README.md', '/w/proj/index.html', '/w/proj/src/main.ts'])
 
-    expect(screen.getAllByRole('button', { name: 'openWith.title' })).toHaveLength(2)
-    expect(screen.getAllByText('chevron_right')).toHaveLength(1)
+    expect(screen.getAllByRole('button', { name: 'openWith.title' })).toHaveLength(3)
+    const rows = screen.getAllByRole('button', { name: /turnChangesOpenInWorkspaceAria/ })
+    expect(rows.every((row) => row.querySelector('.lucide-chevron-right'))).toBe(true)
+  })
+
+  it('shows the same destination chevron on every changed-file row', () => {
+    const { container } = renderCard(['/w/proj/README.md', '/w/proj/src/main.ts'])
+
+    expect(container.querySelectorAll('.lucide-chevron-right')).toHaveLength(2)
   })
 
   it('clicking README.md open-with opens menu with workspace preview item', async () => {
@@ -281,6 +394,21 @@ describe('CurrentTurnChangeCard – open-with buttons', () => {
 
     // The menu should show a workspace preview item (i18n key)
     expect(await screen.findByText('openWith.workspacePreview')).toBeInTheDocument()
+  })
+
+  it('offers the copy entries every other open-with surface has', async () => {
+    // This card built its dependencies by hand instead of using the shared
+    // factory, so it silently lacked the two clipboard rows the prose links and
+    // the file tree both offer.
+    renderCard(['/w/proj/README.md'])
+    const [openWithBtn] = screen.getAllByRole('button', { name: 'openWith.title' })
+
+    await act(async () => {
+      fireEvent.click(openWithBtn!)
+    })
+
+    expect(await screen.findByText('openWith.copyPath')).toBeInTheDocument()
+    expect(screen.getByText('openWith.copyFileContent')).toBeInTheDocument()
   })
 
   it('clicking workspace preview item in README.md menu calls openPreview', async () => {
@@ -339,7 +467,7 @@ describe('CurrentTurnChangeCard – open-with buttons', () => {
     expect(await screen.findByText('openWith.inAppBrowser')).toBeInTheDocument()
   })
 
-  it('ensureTargets is called when open-with button is clicked', async () => {
+  it('loads targets for the concrete file when open-with is clicked', async () => {
     renderCard(['/w/proj/README.md'])
     const [openWithBtn] = screen.getAllByRole('button', { name: 'openWith.title' })
 
@@ -347,7 +475,16 @@ describe('CurrentTurnChangeCard – open-with buttons', () => {
       fireEvent.click(openWithBtn!)
     })
 
-    expect(ensureTargetsMock).toHaveBeenCalledTimes(1)
+    expect(getTargetsForPathMock).toHaveBeenCalledWith('/w/proj/README.md')
+  })
+
+  it('opens an office changed file with the system application instead of the binary workspace preview', () => {
+    renderCard(['/w/proj/reports/brief.docx'])
+
+    fireEvent.click(screen.getByRole('button', { name: /turnChangesOpenFileAria/ }))
+
+    expect(openSystemFileSpy).toHaveBeenCalledWith('/w/proj/reports/brief.docx')
+    expect(openPreviewSpy).not.toHaveBeenCalled()
   })
 
   it('open-with button does not also trigger the row workspace-open (stopPropagation)', async () => {
@@ -360,6 +497,36 @@ describe('CurrentTurnChangeCard – open-with buttons', () => {
 
     // The diff open (3rd arg 'diff') must not have fired from clicking the pill.
     expect(openPreviewSpy).not.toHaveBeenCalledWith('s1', 'README.md', 'diff')
+  })
+})
+
+describe('CurrentTurnChangeCard – conversation continuity', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    panelState.isOpen = false
+    openPreviewSpy.mockImplementation(async () => {
+      panelState.isOpen = true
+    })
+  })
+
+  it('truthfully labels a historical row as opening the current workspace diff', () => {
+    renderCard(['/w/proj/src/main.ts'], false)
+
+    expect(screen.getByText('chat.turnChangesCurrentWorkspaceDiff')).toBeInTheDocument()
+  })
+
+  it('records a stable opener id and semantic turn key before opening the diff', () => {
+    renderCard(['/w/proj/src/main.ts'])
+    const row = screen.getByRole('button', { name: /turnChangesOpenInWorkspaceAria/ })
+
+    fireEvent.click(row)
+
+    expect(row.id).toContain('msg-1')
+    expect(row).toHaveAttribute('data-source-turn-key', 'msg-1')
+    expect(openPreviewSpy).toHaveBeenCalledWith('s1', 'src/main.ts', 'diff', {
+      sourceTurnKey: 'msg-1',
+      sourceElementId: row.id,
+    })
   })
 })
 

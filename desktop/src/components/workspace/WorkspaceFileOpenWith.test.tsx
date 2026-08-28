@@ -10,17 +10,27 @@ const hostOpenPath = vi.hoisted(() => vi.fn().mockResolvedValue(undefined))
 const browserOpen = vi.hoisted(() => vi.fn())
 const openPreview = vi.hoisted(() => vi.fn().mockResolvedValue(undefined))
 
-vi.mock('../../stores/openTargetStore', () => ({
-  useOpenTargetStore: (sel: (s: unknown) => unknown) =>
-    sel({
-      targets: [
-        { id: 'code', kind: 'ide', label: 'VS Code', icon: '', platform: 'darwin' },
-        { id: 'finder', kind: 'file_manager', label: 'Finder', icon: '', platform: 'darwin' },
-      ],
-      ensureTargets: () => {},
-      openTarget,
-    }),
+const openTargetState = vi.hoisted(() => ({
+  targets: [
+    { id: 'code', kind: 'ide', label: 'VS Code', icon: '', platform: 'darwin' },
+    { id: 'finder', kind: 'file_manager', label: 'Finder', icon: '', platform: 'darwin' },
+  ],
+  ensureTargets: () => {},
+  getTargetsForPath: vi.fn((): Promise<unknown[]> => new Promise(() => {})),
 }))
+
+// A zustand store is callable as a hook AND exposes getState; the shared menu
+// wiring in lib/openWithMenuItems uses the latter, the same way openPreviewLink
+// reads the browser/workspace stores.
+vi.mock('../../stores/openTargetStore', () => {
+  const state = { ...openTargetState, openTarget }
+  return {
+    useOpenTargetStore: Object.assign(
+      (sel: (s: unknown) => unknown) => sel(state),
+      { getState: () => state },
+    ),
+  }
+})
 
 vi.mock('@tauri-apps/plugin-shell', () => ({ open: shellOpen }))
 
@@ -61,18 +71,20 @@ describe('WorkspaceFileOpenWith', () => {
     }
   })
 
-  it('renders only IDE and file-manager items', () => {
+  it('renders the IDE, file-manager and copy-contents items', () => {
     const { getAllByRole } = render(
       <WorkspaceFileOpenWith absolutePath="/w/report.md" />,
     )
 
-    const menuItems = getAllByRole('menuitem')
-    expect(menuItems).toHaveLength(2)
-
-    const labels = menuItems.map((el) => el.textContent)
+    const labels = getAllByRole('menuitem').map((el) => el.textContent)
+    expect(labels).toHaveLength(4)
     expect(labels.some((l) => l?.includes('VS Code'))).toBe(true)
-    expect(labels.some((l) => l?.includes('Finder'))).toBe(true)
-    expect(labels.some((l) => l?.includes('openWith.systemDefault'))).toBe(false)
+    expect(labels.some((l) => l?.includes('openWith.revealIn.darwin'))).toBe(true)
+    // Added with #1146. "Copy path" is deliberately absent: WorkspacePanel
+    // already renders its own copy-path pair directly above this block.
+    expect(labels).toContain('openWith.copyFileContent')
+    expect(labels).not.toContain('openWith.copyPath')
+    expect(labels).toContain('openWith.systemDefault')
   })
 
   it('clicking the IDE item calls openTarget and onAfterSelect', () => {
@@ -89,6 +101,18 @@ describe('WorkspaceFileOpenWith', () => {
 
     expect(openTarget).toHaveBeenCalledWith('code', '/w/report.md')
     expect(onAfter).toHaveBeenCalledTimes(1)
+  })
+
+  it('adds native applications discovered for this exact file path', async () => {
+    openTargetState.getTargetsForPath.mockResolvedValueOnce([
+      { id: 'application:pages', kind: 'application', label: 'Pages', icon: 'application', platform: 'darwin' },
+      { id: 'system-default', kind: 'system_default', label: 'System default', icon: 'system', platform: 'darwin' },
+    ])
+
+    const view = render(<WorkspaceFileOpenWith absolutePath="/w/brief.docx" />)
+
+    expect(await view.findByText('openWith.openInTarget:Pages')).toBeInTheDocument()
+    expect(openTargetState.getTargetsForPath).toHaveBeenCalledWith('/w/brief.docx')
   })
 
   it('does not call shell open from the file open-with menu', () => {
@@ -111,7 +135,7 @@ describe('WorkspaceFileOpenWith', () => {
     expect(labels.some((l) => l?.includes('openWith.workspacePreview'))).toBe(true)
     expect(labels.some((l) => l?.includes('openWith.inAppBrowser'))).toBe(true)
     expect(labels.some((l) => l?.includes('VS Code'))).toBe(true)
-    expect(labels.some((l) => l?.includes('Finder'))).toBe(true)
+    expect(labels.some((l) => l?.includes('openWith.revealIn.darwin'))).toBe(true)
   })
 
   it('opens the in-app browser preview URL from workspace html files', () => {

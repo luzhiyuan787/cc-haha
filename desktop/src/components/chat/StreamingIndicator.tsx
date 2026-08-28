@@ -1,16 +1,11 @@
 import { useEffect, useState } from 'react'
 import { RefreshCw } from 'lucide-react'
+import { Badge } from '@/components/ui/Badge'
 import { useChatStore } from '../../stores/chatStore'
 import { useTabStore } from '../../stores/tabStore'
 import { useTranslation, type TranslationKey } from '../../i18n'
 import { formatTokenCount } from '../../lib/formatTokenCount'
-
-function formatElapsed(seconds: number): string {
-  if (seconds < 60) return `${seconds}s`
-  const m = Math.floor(seconds / 60)
-  const s = seconds % 60
-  return `${m}m ${s}s`
-}
+import { formatDurationSeconds } from '../../lib/backgroundTasks'
 
 function translateServerVerb(
   t: (key: TranslationKey) => string,
@@ -19,6 +14,28 @@ function translateServerVerb(
   const key = `serverVerb.${verb}` as TranslationKey
   const translated = t(key)
   return translated === key ? verb : translated
+}
+
+/**
+ * What the turn is currently doing, in the user's language.
+ *
+ * This is the only place in the UI that reports the verb, the elapsed time and
+ * the tokens so far — the composer keeps just a Stop button. Do not delete this
+ * component on the assumption the composer covers it, and do not fold it into
+ * the turn rail either: during `isPreparingTurn` the session is still being
+ * created, so the transcript holds no render items and there is no rail to hang
+ * it on. That gap is exactly what regressed once before.
+ */
+export function resolveTurnStatusVerb(
+  t: (key: TranslationKey) => string,
+  chatState: string,
+  statusVerb: string,
+): string {
+  if (statusVerb) return translateServerVerb(t, statusVerb)
+  if (chatState === 'thinking') return t('serverVerb.Thinking')
+  if (chatState === 'compacting') return t('serverVerb.Compacting conversation')
+  if (chatState === 'tool_executing') return t('serverVerb.Running')
+  return t('serverVerb.Working')
 }
 
 function formatRetrySeconds(ms: number): number {
@@ -38,7 +55,9 @@ export function StreamingIndicator() {
   const [now, setNow] = useState(() => Date.now())
   const activeTabId = useTabStore((s) => s.activeTabId)
   const sessionState = useChatStore((s) => activeTabId ? s.sessions[activeTabId] : undefined)
-  const chatState = sessionState?.chatState ?? 'idle'
+  const chatState = sessionState?.isPreparingTurn
+    ? 'thinking'
+    : sessionState?.chatState ?? 'idle'
   const statusVerb = sessionState?.statusVerb ?? ''
   const apiRetry = sessionState?.apiRetry ?? null
   const streamingFallback = sessionState?.streamingFallback ?? null
@@ -65,23 +84,29 @@ export function StreamingIndicator() {
         data-testid="api-retry-indicator"
         role="status"
         aria-live="polite"
-        className="mb-2 flex w-full max-w-[min(720px,100%)] flex-wrap items-center gap-2 rounded-md border border-amber-500/35 bg-amber-50/80 px-3 py-2 text-xs text-amber-950 shadow-sm dark:border-amber-400/25 dark:bg-amber-950/30 dark:text-amber-100"
+        className="mb-2 flex w-full max-w-[min(720px,100%)] flex-wrap items-center gap-2 rounded-[var(--radius-md)] border border-[var(--color-warning)] bg-[var(--color-warning-container)] px-3 py-2 text-xs text-[var(--color-on-warning-container)] shadow-[var(--shadow-card)]"
       >
-        <RefreshCw size={14} strokeWidth={2.2} className="shrink-0 animate-spin text-amber-700 dark:text-amber-300" aria-hidden="true" />
+        <RefreshCw size={14} strokeWidth={2.2} className="shrink-0 animate-spin text-[var(--color-warning)]" aria-hidden="true" />
         <span className="font-medium">{t('chat.retry.title')}</span>
-        <span className="rounded-[4px] border border-amber-700/20 bg-white/70 px-1.5 py-0.5 font-mono text-[11px] leading-none text-amber-900 dark:border-amber-300/20 dark:bg-black/15 dark:text-amber-100">
+        {/*
+          Neutral rather than `tone="warning"`: these chips sit on the warning
+          container itself, so a warning-tinted chip would disappear into it,
+          and the warning accent as foreground on that fill measures 2.66:1 in
+          the light theme (see components/AGENTS.md §3.2).
+        */}
+        <Badge mono pill={false} bordered className="leading-none">
           {t('chat.retry.attempt', { attempt: apiRetry.attempt, max: apiRetry.maxRetries })}
-        </span>
-        <span className="rounded-[4px] border border-amber-700/20 bg-white/70 px-1.5 py-0.5 font-mono text-[11px] leading-none text-amber-900 dark:border-amber-300/20 dark:bg-black/15 dark:text-amber-100">
+        </Badge>
+        <Badge mono pill={false} bordered className="leading-none">
           {statusText}
-        </span>
-        <span className="text-amber-800 dark:text-amber-200">
+        </Badge>
+        <span>
           {remainingMs > 0
             ? t('chat.retry.waiting', { seconds: formatRetrySeconds(remainingMs) })
             : t('chat.retry.retrying')}
         </span>
         {detailText && (
-          <span className="min-w-0 max-w-full truncate text-amber-700 dark:text-amber-200" title={detailText}>
+          <span className="min-w-0 max-w-full truncate opacity-80" title={detailText}>
             {detailText}
           </span>
         )}
@@ -97,50 +122,48 @@ export function StreamingIndicator() {
         data-testid="streaming-fallback-indicator"
         role="status"
         aria-live="polite"
-        className="mb-2 flex w-fit items-center gap-2 rounded-full border border-[var(--color-border)]/40 bg-[var(--color-surface-container-low)] px-3 py-1"
+        className="flex w-fit items-center gap-[9px] py-1 text-[13.5px] text-[var(--color-text-secondary)]"
       >
-        <RefreshCw size={12} strokeWidth={2.2} className="shrink-0 animate-spin text-[var(--color-text-secondary)]" aria-hidden="true" />
-        <span className="text-xs font-medium text-[var(--color-text-secondary)]">
+        <RefreshCw size={13} strokeWidth={2.2} className="shrink-0 animate-spin text-[var(--color-text-secondary)]" aria-hidden="true" />
+        <span className="font-medium text-[var(--color-text-primary)]">
           {t('chat.fallback.title')}
         </span>
-        <span className="text-[10px] text-[var(--color-text-tertiary)]">
+        <span className="text-[12.5px] text-[var(--color-text-tertiary)]">
           {t('chat.fallback.detail')}
         </span>
         {elapsedSeconds > 0 && (
-          <span className="text-[10px] text-[var(--color-text-tertiary)]">
-            {formatElapsed(elapsedSeconds)}
+          <span className="text-[12.5px] text-[var(--color-text-tertiary)]">
+            {formatDurationSeconds(elapsedSeconds, t)}
           </span>
         )}
       </div>
     )
   }
 
-  let verb: string
-  if (statusVerb) {
-    verb = translateServerVerb(t, statusVerb)
-  } else {
-    verb = chatState === 'thinking'
-      ? t('serverVerb.Thinking')
-      : chatState === 'compacting'
-        ? t('serverVerb.Compacting conversation')
-      : chatState === 'tool_executing'
-        ? t('serverVerb.Running')
-        : t('serverVerb.Working')
-  }
+  const verb = resolveTurnStatusVerb(t, chatState, statusVerb)
 
   return (
-    <div className="mb-2 flex w-fit items-center gap-2 rounded-full border border-[var(--color-border)]/40 bg-[var(--color-surface-container-low)] px-3 py-1">
-      <span className="text-[var(--color-brand)] animate-shimmer text-xs">✦</span>
-      <span className="text-xs font-medium text-[var(--color-text-secondary)]">{verb}...</span>
+    <div
+      data-testid="turn-status-indicator"
+      role="status"
+      aria-live="polite"
+      // Bare line, not a pill: it now sits at the end of the live turn rail, and
+      // the rail already says "still going". A bordered chip here would read as
+      // a second, competing status object next to the one that is lit.
+      className="flex w-fit items-center gap-[9px] py-1 text-[13.5px] text-[var(--color-text-secondary)]"
+    >
+      <span className="animate-pulse-dot text-[var(--color-brand)]" aria-hidden="true">✦</span>
+      <span className="font-medium text-[var(--color-text-primary)]">{verb}...</span>
       {elapsedSeconds > 0 && (
-        <span className="text-[10px] text-[var(--color-text-tertiary)]">
-          {formatElapsed(elapsedSeconds)}
-        </span>
+        <span>{formatDurationSeconds(elapsedSeconds, t)}</span>
       )}
       {streamingTokens > 0 && (
-        <span className="text-[10px] text-[var(--color-text-tertiary)]">
-          · ↓ {t('common.tokens', { count: formatTokenCount(streamingTokens) })}
-        </span>
+        <>
+          <span aria-hidden="true">·</span>
+          <span className="font-mono text-[12.5px]">
+            ↓ {t('common.tokens', { count: formatTokenCount(streamingTokens) })}
+          </span>
+        </>
       )}
     </div>
   )

@@ -1,7 +1,9 @@
 import { Check, Copy, GitFork } from 'lucide-react'
+import type { ReactNode } from 'react'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { formatExactMessageTimestamp, formatMessageHoverTime } from '../../lib/formatMessageTimestamp'
-import { CopyButton } from '../shared/CopyButton'
+import { CopyButton } from '@/components/ui/CopyButton'
+import { IconButton } from '@/components/ui/IconButton'
 
 export type MessageBranchAction = {
   label: string
@@ -9,12 +11,32 @@ export type MessageBranchAction = {
   onBranch: () => void
 }
 
+/**
+ * The copy chip and the branch chip sit side by side and must look identical.
+ * The branch one is an `IconButton size="sm" tone="muted" shape="circle"`;
+ * `CopyButton` is styled by className, so its shell is mirrored here.
+ */
+const ACTION_CHIP_CLASS = [
+  'inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full',
+  'text-[var(--color-text-tertiary)] transition-colors duration-150 cursor-pointer',
+  'hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]',
+  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)]',
+].join(' ')
+
 type Props = {
   copyText?: string
   copyLabel: string
   branchAction?: MessageBranchAction
   align?: 'start' | 'end'
   timestamp?: number
+  /** Inline metadata that shares the same compact row as the actions. */
+  metadata?: ReactNode
+  /**
+   * Skip the hover gate. For bars that are already rare and deliberate — the
+   * reply that closes a turn — where hiding them until hover only makes a
+   * present affordance hard to find.
+   */
+  alwaysVisible?: boolean
 }
 
 export function MessageActionBar({
@@ -23,6 +45,8 @@ export function MessageActionBar({
   branchAction,
   align = 'start',
   timestamp,
+  metadata,
+  alwaysVisible = false,
 }: Props) {
   const locale = useSettingsStore((state) => state.locale)
   const hasCopy = Boolean(copyText?.trim())
@@ -33,17 +57,19 @@ export function MessageActionBar({
     ? formatExactMessageTimestamp(timestamp, locale)
     : ''
 
-  if (!hasCopy && !branchAction) return null
+  if (!hasCopy && !branchAction && !metadata) return null
 
   return (
     <div
       data-message-actions
       data-align={align}
-      className={`pointer-events-none mt-2 flex h-7 w-full opacity-0 transition-opacity duration-150 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 ${
-        align === 'end' ? 'justify-end' : 'justify-start'
-      }`}
+      className={`mt-2 flex h-7 w-full transition-opacity duration-150 ${
+        alwaysVisible
+          ? ''
+          : 'pointer-events-none opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100'
+      } ${align === 'end' ? 'justify-end' : 'justify-start'}`}
     >
-      <div className="flex min-h-7 items-center gap-1.5">
+      <div className="flex min-h-7 min-w-0 items-center gap-1.5">
         {hasCopy ? (
           <CopyButton
             text={copyText!}
@@ -51,21 +77,25 @@ export function MessageActionBar({
             displayLabel={<Copy size={13} strokeWidth={2.2} aria-hidden="true" />}
             displayCopiedLabel={<Check size={13} strokeWidth={2.4} aria-hidden="true" />}
             onPointerUp={(event) => event.currentTarget.blur()}
-            className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-transparent bg-transparent text-[var(--color-text-tertiary)] transition-colors hover:border-[var(--color-brand)]/30 hover:bg-[var(--color-surface-container-low)] hover:text-[var(--color-text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-brand)]/35"
+            className={ACTION_CHIP_CLASS}
           />
         ) : null}
         {branchAction ? (
-          <button
-            type="button"
-            onClick={branchAction.onBranch}
+          <IconButton
+            icon={<GitFork size={13} strokeWidth={2.2} aria-hidden="true" />}
+            label={branchAction.label}
+            size="sm"
+            tone="muted"
+            shape="circle"
             disabled={branchAction.loading}
-            aria-label={branchAction.label}
-            title={branchAction.label}
+            onClick={branchAction.onBranch}
             onPointerUp={(event) => event.currentTarget.blur()}
-            className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-transparent bg-transparent text-[var(--color-text-tertiary)] transition-colors hover:border-[var(--color-brand)]/30 hover:bg-[var(--color-surface-container-low)] hover:text-[var(--color-text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-brand)]/35 disabled:cursor-wait disabled:opacity-60"
-          >
-            <GitFork size={13} strokeWidth={2.2} aria-hidden="true" />
-          </button>
+          />
+        ) : null}
+        {metadata ? (
+          <span className={hasCopy || branchAction ? 'ml-3 min-w-0' : 'min-w-0'}>
+            {metadata}
+          </span>
         ) : null}
         {hoverTimeLabel ? (
           <span

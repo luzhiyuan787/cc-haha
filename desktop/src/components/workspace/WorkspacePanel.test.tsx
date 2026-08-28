@@ -31,11 +31,13 @@ if (typeof document === 'undefined') {
 type WorkspaceApiMocks = {
   getWorkspaceStatusMock: ReturnType<typeof vi.fn>
   getWorkspaceTreeMock: ReturnType<typeof vi.fn>
+  searchWorkspaceMock: ReturnType<typeof vi.fn>
   getWorkspaceFileMock: ReturnType<typeof vi.fn>
   getWorkspaceDiffMock: ReturnType<typeof vi.fn>
 }
 
 var mocks: WorkspaceApiMocks | undefined
+const workspacePreviewLineLimitForTests = vi.hoisted(() => 20)
 
 function getMocks() {
   if (!mocks) {
@@ -81,10 +83,13 @@ async function flushReactWork() {
   })
 }
 
-async function renderPanel(sessionId: string) {
+async function renderPanel(
+  sessionId: string,
+  props: { embedded?: boolean; forceVisible?: boolean } = {},
+) {
   let view!: ReturnType<typeof render>
   await act(async () => {
-    view = render(<WorkspacePanel sessionId={sessionId} />)
+    view = render(<WorkspacePanel sessionId={sessionId} {...props} />)
     await Promise.resolve()
   })
   return view
@@ -255,6 +260,7 @@ vi.mock('../../api/sessions', () => ({
       mocks = {
         getWorkspaceStatusMock: vi.fn(),
         getWorkspaceTreeMock: vi.fn(),
+        searchWorkspaceMock: vi.fn(),
         getWorkspaceFileMock: vi.fn(),
         getWorkspaceDiffMock: vi.fn(),
       }
@@ -263,6 +269,7 @@ vi.mock('../../api/sessions', () => ({
     return {
       getWorkspaceStatus: mocks.getWorkspaceStatusMock,
       getWorkspaceTree: mocks.getWorkspaceTreeMock,
+      searchWorkspace: mocks.searchWorkspaceMock,
       getWorkspaceFile: mocks.getWorkspaceFileMock,
       getWorkspaceDiff: mocks.getWorkspaceDiffMock,
     }
@@ -278,11 +285,17 @@ vi.mock('../../api/openTargets', () => ({
 
 vi.mock('@tauri-apps/plugin-shell', () => ({ open: vi.fn().mockResolvedValue(undefined) }))
 
+vi.mock('./WorkspaceCodeSurface', async (importOriginal) => ({
+  ...await importOriginal<typeof import('./WorkspaceCodeSurface')>(),
+  WORKSPACE_PREVIEW_LINE_LIMIT: workspacePreviewLineLimitForTests,
+}))
+
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useChatStore } from '../../stores/chatStore'
 import { useWorkspaceChatContextStore } from '../../stores/workspaceChatContextStore'
 import { useWorkspacePanelStore } from '../../stores/workspacePanelStore'
 import { useUIStore } from '../../stores/uiStore'
+import { getServerBaseUrl } from '../../lib/desktopRuntime'
 import { WorkspacePanel } from './WorkspacePanel'
 
 describe('WorkspacePanel', () => {
@@ -390,9 +403,12 @@ describe('WorkspacePanel', () => {
       await statusRequest.promise
     })
 
-    expect(view.getByPlaceholderText('Filter files...')).toBeTruthy()
+    expect(view.getByPlaceholderText('Filter changed files...')).toBeTruthy()
 
-    await clickElement(await view.findByText('src/app.ts'))
+    await waitFor(() => {
+      expect(view.container.querySelector('[data-workspace-file-path="src/app.ts"]')).toBeTruthy()
+    })
+    await clickElement(view.container.querySelector('[data-workspace-file-path="src/app.ts"]')!)
 
     await waitFor(() => {
       expect(getMocks().getWorkspaceDiffMock).toHaveBeenCalledWith('session-changed', 'src/app.ts')
@@ -410,11 +426,249 @@ describe('WorkspacePanel', () => {
     await waitFor(() => {
       expect(view.getByTestId('workspace-code').textContent).toContain('console.log("new")')
     })
+    expect(view.queryByRole('tablist', { name: 'Preview tabs' })).toBeNull()
+    const previewHeader = view.getByTestId('workspace-preview-header')
+    expect(previewHeader.textContent).toContain('src/app.ts')
+    expect(previewHeader.textContent).toContain('+4')
+    expect(previewHeader.textContent).toContain('-1')
+    expect(view.queryByTestId('workspace-review-toolbar')).toBeNull()
+    expect(view.getByTestId('workspace-review-layout').className).toContain('grid-cols-1')
+    expect(view.getByTestId('workspace-review-layout').className).toContain('overflow-hidden')
+    expect(view.getByTestId('workspace-preview-column').className).toContain('min-h-0')
+    expect(view.getByTestId('workspace-preview-column').className).toContain('overflow-hidden')
+    expect(previewHeader.textContent).not.toContain('DIFF')
+    expect(view.queryByTestId('workspace-file-navigator')).toBeNull()
+    await clickElement(view.getByRole('button', { name: 'Show file navigator' }))
+    expect(view.getByTestId('workspace-file-navigator').className).toContain('absolute')
+    expect(view.getByTestId('workspace-file-navigator-header')).toBeTruthy()
+    expect(view.queryByText('1 file')).toBeNull()
+    expect(view.getByTestId('workspace-file-navigator').className).toContain('w-[min(280px,100%)]')
+    expect(view.getByTestId('workspace-review-layout').className).toContain('grid-cols-1')
     const expandedPanel = view.getByTestId('workspace-panel')
     expect(expandedPanel.style.width).toBe('860px')
     expect(expandedPanel.style.maxWidth).toBe('min(62%, calc(100% - 328px))')
     expect(expandedPanel.style.minWidth).toBe('min(420px, 54%)')
-    expect(view.getAllByText('Diff').length).toBeGreaterThan(0)
+  })
+
+  it.each([
+    ['diff:src/app.ts', 'modified', 'Modified'],
+    ['file:src/app.ts', 'added', 'Added'],
+  ] as const)('marks the changed row active for %s and localizes its %s status', async (activeTabId, status, statusLabel) => {
+    const sessionId = `session-active-${status}`
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        [sessionId]: { isOpen: true, activeView: 'changed', hasUserSelectedView: true },
+      },
+      statusBySession: {
+        ...state.statusBySession,
+        [sessionId]: {
+          state: 'ok',
+          workDir: '/repo',
+          repoName: 'repo',
+          branch: 'main',
+          isGitRepo: true,
+          changedFiles: [{ path: 'src/app.ts', status, additions: 2, deletions: 1 }],
+        },
+      },
+      previewTabsBySession: {
+        ...state.previewTabsBySession,
+        [sessionId]: [{
+          id: activeTabId,
+          path: 'src/app.ts',
+          kind: activeTabId.startsWith('diff:') ? 'diff' : 'file',
+          title: 'app.ts',
+          state: 'ok',
+          ...(activeTabId.startsWith('diff:')
+            ? { diff: '@@ -1 +1 @@\n-old\n+new' }
+            : { content: 'const app = true', language: 'typescript', size: 16 }),
+        }],
+      },
+      activePreviewTabIdBySession: {
+        ...state.activePreviewTabIdBySession,
+        [sessionId]: activeTabId,
+      },
+    }))
+
+    const view = await renderPanel(sessionId)
+    await clickElement(view.getByRole('button', { name: 'Show file navigator' }))
+
+    const row = view.container.querySelector('[data-workspace-file-path="src/app.ts"]')
+    if (!row) throw new Error('Changed file row was not rendered')
+    expect(row.getAttribute('aria-current')).toBe('true')
+    expect(row.className).toContain('bg-[var(--color-info-container)]')
+    expect(view.getByLabelText(statusLabel).textContent).toBe(status === 'modified' ? 'M' : 'A')
+  })
+
+  it('keeps navigator controls and filter feedback in one header when no file is open', async () => {
+    const sessionId = 'session-review-toolbar'
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        [sessionId]: { isOpen: true, activeView: 'changed', hasUserSelectedView: true },
+      },
+      statusBySession: {
+        ...state.statusBySession,
+        [sessionId]: {
+          state: 'ok',
+          workDir: '/repo',
+          repoName: 'claude-code-haha',
+          branch: 'main',
+          isGitRepo: true,
+          changedFiles: [
+            { path: 'desktop/src/App.tsx', status: 'modified', additions: 7, deletions: 2 },
+            { path: 'desktop/src/theme.css', status: 'modified', additions: 3, deletions: 1 },
+            { path: 'docs/review.md', status: 'added', additions: 5, deletions: 0 },
+          ],
+        },
+      },
+    }))
+
+    const view = await renderPanel(sessionId)
+
+    expect(view.queryByTestId('workspace-review-toolbar')).toBeNull()
+    const navigatorHeader = view.getByTestId('workspace-file-navigator-header')
+    expect(navigatorHeader.tagName).toBe('HEADER')
+    expect(navigatorHeader.textContent).toContain('Changed files')
+    expect(view.getByRole('button', { name: /Refresh/ })).toBeTruthy()
+    expect(view.queryByText('claude-code-haha')).toBeNull()
+    expect(view.queryByText('main')).toBeNull()
+
+    const filter = view.getByPlaceholderText('Filter changed files...')
+    expect(view.queryByText('3 files')).toBeNull()
+    fireEvent.change(filter, { target: { value: 'theme' } })
+
+    expect(view.getByText('1 of 3 files')).toBeTruthy()
+    expect(view.container.querySelector('[data-workspace-file-path="desktop/src/theme.css"]')).toBeTruthy()
+    expect(view.container.querySelector('[data-workspace-file-path="desktop/src/App.tsx"]')).toBeNull()
+    expect(view.container.querySelector('[data-workspace-file-path="docs/review.md"]')).toBeNull()
+  })
+
+  it('keeps the full workbench tab in a stable diff and 280px navigator split', async () => {
+    const sessionId = 'session-full-review-workbench'
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        [sessionId]: { isOpen: true, activeView: 'changed', hasUserSelectedView: true },
+      },
+      statusBySession: {
+        ...state.statusBySession,
+        [sessionId]: {
+          state: 'ok',
+          workDir: '/repo',
+          repoName: 'repo',
+          branch: 'main',
+          isGitRepo: true,
+          changedFiles: [{ path: 'src/app.ts', status: 'modified', additions: 1, deletions: 1 }],
+        },
+      },
+      previewTabsBySession: {
+        ...state.previewTabsBySession,
+        [sessionId]: [{
+          id: 'diff:src/app.ts',
+          path: 'src/app.ts',
+          kind: 'diff',
+          title: 'app.ts',
+          diff: '@@ -1 +1 @@\n-old\n+new',
+          state: 'ok',
+        }],
+      },
+      activePreviewTabIdBySession: {
+        ...state.activePreviewTabIdBySession,
+        [sessionId]: 'diff:src/app.ts',
+      },
+    }))
+
+    const view = await renderPanel(sessionId, { embedded: true, forceVisible: true })
+
+    expect(view.getByTestId('workspace-review-layout').className).toContain('grid-cols-[minmax(0,1fr)_280px]')
+    expect(view.getByTestId('workspace-review-layout').className).toContain('overflow-hidden')
+    expect(view.getByTestId('workspace-preview-column').className).toContain('min-h-0')
+    expect(view.getByTestId('workspace-preview-column').className).toContain('overflow-hidden')
+    expect(view.getByTestId('workspace-file-navigator').className).not.toContain('absolute')
+    expect(view.getByRole('button', { name: 'Hide file navigator' })).toBeTruthy()
+  })
+
+  it('groups changed files by directory without weakening file filtering', async () => {
+    const sessionId = 'session-grouped-changes'
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        [sessionId]: { isOpen: true, activeView: 'changed', hasUserSelectedView: true },
+      },
+      statusBySession: {
+        ...state.statusBySession,
+        [sessionId]: {
+          state: 'ok',
+          workDir: '/repo',
+          repoName: 'repo',
+          branch: 'main',
+          isGitRepo: true,
+          changedFiles: [
+            { path: 'desktop/src/App.tsx', status: 'modified', additions: 7, deletions: 2 },
+            { path: 'desktop/src/theme.css', status: 'modified', additions: 3, deletions: 1 },
+            { path: 'docs/review.md', status: 'added', additions: 5, deletions: 0 },
+          ],
+        },
+      },
+    }))
+
+    const view = await renderPanel(sessionId)
+
+    expect(view.getByText('desktop/src')).toBeTruthy()
+    expect(view.getByText('docs')).toBeTruthy()
+    expect(view.getByText('App.tsx')).toBeTruthy()
+    expect(view.getByText('theme.css')).toBeTruthy()
+
+    fireEvent.change(view.getByPlaceholderText('Filter changed files...'), { target: { value: 'theme' } })
+
+    expect(view.getByText('desktop/src')).toBeTruthy()
+    expect(view.queryByText('docs')).toBeNull()
+    expect(view.getByText('theme.css')).toBeTruthy()
+    expect(view.queryByText('App.tsx')).toBeNull()
+  })
+
+  it('gives renamed files enough height to show the old path without overlapping the next row', async () => {
+    const sessionId = 'session-renamed-file-height'
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        [sessionId]: { isOpen: true, activeView: 'changed', hasUserSelectedView: true },
+      },
+      statusBySession: {
+        ...state.statusBySession,
+        [sessionId]: {
+          state: 'ok',
+          workDir: '/repo',
+          repoName: 'repo',
+          branch: 'main',
+          isGitRepo: true,
+          changedFiles: [
+            {
+              path: 'desktop/src/components/workspace/NewWorkspacePanel.tsx',
+              oldPath: 'desktop/src/components/workspace/LegacyWorkspacePanelWithALongName.tsx',
+              status: 'renamed',
+              additions: 2,
+              deletions: 2,
+            },
+            { path: 'desktop/src/components/workspace/next.ts', status: 'modified', additions: 1, deletions: 0 },
+          ],
+        },
+      },
+    }))
+
+    const view = await renderPanel(sessionId)
+    const oldPath = view.getByText('desktop/src/components/workspace/LegacyWorkspacePanelWithALongName.tsx')
+    const renamedRow = oldPath.closest('button')
+
+    expect(renamedRow?.className).toContain('min-h-11')
+    expect(renamedRow?.className).not.toContain('h-9')
+    expect(view.getByText('next.ts')).toBeTruthy()
   })
 
   it('refreshes status on open and switches back to changed files when new changes exist', async () => {
@@ -469,7 +723,7 @@ describe('WorkspacePanel', () => {
     await waitFor(() => {
       expect(view.getByRole('button', { name: 'Changed files' })).toBeTruthy()
     })
-    expect(view.getByText('src/Fresh.ts')).toBeTruthy()
+    expect(view.container.querySelector('[data-workspace-file-path="src/Fresh.ts"]')).toBeTruthy()
   })
 
   it('loads workspace status when opened while the chat is running', async () => {
@@ -507,7 +761,7 @@ describe('WorkspacePanel', () => {
       expect(getMocks().getWorkspaceStatusMock).toHaveBeenCalledWith('session-running-open')
     })
     await waitFor(() => {
-      expect(view.getByText('src/running.ts')).toBeTruthy()
+      expect(view.container.querySelector('[data-workspace-file-path="src/running.ts"]')).toBeTruthy()
     })
     expect(view.queryByText('Loading...')).toBeNull()
   })
@@ -541,11 +795,11 @@ describe('WorkspacePanel', () => {
     const view = await renderPanel('session-non-git')
 
     await waitFor(() => {
-      expect(view.getByText('src/app.ts')).toBeTruthy()
+      expect(view.container.querySelector('[data-workspace-file-path="src/app.ts"]')).toBeTruthy()
     })
     expect(view.queryByText('No matching files')).toBeNull()
 
-    await clickElement(view.getByText('src/app.ts'))
+    await clickElement(view.container.querySelector('[data-workspace-file-path="src/app.ts"]')!)
 
     await waitFor(() => {
       expect(getMocks().getWorkspaceDiffMock).toHaveBeenCalledWith('session-non-git', 'src/app.ts')
@@ -612,7 +866,227 @@ describe('WorkspacePanel', () => {
     expect(view.getByRole('button', { name: 'All files' })).toBeTruthy()
     expect(await view.findByText('src')).toBeTruthy()
     expect(await view.findByText('README.md')).toBeTruthy()
+    expect(view.queryByRole('status')).toBeNull()
     expect(view.queryByText('No changes')).toBeNull()
+
+    getMocks().searchWorkspaceMock.mockResolvedValueOnce({
+      state: 'ok',
+      query: 'readme',
+      truncated: false,
+      entries: [{ name: 'README.md', path: 'README.md', isDirectory: false }],
+    })
+    fireEvent.change(view.getByPlaceholderText('Search all files...'), { target: { value: 'readme' } })
+
+    expect(await view.findByText('1 search results')).toBeTruthy()
+    expect(view.getByText('README.md')).toBeTruthy()
+    expect(view.queryByText('src')).toBeNull()
+  })
+
+  it('searches unopened directories in a deep Java project without expanding the tree first', async () => {
+    const sessionId = 'session-deep-java-search'
+    const targetPath = 'services/mental-health-service/src/main/java/com/example/campus/mentalhealth/controller/MentalHealthTrendController.java'
+
+    getMocks().searchWorkspaceMock.mockResolvedValue({
+      state: 'ok',
+      query: 'MentalHealthTrendController',
+      truncated: false,
+      entries: [{
+        name: 'MentalHealthTrendController.java',
+        path: targetPath,
+        isDirectory: false,
+      }],
+    })
+    getMocks().getWorkspaceFileMock.mockResolvedValue({
+      state: 'ok',
+      path: targetPath,
+      content: 'package com.example.campus;\n\npublic final class MentalHealthTrendController {}\n',
+      language: 'java',
+      size: 82,
+    })
+
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        [sessionId]: { isOpen: true, activeView: 'all', hasUserSelectedView: true },
+      },
+      statusBySession: {
+        ...state.statusBySession,
+        [sessionId]: {
+          state: 'ok',
+          workDir: '/repo/campus-agent-platform',
+          repoName: 'campus-agent-platform',
+          branch: 'main',
+          isGitRepo: true,
+          changedFiles: [],
+        },
+      },
+      treeBySessionPath: {
+        ...state.treeBySessionPath,
+        [sessionId]: {
+          '': {
+            state: 'ok',
+            path: '',
+            entries: [
+              { name: 'identity-domain', path: 'identity-domain', isDirectory: true },
+              { name: 'identity-application', path: 'identity-application', isDirectory: true },
+              { name: 'identity-adapter', path: 'identity-adapter', isDirectory: true },
+              { name: 'services', path: 'services', isDirectory: true },
+              { name: 'build.gradle', path: 'build.gradle', isDirectory: false },
+            ],
+          },
+        },
+      },
+    }))
+
+    const view = await renderPanel(sessionId)
+    fireEvent.change(view.getByPlaceholderText('Search all files...'), {
+      target: { value: 'MentalHealthTrendController' },
+    })
+
+    expect(await view.findByText('MentalHealthTrendController.java')).toBeTruthy()
+    expect(view.getByText('services/mental-health-service/src/main/java/com/example/campus/mentalhealth/controller')).toBeTruthy()
+    expect(view.queryByRole('button', { name: 'services' })).toBeNull()
+    expect(getMocks().searchWorkspaceMock).toHaveBeenCalledWith(sessionId, 'MentalHealthTrendController')
+    expect(getMocks().getWorkspaceTreeMock).not.toHaveBeenCalledWith(sessionId, 'services')
+
+    await clickElement(view.getByRole('button', {
+      name: 'MentalHealthTrendController.java, services/mental-health-service/src/main/java/com/example/campus/mentalhealth/controller',
+    }))
+    expect((await view.findByTestId('workspace-preview-header')).textContent).toContain(targetPath)
+    await waitFor(() => {
+      expect(document.activeElement).toBe(view.getByTestId('workspace-preview-header'))
+    })
+
+    await clickElement(view.getByRole('button', { name: 'Show file navigator' }))
+    const searchInput = view.getByPlaceholderText('Search all files...') as HTMLInputElement
+    expect(searchInput.value).toBe('MentalHealthTrendController')
+    expect(view.getByText('MentalHealthTrendController.java')).toBeTruthy()
+    await waitFor(() => {
+      expect(document.activeElement).toBe(searchInput)
+    })
+
+    const staleSearch = deferred<{
+      state: 'ok'
+      query: string
+      truncated: boolean
+      entries: Array<{ name: string; path: string; isDirectory: boolean }>
+    }>()
+    getMocks().searchWorkspaceMock.mockReset()
+    getMocks().searchWorkspaceMock
+      .mockReturnValueOnce(staleSearch.promise)
+      .mockResolvedValueOnce({
+        state: 'ok',
+        query: 'JdbcOrganizationHierarchyRepository',
+        truncated: false,
+        entries: [{
+          name: 'JdbcOrganizationHierarchyRepository.java',
+          path: 'identity-adapter/src/main/java/com/example/campus/identity/adapter/persistence/mysql/JdbcOrganizationHierarchyRepository.java',
+          isDirectory: false,
+        }, {
+          name: 'JdbcOrganizationHierarchyRepositoryTest.java',
+          path: 'identity-adapter/src/test/java/com/example/campus/identity/adapter/persistence/mysql/JdbcOrganizationHierarchyRepositoryTest.java',
+          isDirectory: false,
+        }],
+      })
+
+    fireEvent.change(view.getByPlaceholderText('Search all files...'), {
+      target: { value: 'DeepOrganizationHierarchySearchService' },
+    })
+    await waitFor(() => {
+      expect(getMocks().searchWorkspaceMock).toHaveBeenCalledWith(sessionId, 'DeepOrganizationHierarchySearchService')
+    })
+    fireEvent.change(view.getByPlaceholderText('Search all files...'), {
+      target: { value: 'JdbcOrganizationHierarchyRepository' },
+    })
+
+    expect(await view.findByText('JdbcOrganizationHierarchyRepository.java')).toBeTruthy()
+    staleSearch.resolve({
+      state: 'ok',
+      query: 'DeepOrganizationHierarchySearchService',
+      truncated: false,
+      entries: [{
+        name: 'DeepOrganizationHierarchySearchService.java',
+        path: 'identity-application/src/main/java/com/example/campus/identity/application/query/DeepOrganizationHierarchySearchService.java',
+        isDirectory: false,
+      }],
+    })
+    await flushReactWork()
+    expect(view.queryByText('DeepOrganizationHierarchySearchService.java')).toBeNull()
+    expect(view.getByText('JdbcOrganizationHierarchyRepository.java')).toBeTruthy()
+
+    const currentSearchInput = view.getByPlaceholderText('Search all files...')
+    fireEvent.keyDown(currentSearchInput, { key: 'ArrowDown' })
+    const currentResult = view.getByRole('button', {
+      name: /JdbcOrganizationHierarchyRepository\.java, identity-adapter\/src\/main/,
+    })
+    expect(document.activeElement).toBe(currentResult)
+    const nextResult = view.getByRole('button', {
+      name: /JdbcOrganizationHierarchyRepositoryTest\.java/,
+    })
+    fireEvent.keyDown(currentResult, { key: 'ArrowDown' })
+    expect(document.activeElement).toBe(nextResult)
+    fireEvent.keyDown(nextResult, { key: 'ArrowUp' })
+    expect(document.activeElement).toBe(currentResult)
+    fireEvent.keyDown(currentResult, { key: 'End' })
+    expect(document.activeElement).toBe(nextResult)
+    fireEvent.keyDown(nextResult, { key: 'Home' })
+    expect(document.activeElement).toBe(currentResult)
+    fireEvent.keyDown(currentResult, { key: 'Escape' })
+    await waitFor(() => {
+      expect(document.activeElement).toBe(currentSearchInput)
+    })
+    expect(view.getByText('services')).toBeTruthy()
+    expect(view.queryByText('JdbcOrganizationHierarchyRepository.java')).toBeNull()
+  })
+
+  it('shows workspace search errors and empty results without falling back to the loaded root tree', async () => {
+    const sessionId = 'session-workspace-search-states'
+    getMocks().searchWorkspaceMock
+      .mockRejectedValueOnce(new Error('Workspace search failed'))
+      .mockResolvedValueOnce({ state: 'ok', query: 'missing-class', truncated: false, entries: [] })
+
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        [sessionId]: { isOpen: true, activeView: 'all', hasUserSelectedView: true },
+      },
+      statusBySession: {
+        ...state.statusBySession,
+        [sessionId]: {
+          state: 'ok',
+          workDir: '/repo/campus-agent-platform',
+          repoName: 'campus-agent-platform',
+          branch: 'main',
+          isGitRepo: true,
+          changedFiles: [],
+        },
+      },
+      treeBySessionPath: {
+        ...state.treeBySessionPath,
+        [sessionId]: {
+          '': {
+            state: 'ok',
+            path: '',
+            entries: [{ name: 'services', path: 'services', isDirectory: true }],
+          },
+        },
+      },
+    }))
+
+    const view = await renderPanel(sessionId)
+    fireEvent.change(view.getByPlaceholderText('Search all files...'), {
+      target: { value: 'broken-search' },
+    })
+    expect(await view.findByText('Workspace search failed')).toBeTruthy()
+    expect(view.queryByText('services')).toBeNull()
+
+    fireEvent.change(view.getByPlaceholderText('Search all files...'), {
+      target: { value: 'missing-class' },
+    })
+    expect(await view.findByText('No matching files')).toBeTruthy()
+    expect(view.queryByText('services')).toBeNull()
   })
 
   it('lazy loads the root tree, expands directories, and opens file previews from the all-files view', async () => {
@@ -726,7 +1200,6 @@ describe('WorkspacePanel', () => {
     await waitFor(() => {
       expect(view.getByTestId('workspace-code').textContent).toContain('export const ready = true')
     })
-    expect(view.getAllByText('File').length).toBeGreaterThan(0)
   })
 
   it('renders multiple preview tabs and closes only the exact requested tab', async () => {
@@ -804,6 +1277,58 @@ describe('WorkspacePanel', () => {
     expect(view.getAllByText('b.ts').length).toBeGreaterThanOrEqual(1)
   })
 
+  it('keeps a close control available for the last preview tab', async () => {
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        'session-last-preview-tab': {
+          isOpen: true,
+          activeView: 'changed',
+          hasUserSelectedView: true,
+        },
+      },
+      statusBySession: {
+        ...state.statusBySession,
+        'session-last-preview-tab': {
+          state: 'ok',
+          workDir: '/repo',
+          repoName: 'repo',
+          branch: 'main',
+          isGitRepo: true,
+          changedFiles: [{
+            path: 'src/app.ts',
+            status: 'modified',
+            additions: 1,
+            deletions: 1,
+          }],
+        },
+      },
+      previewTabsBySession: {
+        ...state.previewTabsBySession,
+        'session-last-preview-tab': [{
+          id: 'diff:src/app.ts',
+          path: 'src/app.ts',
+          kind: 'diff',
+          title: 'app.ts',
+          diff: '@@ -1 +1 @@\n-old\n+new',
+          state: 'ok',
+        }],
+      },
+      activePreviewTabIdBySession: {
+        ...state.activePreviewTabIdBySession,
+        'session-last-preview-tab': 'diff:src/app.ts',
+      },
+    }))
+
+    const view = await renderPanel('session-last-preview-tab')
+
+    expect(view.getByTestId('workspace-code').textContent).toContain('+new')
+    await clickElement(view.getByLabelText('Close tab app.ts Diff'))
+
+    expect(view.queryByTestId('workspace-preview-column')).toBeNull()
+  })
+
   it('keeps the file navigator hidden while previewing until explicitly opened', async () => {
     await setWorkspaceState((state) => ({
       ...state,
@@ -854,17 +1379,17 @@ describe('WorkspacePanel', () => {
 
     expect(view.getByTestId('workspace-code').textContent).toContain('+new')
     expect(view.queryByRole('button', { name: 'Changed files' })).toBeNull()
-    expect(view.queryByPlaceholderText('Filter files...')).toBeNull()
+    expect(view.queryByPlaceholderText('Filter changed files...')).toBeNull()
 
     await clickElement(view.getByRole('button', { name: 'Show file navigator' }))
 
     expect(view.getByRole('button', { name: 'Changed files' })).toBeTruthy()
-    expect(view.getByPlaceholderText('Filter files...')).toBeTruthy()
-    expect(view.getByText('src/app.ts')).toBeTruthy()
+    expect(view.getByPlaceholderText('Filter changed files...')).toBeTruthy()
+    expect(view.container.querySelector('[data-workspace-file-path="src/app.ts"]')).toBeTruthy()
     expect(view.getByRole('button', { name: 'Hide file navigator' })).toBeTruthy()
   })
 
-  it('defers all-files tree loading while the file navigator is hidden behind a preview', async () => {
+  it('preserves the all-files navigator when a preview is already open', async () => {
     getMocks().getWorkspaceTreeMock.mockResolvedValue({
       state: 'ok',
       path: '',
@@ -889,7 +1414,12 @@ describe('WorkspacePanel', () => {
           repoName: 'repo',
           branch: 'main',
           isGitRepo: true,
-          changedFiles: [],
+          changedFiles: [{
+            path: 'src/app.ts',
+            status: 'modified',
+            additions: 2,
+            deletions: 1,
+          }],
         },
       },
       previewTabsBySession: {
@@ -917,15 +1447,18 @@ describe('WorkspacePanel', () => {
     expect(getMocks().getWorkspaceTreeMock).not.toHaveBeenCalled()
 
     await clickElement(view.getByRole('button', { name: 'Show file navigator' }))
-
     await waitFor(() => {
       expect(getMocks().getWorkspaceTreeMock).toHaveBeenCalledWith('session-preview-hidden-tree', '')
     })
-    expect(view.getAllByText('src').length).toBeGreaterThanOrEqual(2)
+
+    expect(view.getByRole('button', { name: 'All files' })).toBeTruthy()
+    expect(view.getByPlaceholderText('Search all files...')).toBeTruthy()
+    expect(view.getByText('src')).toBeTruthy()
+    expect(view.container.querySelector('[data-workspace-file-path="src/app.ts"]')).toBeNull()
   })
 
-  it('uses theme tokens for the panel, preview tabs, and code surface in dark mode', async () => {
-    await setSettingsState({ ...settingsInitialState, locale: 'en', theme: 'dark' })
+  it('uses theme tokens for the panel, preview header, and code surface in dark mode', async () => {
+    await setSettingsState({ ...settingsInitialState, locale: 'en' })
     await setWorkspaceState((state) => ({
       ...state,
       panelBySession: {
@@ -968,15 +1501,87 @@ describe('WorkspacePanel', () => {
 
     const view = await renderPanel('session-dark-theme')
     const panel = view.getByTestId('workspace-panel')
-    const tabList = view.getByRole('tablist', { name: 'Preview tabs' })
+    const previewHeader = view.getByTestId('workspace-preview-header')
     const codeSurface = view.getByTestId('workspace-code')
 
     expect(panel.className).toContain('bg-[var(--color-surface)]')
     expect(panel.className).not.toContain('bg-white')
-    expect(tabList.className).toContain('bg-[var(--color-surface-container-lowest)]')
-    expect(tabList.className).not.toContain('bg-white')
+    expect(view.queryByRole('tablist', { name: 'Preview tabs' })).toBeNull()
+    expect(previewHeader.className).toContain('bg-[var(--color-surface)]')
+    expect(previewHeader.className).not.toContain('bg-white')
+    const addToChatLabel = Array.from(previewHeader.querySelectorAll('span'))
+      .find((element) => element.textContent === 'Add to chat')
+    expect(addToChatLabel?.className).toContain('hidden min-[960px]:inline')
     expect(classNameContains(codeSurface, 'bg-[var(--color-code-bg)]')).toBe(true)
     expect(classNameContains(codeSurface, 'bg-white')).toBe(false)
+  })
+
+  it('syntax highlights Java source previews instead of rendering them as plain text', async () => {
+    const sessionId = 'session-java-preview'
+    const javaSource = [
+      'package com.example.campus;',
+      '',
+      'import java.util.List;',
+      '',
+      'public final class MentalHealthTrendController {',
+      '  private final List<String> campusIds;',
+      '',
+      '  public int countVisibleOrganizations() {',
+      '    return campusIds.size();',
+      '  }',
+      '}',
+    ].join('\n')
+
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        [sessionId]: {
+          isOpen: true,
+          activeView: 'all',
+          hasUserSelectedView: true,
+        },
+      },
+      statusBySession: {
+        ...state.statusBySession,
+        [sessionId]: {
+          state: 'ok',
+          workDir: '/repo',
+          repoName: 'repo',
+          branch: 'main',
+          isGitRepo: true,
+          changedFiles: [],
+        },
+      },
+      previewTabsBySession: {
+        ...state.previewTabsBySession,
+        [sessionId]: [{
+          id: 'file:src/MentalHealthTrendController.java',
+          path: 'src/MentalHealthTrendController.java',
+          kind: 'file',
+          title: 'MentalHealthTrendController.java',
+          language: 'java',
+          content: javaSource,
+          state: 'ok',
+          size: javaSource.length,
+        }],
+      },
+      activePreviewTabIdBySession: {
+        ...state.activePreviewTabIdBySession,
+        [sessionId]: 'file:src/MentalHealthTrendController.java',
+      },
+    }))
+
+    const view = await renderPanel(sessionId)
+    await waitFor(() => {
+      expect(view.getByTestId('workspace-code').getAttribute('data-highlight-engine')).toBe('shiki')
+    })
+    const tokens = Array.from(view.getByTestId('workspace-code').querySelectorAll<HTMLElement>('[data-workspace-token]'))
+    const tokenColor = (text: string) => tokens.find((token) => token.textContent === text)?.style.color
+
+    expect(tokenColor('package')).toBe('var(--color-code-keyword)')
+    expect(tokenColor('MentalHealthTrendController')).toBe('var(--color-code-type)')
+    expect(tokenColor('countVisibleOrganizations')).toBe('var(--color-code-function)')
   })
 
   it('can expand long diff previews beyond the default rendered line cap', async () => {
@@ -1024,11 +1629,13 @@ describe('WorkspacePanel', () => {
     const highlightedCode = view.getByTestId('workspace-code').textContent ?? ''
 
     expect(highlightedCode).toContain('+line 1')
+    expect(highlightedCode).toContain('+line 1999')
     expect(highlightedCode).toContain('+line 2000')
     expect(highlightedCode).not.toContain('+line 2001')
     await clickElement(view.getByRole('button', { name: 'Show all loaded lines' }))
 
     await waitFor(() => {
+      expect(view.getByTestId('workspace-code').textContent).toContain('+line 2001')
       expect(view.getByTestId('workspace-code').textContent).toContain('+line 2300')
     })
     expect(view.getByRole('button', { name: 'Collapse preview' })).toBeTruthy()
@@ -1077,16 +1684,22 @@ describe('WorkspacePanel', () => {
 
     const view = await renderPanel('session-wide-diff')
     const diffSurface = view.getByTestId('workspace-code')
-    const firstRow = diffSurface.querySelector('div')
+    const firstRow = diffSurface.querySelector('[data-diff-row-id]')
 
     expect(firstRow?.className).toContain('w-max')
     expect(firstRow?.className).toContain('min-w-full')
-    expect(firstRow?.className).toContain('grid-cols-[48px_18px_max-content]')
+    expect((firstRow as HTMLElement | null)?.style.gridTemplateColumns).toBe(
+      'var(--workspace-diff-gutter-width) minmax(max-content, 1fr)',
+    )
+    expect(firstRow?.querySelector('[data-diff-number-gutter]')).toBeTruthy()
     expect(diffSurface.textContent).toContain(longDiffLine)
   })
 
   it('can expand long file previews beyond the default rendered line cap', async () => {
-    const longFile = Array.from({ length: 2300 }, (_, index) => `const line${index + 1} = ${index + 1}`).join('\n')
+    const longFile = Array.from(
+      { length: workspacePreviewLineLimitForTests + 3 },
+      (_, index) => `const line${index + 1} = ${index + 1}`,
+    ).join('\n')
 
     await setWorkspaceState((state) => ({
       ...state,
@@ -1120,15 +1733,103 @@ describe('WorkspacePanel', () => {
     const highlightedCode = view.getByTestId('workspace-code').textContent ?? ''
 
     expect(highlightedCode).toContain('const line1 = 1')
-    expect(highlightedCode).toContain('const line2000 = 2000')
-    expect(highlightedCode).not.toContain('const line2001 = 2001')
+    expect(highlightedCode).toContain('const line20 = 20')
+    expect(highlightedCode).not.toContain('const line21 = 21')
     await clickElement(view.getByRole('button', { name: 'Show all loaded lines' }))
 
     await waitFor(() => {
-      expect(view.getByTestId('workspace-code').textContent).toContain('const line2300 = 2300')
+      expect(view.getByTestId('workspace-code').textContent).toContain('const line23 = 23')
     })
     expect(view.getByRole('button', { name: 'Collapse preview' })).toBeTruthy()
-  }, 20_000)
+  })
+
+  it('marks the revealed line when a reference carries one', async () => {
+    // #1146: clicking `src/app.ts:3` in the chat has to land on line 3, not just
+    // open the file.
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        'session-reveal-line': { isOpen: true, activeView: 'all' },
+      },
+      previewTabsBySession: {
+        ...state.previewTabsBySession,
+        'session-reveal-line': [{
+          id: 'file:src/app.ts',
+          path: 'src/app.ts',
+          kind: 'file',
+          title: 'app.ts',
+          content: 'const a = 1\nconst b = 2\nconst c = 3\nconst d = 4',
+          language: 'typescript',
+          previewType: 'text',
+          state: 'ok',
+          reveal: { line: 3, nonce: 1 },
+        }],
+      },
+      activePreviewTabIdBySession: {
+        ...state.activePreviewTabIdBySession,
+        'session-reveal-line': 'file:src/app.ts',
+      },
+    }))
+
+    const view = await renderPanel('session-reveal-line')
+    const code = view.getByTestId('workspace-code')
+
+    const revealed = code.querySelector('[data-workspace-line-number="3"]')
+    expect(revealed?.className).toContain('bg-[var(--color-brand-soft)]')
+    // The inset rule is the load-bearing part of the mark: every soft fill in the
+    // palette sits under 1.11 contrast against the code background. See
+    // theme/contrast.test.ts.
+    expect(revealed?.className).toContain('shadow-[inset_2px_0_0_var(--color-brand)]')
+    // Neighbours keep the plain hover treatment.
+    expect(code.querySelector('[data-workspace-line-number="2"]')?.className)
+      .toContain('hover:bg-[var(--color-surface-hover)]')
+  })
+
+  it('expands a truncated preview when the revealed line is past the fold', async () => {
+    // Without this the reference silently does nothing: the row it points at is
+    // not rendered at all while the preview is capped.
+    const longFile = Array.from(
+      { length: workspacePreviewLineLimitForTests + 10 },
+      (_, index) => `const line${index + 1} = ${index + 1}`,
+    ).join('\n')
+    const revealLine = workspacePreviewLineLimitForTests + 5
+
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        'session-reveal-past-fold': { isOpen: true, activeView: 'all' },
+      },
+      previewTabsBySession: {
+        ...state.previewTabsBySession,
+        'session-reveal-past-fold': [{
+          id: 'file:long.ts',
+          path: 'long.ts',
+          kind: 'file',
+          title: 'long.ts',
+          content: longFile,
+          language: 'typescript',
+          previewType: 'text',
+          state: 'ok',
+          reveal: { line: revealLine, nonce: 1 },
+        }],
+      },
+      activePreviewTabIdBySession: {
+        ...state.activePreviewTabIdBySession,
+        'session-reveal-past-fold': 'file:long.ts',
+      },
+    }))
+
+    const view = await renderPanel('session-reveal-past-fold')
+
+    await waitFor(() => {
+      expect(view.getByTestId('workspace-code').textContent).toContain(`const line${revealLine} = ${revealLine}`)
+    })
+    expect(view.getByTestId('workspace-code')
+      .querySelector(`[data-workspace-line-number="${revealLine}"]`)?.className)
+      .toContain('bg-[var(--color-brand-soft)]')
+  })
 
   it('renders image previews from workspace files', async () => {
     await setWorkspaceState((state) => ({
@@ -1216,6 +1917,71 @@ describe('WorkspacePanel', () => {
     expect(view.getByText('Done')).toBeTruthy()
     expect(view.container.textContent).toContain('export const ok = true')
     expect(view.queryByTestId('workspace-code')).toBeNull()
+  })
+
+  it('resolves relative and remote markdown preview images to loadable URLs', async () => {
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        'session-markdown-images': {
+          isOpen: true,
+          activeView: 'all',
+        },
+      },
+      statusBySession: {
+        ...state.statusBySession,
+        'session-markdown-images': {
+          state: 'ok',
+          workDir: '/repo',
+          repoName: 'repo',
+          branch: 'main',
+          isGitRepo: true,
+          changedFiles: [],
+        },
+      },
+      previewTabsBySession: {
+        ...state.previewTabsBySession,
+        'session-markdown-images': [{
+          id: 'file:docs/guide.md',
+          path: 'docs/guide.md',
+          kind: 'file',
+          title: 'guide.md',
+          language: 'markdown',
+          content: [
+            '# Guide',
+            '',
+            '![logo](assets/logo.png)',
+            '![banner](../shared/banner.png)',
+            '![badge](https://img.shields.io/badge/stars-1k.svg)',
+            '![absolute](/repo/docs/raw.png)',
+            '![inline](data:image/png;base64,AAAA)',
+          ].join('\n'),
+          state: 'ok',
+          size: 160,
+        }],
+      },
+      activePreviewTabIdBySession: {
+        ...state.activePreviewTabIdBySession,
+        'session-markdown-images': 'file:docs/guide.md',
+      },
+    }))
+
+    const view = await renderPanel('session-markdown-images')
+
+    const base = getServerBaseUrl()
+    const images = await waitFor(() => {
+      const found = Array.from(view.container.querySelectorAll('img'))
+      expect(found).toHaveLength(5)
+      return found
+    })
+    expect(images.map((image) => image.getAttribute('src'))).toEqual([
+      `${base}/preview-fs/session-markdown-images/docs/assets/logo.png`,
+      `${base}/preview-fs/session-markdown-images/shared/banner.png`,
+      'https://img.shields.io/badge/stars-1k.svg',
+      `${base}/local-file/repo/docs/raw.png`,
+      'data:image/png;base64,AAAA',
+    ])
   })
 
   it('renders Mermaid diagrams in markdown file previews when labels contain HTML breaks and braces', async () => {
@@ -1696,6 +2462,168 @@ describe('WorkspacePanel', () => {
     ])
   })
 
+  it('adds a Shift-selected line range comment from a code preview to the chat context', async () => {
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        'session-line-range-comment': {
+          isOpen: true,
+          activeView: 'all',
+        },
+      },
+      statusBySession: {
+        ...state.statusBySession,
+        'session-line-range-comment': {
+          state: 'ok',
+          workDir: '/repo',
+          repoName: 'repo',
+          branch: 'main',
+          isGitRepo: true,
+          changedFiles: [],
+        },
+      },
+      previewTabsBySession: {
+        ...state.previewTabsBySession,
+        'session-line-range-comment': [{
+          id: 'file:src/App.tsx',
+          path: 'src/App.tsx',
+          kind: 'file',
+          title: 'App.tsx',
+          language: 'tsx',
+          content: 'const title = "Todo"\nconst count = 1\nexport default title',
+          state: 'ok',
+          size: 64,
+        }],
+      },
+      activePreviewTabIdBySession: {
+        ...state.activePreviewTabIdBySession,
+        'session-line-range-comment': 'file:src/App.tsx',
+      },
+    }))
+
+    const view = await renderPanel('session-line-range-comment')
+    const firstLine = view.getByRole('button', { name: 'Comment line 1' })
+    const secondLine = view.getByRole('button', { name: 'Comment line 2' })
+    const thirdLine = view.getByRole('button', { name: 'Comment line 3' })
+
+    await clickElement(firstLine)
+    await act(async () => {
+      fireEvent.click(thirdLine, { shiftKey: true })
+      await Promise.resolve()
+    })
+
+    expect(firstLine.getAttribute('aria-pressed')).toBe('true')
+    expect(secondLine.getAttribute('aria-pressed')).toBe('true')
+    expect(thirdLine.getAttribute('aria-pressed')).toBe('true')
+    expect(view.getByText('Lines 1–3')).toBeTruthy()
+
+    const textarea = view.getByPlaceholderText('Describe what should change here...')
+    await act(() => {
+      fireEvent.change(textarea, { target: { value: 'Extract this setup' } })
+    })
+    await clickElement(view.getByRole('button', { name: 'Add comment' }))
+
+    expect(useWorkspaceChatContextStore.getState().referencesBySession['session-line-range-comment']).toMatchObject([
+      {
+        kind: 'code-comment',
+        path: 'src/App.tsx',
+        absolutePath: '/repo/src/App.tsx',
+        name: 'App.tsx',
+        lineStart: 1,
+        lineEnd: 3,
+        note: 'Extract this setup',
+        quote: 'const title = "Todo"\nconst count = 1\nexport default title',
+      },
+    ])
+  })
+
+  it('adds a side-aware diff comment, keeps the diff open, and focuses the composer', async () => {
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        'session-diff-comment': {
+          isOpen: true,
+          activeView: 'changed',
+        },
+      },
+      statusBySession: {
+        ...state.statusBySession,
+        'session-diff-comment': {
+          state: 'ok',
+          workDir: '/repo',
+          repoName: 'repo',
+          branch: 'main',
+          isGitRepo: true,
+          changedFiles: [],
+        },
+      },
+      previewTabsBySession: {
+        ...state.previewTabsBySession,
+        'session-diff-comment': [{
+          id: 'diff:src/a.ts',
+          path: 'src/a.ts',
+          kind: 'diff',
+          title: 'a.ts',
+          diff: '@@ -10,2 +11,2 @@\n-const result = makeResult()\n-return result\n+const result = buildResult()\n+return result',
+          state: 'ok',
+        }],
+      },
+      activePreviewTabIdBySession: {
+        ...state.activePreviewTabIdBySession,
+        'session-diff-comment': 'diff:src/a.ts',
+      },
+    }))
+
+    const otherComposerShell = document.createElement('div')
+    otherComposerShell.dataset.testid = 'chat-input-shell'
+    otherComposerShell.dataset.sessionId = 'another-session'
+    const otherComposer = document.createElement('div')
+    otherComposer.setAttribute('data-composer-editor', 'true')
+    otherComposer.tabIndex = -1
+    otherComposerShell.append(otherComposer)
+    document.body.append(otherComposerShell)
+
+    const composerShell = document.createElement('div')
+    composerShell.dataset.testid = 'chat-input-shell'
+    composerShell.dataset.sessionId = 'session-diff-comment'
+    const composer = document.createElement('div')
+    composer.setAttribute('data-composer-editor', 'true')
+    composer.tabIndex = -1
+    composerShell.append(composer)
+    document.body.append(composerShell)
+
+    const view = await renderPanel('session-diff-comment')
+
+    await clickElement(view.getByRole('button', { name: 'Comment on src/a.ts new line 11' }))
+    const editor = view.getByRole('textbox', { name: 'Review comment' })
+    await act(() => {
+      fireEvent.change(editor, { target: { value: 'Use a shared helper' } })
+    })
+    await clickElement(view.getByRole('button', { name: 'Submit review comment' }))
+
+    await waitFor(() => expect(document.activeElement).toBe(composer))
+    expect(useWorkspaceChatContextStore.getState().referencesBySession['session-diff-comment']).toMatchObject([
+      {
+        kind: 'code-comment',
+        path: 'src/a.ts',
+        absolutePath: '/repo/src/a.ts',
+        name: 'a.ts',
+        lineStart: 11,
+        lineEnd: 11,
+        diffSide: 'new',
+        hunkId: expect.any(String),
+        note: 'Use a shared helper',
+        quote: 'const result = buildResult()',
+      },
+    ])
+    expect(useWorkspacePanelStore.getState().activePreviewTabIdBySession['session-diff-comment']).toBe('diff:src/a.ts')
+    expect(view.getByTestId('workspace-code')).toBeTruthy()
+    composerShell.remove()
+    otherComposerShell.remove()
+  })
+
   it('adds selected code from a preview to the chat context without requiring a note', async () => {
     await setWorkspaceState((state) => ({
       ...state,
@@ -1991,10 +2919,10 @@ describe('WorkspacePanel', () => {
     expect(viewMenuButton.className).toContain('text-[14px]')
     expect(viewMenuButton.className).not.toContain('text-[18px]')
     expect(viewMenuButton.querySelector('.material-symbols-outlined')?.className).toContain('text-[15px]')
-    expect(refreshButton.className).toContain('h-7 w-7')
-    expect(closeButton.className).toContain('h-7 w-7')
-    expect(refreshButton.querySelector('.material-symbols-outlined')?.className).toContain('text-[16px]')
-    expect(closeButton.querySelector('.material-symbols-outlined')?.className).toContain('text-[16px]')
+    expect(refreshButton.className).toContain('h-8 w-8')
+    expect(closeButton.className).toContain('h-8 w-8')
+    expect(refreshButton.querySelector('.lucide-refresh-cw')).toBeTruthy()
+    expect(closeButton.querySelector('.lucide-x')).toBeTruthy()
   })
 
   it('shows explicit empty and error states in the changed view', async () => {
@@ -2067,5 +2995,138 @@ describe('WorkspacePanel', () => {
     await waitFor(() => {
       expect(view.getByText('status failed')).toBeTruthy()
     })
+  })
+
+  it('keeps a loaded diff visible and marks the preview busy while it refreshes', async () => {
+    const refresh = deferred<{ state: 'ok'; path: string; diff: string }>()
+    getMocks().getWorkspaceDiffMock.mockReturnValue(refresh.promise)
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        'session-preview-refresh': { isOpen: true, activeView: 'changed' },
+      },
+      previewTabsBySession: {
+        ...state.previewTabsBySession,
+        'session-preview-refresh': [{
+          id: 'diff:src/a.ts',
+          path: 'src/a.ts',
+          kind: 'diff',
+          title: 'a.ts',
+          state: 'ok',
+          diff: '@@ -1 +1 @@\n-old\n+cached',
+        }],
+      },
+      activePreviewTabIdBySession: {
+        ...state.activePreviewTabIdBySession,
+        'session-preview-refresh': 'diff:src/a.ts',
+      },
+    }))
+
+    const view = await renderPanel('session-preview-refresh')
+    expect(view.getByText('cached')).toBeTruthy()
+
+    await clickElement(view.getByRole('button', { name: 'Refresh workspace' }))
+
+    expect(view.getByText('cached')).toBeTruthy()
+    expect(view.getByTestId('workspace-preview-content').getAttribute('aria-busy')).toBe('true')
+
+    refresh.resolve({
+      state: 'ok',
+      path: 'src/a.ts',
+      diff: '@@ -1 +1 @@\n-old\n+latest',
+    })
+    await flushReactWork()
+
+    expect(view.getByText('latest')).toBeTruthy()
+    expect(view.queryByText('cached')).toBeNull()
+    expect(view.getByTestId('workspace-preview-content').getAttribute('aria-busy')).toBe('false')
+  })
+
+  it('localizes an initial missing preview without describing it as a refresh failure', async () => {
+    await setSettingsState({ ...settingsInitialState, locale: 'zh' })
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        'session-initial-missing-zh': { isOpen: true, activeView: 'changed' },
+      },
+      previewTabsBySession: {
+        ...state.previewTabsBySession,
+        'session-initial-missing-zh': [{
+          id: 'diff:src/missing.ts',
+          path: 'src/missing.ts',
+          kind: 'diff',
+          title: 'missing.ts',
+          state: 'missing',
+        }],
+      },
+      activePreviewTabIdBySession: {
+        ...state.activePreviewTabIdBySession,
+        'session-initial-missing-zh': 'diff:src/missing.ts',
+      },
+    }))
+
+    const view = await renderPanel('session-initial-missing-zh')
+
+    expect(view.getByText('文件不存在。')).toBeTruthy()
+    expect(view.queryByText(/refresh/i)).toBeNull()
+    expect(view.queryByRole('button', { name: '重试' })).toBeNull()
+  })
+
+  it('localizes stale diff state and completes retry after a non-ok refresh omits an error', async () => {
+    const refresh = deferred<{ state: 'missing'; path: string }>()
+    const retry = deferred<{ state: 'ok'; path: string; diff: string }>()
+    getMocks().getWorkspaceDiffMock
+      .mockReturnValueOnce(refresh.promise)
+      .mockReturnValueOnce(retry.promise)
+    await setSettingsState({ ...settingsInitialState, locale: 'zh' })
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        'session-preview-refresh-error': { isOpen: true, activeView: 'changed' },
+      },
+      previewTabsBySession: {
+        ...state.previewTabsBySession,
+        'session-preview-refresh-error': [{
+          id: 'diff:src/a.ts',
+          path: 'src/a.ts',
+          kind: 'diff',
+          title: 'a.ts',
+          state: 'ok',
+          diff: '@@ -1 +1 @@\n-old\n+cached',
+        }],
+      },
+      activePreviewTabIdBySession: {
+        ...state.activePreviewTabIdBySession,
+        'session-preview-refresh-error': 'diff:src/a.ts',
+      },
+    }))
+
+    const view = await renderPanel('session-preview-refresh-error')
+    await clickElement(view.getByRole('button', { name: '刷新工作区' }))
+    refresh.resolve({ state: 'missing', path: 'src/a.ts' })
+    await flushReactWork()
+
+    expect(view.getByText('cached')).toBeTruthy()
+    expect(view.getByRole('alert').textContent).toContain('文件不存在。')
+    expect(view.getByRole('alert').textContent).not.toMatch(/refresh/i)
+    await clickElement(view.getByRole('button', { name: '重试' }))
+
+    expect(view.queryByRole('alert')).toBeNull()
+    expect(view.getByText('cached')).toBeTruthy()
+    expect(view.getByTestId('workspace-preview-content').getAttribute('aria-busy')).toBe('true')
+
+    retry.resolve({
+      state: 'ok',
+      path: 'src/a.ts',
+      diff: '@@ -1 +1 @@\n-old\n+recovered',
+    })
+    await flushReactWork()
+
+    expect(view.getByText('recovered')).toBeTruthy()
+    expect(view.queryByText('cached')).toBeNull()
+    expect(view.getByTestId('workspace-preview-content').getAttribute('aria-busy')).toBe('false')
   })
 })

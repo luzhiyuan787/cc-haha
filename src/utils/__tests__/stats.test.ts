@@ -194,6 +194,63 @@ describe('activity stats token accounting', () => {
     expect(totalForDate(stats.dailyModelTokens, today)).toBe(34)
   })
 
+  it('does not count usage copied from a parent session into a fork', async () => {
+    const today = dateKey(0)
+    const sourceUser = userEntry('source-user', at(today, '10:00:00'))
+    const sourceAssistant = assistantEntry(
+      'source-assistant',
+      at(today, '10:01:00'),
+      { input_tokens: 10, output_tokens: 2 },
+      { parentUuid: 'source-user' },
+    )
+
+    await writeJsonl(projectFile('source-session'), [
+      sourceUser,
+      sourceAssistant,
+    ])
+    await writeJsonl(projectFile('fork-session'), [
+      {
+        ...sourceUser,
+        sessionId: 'fork-session',
+        forkedFrom: {
+          sessionId: 'source-session',
+          messageUuid: 'source-user',
+        },
+      },
+      {
+        ...sourceAssistant,
+        sessionId: 'fork-session',
+        forkedFrom: {
+          sessionId: 'source-session',
+          messageUuid: 'source-assistant',
+        },
+      },
+      {
+        ...userEntry('fork-user', at(today, '10:02:00')),
+        parentUuid: 'source-assistant',
+        sessionId: 'fork-session',
+      },
+      {
+        ...assistantEntry(
+          'fork-assistant',
+          at(today, '10:03:00'),
+          { input_tokens: 5, output_tokens: 1 },
+          { parentUuid: 'fork-user' },
+        ),
+        sessionId: 'fork-session',
+      },
+    ])
+
+    const stats = await aggregateClaudeCodeStatsForRange('all')
+
+    expect(stats.totalSessions).toBe(2)
+    expect(totalForDate(stats.dailyModelTokens, today)).toBe(18)
+    expect(stats.modelUsage['claude-test']).toMatchObject({
+      inputTokens: 15,
+      outputTokens: 3,
+    })
+  })
+
   it('tracks tool and skill usage from main and subagent transcripts', async () => {
     const today = dateKey(0)
 
@@ -291,12 +348,100 @@ describe('activity stats token accounting', () => {
     expect(totalForDate(stats.dailyModelTokens, future)).toBe(0)
   })
 
-  it('invalidates pre-v6 stats caches because cached aggregates lack tool usage', async () => {
+  it('uses fixed inclusive 7d and 30d UTC boundaries', async () => {
+    const now = new Date('2026-07-15T12:00:00.000Z')
+    for (const [sessionId, date, tokens] of [
+      ['inside-7d', '2026-07-09', 7],
+      ['outside-7d', '2026-07-08', 8],
+      ['inside-30d', '2026-06-16', 30],
+      ['outside-30d', '2026-06-15', 31],
+    ] as const) {
+      await writeJsonl(projectFile(sessionId), [
+        userEntry(`${sessionId}-user`, at(date, '10:00:00')),
+        assistantEntry(
+          `${sessionId}-assistant`,
+          at(date, '10:01:00'),
+          { input_tokens: tokens },
+          { parentUuid: `${sessionId}-user` },
+        ),
+      ])
+    }
+
+    const sevenDays = await aggregateClaudeCodeStatsForRange('7d', { now })
+    expect(sevenDays.dailyActivity.map(day => day.date)).toEqual(['2026-07-09'])
+    expect(totalForDate(sevenDays.dailyModelTokens, '2026-07-09')).toBe(7)
+
+    const thirtyDays = await aggregateClaudeCodeStatsForRange('30d', { now })
+    expect(thirtyDays.dailyActivity.map(day => day.date)).toEqual([
+      '2026-06-16',
+      '2026-07-08',
+      '2026-07-09',
+    ])
+    expect(totalForDate(thirtyDays.dailyModelTokens, '2026-06-16')).toBe(30)
+    expect(totalForDate(thirtyDays.dailyModelTokens, '2026-06-15')).toBe(0)
+  })
+
+  it('counts calendar days instead of rounding timestamps within one UTC day', async () => {
+    const now = new Date('2026-07-15T23:59:30.000Z')
+    await writeJsonl(projectFile('early-session'), [
+      userEntry('early-user', '2026-07-15T00:01:00.000Z'),
+      assistantEntry(
+        'early-assistant',
+        '2026-07-15T00:02:00.000Z',
+        { input_tokens: 1 },
+        { parentUuid: 'early-user' },
+      ),
+    ])
+    await writeJsonl(projectFile('late-session'), [
+      userEntry('late-user', '2026-07-15T23:58:00.000Z'),
+      assistantEntry(
+        'late-assistant',
+        '2026-07-15T23:59:00.000Z',
+        { input_tokens: 1 },
+        { parentUuid: 'late-user' },
+      ),
+    ])
+
+    const stats = await aggregateClaudeCodeStatsForRange('7d', { now })
+
+    expect(stats.totalSessions).toBe(2)
+    expect(stats.totalDays).toBe(1)
+  })
+
+  it('anchors the current streak to the UTC activity date in positive-offset timezones', async () => {
+    const originalTimezone = process.env.TZ
+    process.env.TZ = 'Asia/Shanghai'
+    try {
+      const now = new Date('2026-07-15T01:00:00.000Z')
+      await writeJsonl(projectFile('utc-today-session'), [
+        userEntry('today-user', '2026-07-15T00:20:00.000Z'),
+        assistantEntry(
+          'today-assistant',
+          '2026-07-15T00:21:00.000Z',
+          { input_tokens: 1 },
+          { parentUuid: 'today-user' },
+        ),
+      ])
+
+      const stats = await aggregateClaudeCodeStatsForRange('7d', { now })
+
+      expect(stats.streaks.currentStreak).toBe(1)
+      expect(stats.streaks.currentStreakStart).toBe('2026-07-15')
+    } finally {
+      if (originalTimezone === undefined) {
+        delete process.env.TZ
+      } else {
+        process.env.TZ = originalTimezone
+      }
+    }
+  })
+
+  it('invalidates pre-v7 stats caches because token aggregates may include inherited fork usage', async () => {
     await mkdir(tmpConfigDir, { recursive: true })
     await writeFile(
       join(tmpConfigDir, 'stats-cache.json'),
       JSON.stringify({
-        version: 5,
+        version: 6,
         lastComputedDate: dateKey(-1),
         dailyActivity: [{ date: dateKey(-1), messageCount: 1, sessionCount: 1, toolCallCount: 0 }],
         dailyModelTokens: [{ date: dateKey(-1), tokensByModel: { stale: 1 } }],
@@ -315,7 +460,7 @@ describe('activity stats token accounting', () => {
 
     const cache = await loadStatsCache()
 
-    expect(STATS_CACHE_VERSION).toBe(6)
+    expect(STATS_CACHE_VERSION).toBe(7)
     expect(cache.dailyModelTokens).toEqual([])
     expect(cache.toolUsage).toEqual({})
     expect(cache.skillUsage).toEqual({})

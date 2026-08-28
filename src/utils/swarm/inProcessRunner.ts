@@ -44,7 +44,10 @@ import {
   getProgressUpdate,
   updateProgressFromMessage,
 } from '../../tasks/LocalAgentTask/LocalAgentTask.js'
-import type { CustomAgentDefinition } from '../../tools/AgentTool/loadAgentsDir.js'
+import type {
+  CustomAgentDefinition,
+  PluginAgentDefinition,
+} from '../../tools/AgentTool/loadAgentsDir.js'
 import { runAgent } from '../../tools/AgentTool/runAgent.js'
 import { awaitClassifierAutoApproval } from '../../tools/BashTool/bashPermissions.js'
 import { BASH_TOOL_NAME } from '../../tools/BashTool/toolName.js'
@@ -84,9 +87,17 @@ import { emitTaskTerminatedSdk } from '../sdkEventQueue.js'
 import { sleep } from '../sleep.js'
 import { jsonStringify } from '../slowOperations.js'
 import { asSystemPrompt } from '../systemPromptType.js'
-import { claimTask, listTasks, type Task, updateTask } from '../tasks.js'
+import {
+  claimTask,
+  getCanonicalTeamTaskListId,
+  listTasks,
+  type Task,
+} from '../tasks.js'
 import type { TeammateContext } from '../teammateContext.js'
-import { runWithTeammateContext } from '../teammateContext.js'
+import {
+  createTeamStreamScopeId,
+  runWithTeammateContext,
+} from '../teammateContext.js'
 import {
   createIdleNotification,
   getLastPeerDmSummary,
@@ -107,6 +118,7 @@ import {
   createPermissionRequest,
   sendPermissionRequestViaMailbox,
 } from './permissionSync.js'
+import { readTeamFile, setMemberActive } from './teamHelpers.js'
 import { TEAMMATE_SYSTEM_PROMPT_ADDENDUM } from './teammatePromptAddendum.js'
 
 type SetAppStateFn = (updater: (prev: AppState) => AppState) => void
@@ -476,7 +488,7 @@ export type InProcessRunnerConfig = {
   /** Initial prompt for the teammate */
   prompt: string
   /** Optional agent definition (for specialized agents) */
-  agentDefinition?: CustomAgentDefinition
+  agentDefinition?: CustomAgentDefinition | PluginAgentDefinition
   /** Teammate context for AsyncLocalStorage */
   teammateContext: TeammateContext
   /** Parent's tool use context */
@@ -511,6 +523,67 @@ export type InProcessRunnerResult = {
   error?: string
   /** Messages produced by the agent */
   messages: Message[]
+}
+
+export function buildInProcessTeammateAgentDefinition(
+  agentName: string,
+  systemPrompt: string,
+  agentDefinition?: CustomAgentDefinition | PluginAgentDefinition,
+): CustomAgentDefinition {
+  return {
+    agentType: agentName,
+    whenToUse: `In-process teammate: ${agentName}`,
+    rawSystemPrompt: systemPrompt,
+    getSystemPrompt: () => systemPrompt,
+    // Inject team-essential tools so teammates can always respond to shutdown
+    // requests, send messages, and coordinate via the task list.
+    tools: agentDefinition?.tools
+      ? [
+          ...new Set([
+            ...agentDefinition.tools,
+            SEND_MESSAGE_TOOL_NAME,
+            TEAM_CREATE_TOOL_NAME,
+            TEAM_DELETE_TOOL_NAME,
+            TASK_CREATE_TOOL_NAME,
+            TASK_GET_TOOL_NAME,
+            TASK_LIST_TOOL_NAME,
+            TASK_UPDATE_TOOL_NAME,
+          ]),
+        ]
+      : ['*'],
+    source: 'projectSettings',
+    permissionMode: 'default',
+    ...(agentDefinition?.model ? { model: agentDefinition.model } : {}),
+    ...(agentDefinition?.effort !== undefined
+      ? { effort: agentDefinition.effort }
+      : {}),
+  }
+}
+
+async function setInProcessTeammateActivity(
+  identity: Pick<TeammateIdentity, 'agentName' | 'teamName'>,
+  isActive: boolean,
+): Promise<void> {
+  try {
+    await setMemberActive(identity.teamName, identity.agentName, isActive)
+  } catch (error) {
+    logForDebugging(
+      `[inProcessRunner] Failed to sync ${identity.agentName} activity: ${error}`,
+    )
+  }
+}
+
+/** Keep the persisted roster active only while an in-process turn is running. */
+export async function withInProcessTeammateActivity<T>(
+  identity: Pick<TeammateIdentity, 'agentName' | 'teamName'>,
+  runTurn: () => Promise<T>,
+): Promise<T> {
+  await setInProcessTeammateActivity(identity, true)
+  try {
+    return await runTurn()
+  } finally {
+    await setInProcessTeammateActivity(identity, false)
+  }
 }
 
 /**
@@ -592,12 +665,12 @@ async function sendIdleNotification(
  * Find an available task from the team's task list.
  * A task is available if it's pending, has no owner, and is not blocked.
  */
-function findAvailableTask(tasks: Task[]): Task | undefined {
+function findAvailableTasks(tasks: Task[]): Task[] {
   const unresolvedTaskIds = new Set(
     tasks.filter(t => t.status !== 'completed').map(t => t.id),
   )
 
-  return tasks.find(task => {
+  return tasks.filter(task => {
     if (task.status !== 'pending') return false
     if (task.owner) return false
     return task.blockedBy.every(id => !unresolvedTaskIds.has(id))
@@ -618,38 +691,45 @@ function formatTaskAsPrompt(task: Task): string {
 }
 
 /**
- * Try to claim an available task from the team's task list.
- * Returns the formatted prompt if a task was claimed, or undefined if none available.
+ * Try to claim follow-up work from the team's task list.
+ *
+ * A newly spawned teammate must first receive an explicit owner assignment from
+ * the lead. Otherwise concurrent spawns race through the same unowned list and
+ * can attach another member's task to the teammate's first prompt. Once the
+ * member has appeared as an owner, completed ownership is the durable signal
+ * that it may autonomously continue with the next available task.
  */
-async function tryClaimNextTask(
-  taskListId: string,
-  agentName: string,
+export async function claimNextInProcessTask(
+  identity: Pick<TeammateIdentity, 'agentName' | 'teamName'>,
 ): Promise<string | undefined> {
+  const { agentName } = identity
+  const taskListId = getCanonicalTeamTaskListId(identity.teamName)
+
   try {
     const tasks = await listTasks(taskListId)
-    const availableTask = findAvailableTask(tasks)
+    if (!tasks.some(task => task.owner === agentName)) return undefined
 
-    if (!availableTask) {
-      return undefined
-    }
-
-    const result = await claimTask(taskListId, availableTask.id, agentName)
-
-    if (!result.success) {
-      logForDebugging(
-        `[inProcessRunner] Failed to claim task #${availableTask.id}: ${result.reason}`,
+    for (const availableTask of findAvailableTasks(tasks)) {
+      const result = await claimTask(
+        taskListId,
+        availableTask.id,
+        agentName,
+        { checkAgentBusy: true, markInProgress: true },
       )
-      return undefined
+      if (!result.success) {
+        logForDebugging(
+          `[inProcessRunner] Failed to claim task #${availableTask.id}: ${result.reason}`,
+        )
+        continue
+      }
+
+      logForDebugging(
+        `[inProcessRunner] Claimed task #${availableTask.id}: ${availableTask.subject}`,
+      )
+
+      return formatTaskAsPrompt(availableTask)
     }
-
-    // Also set status to in_progress so the UI reflects it immediately
-    await updateTask(taskListId, availableTask.id, { status: 'in_progress' })
-
-    logForDebugging(
-      `[inProcessRunner] Claimed task #${availableTask.id}: ${availableTask.subject}`,
-    )
-
-    return formatTaskAsPrompt(availableTask)
+    return undefined
   } catch (err) {
     logForDebugging(`[inProcessRunner] Error checking task list: ${err}`)
     return undefined
@@ -692,7 +772,6 @@ async function waitForNextPromptOrShutdown(
   taskId: string,
   getAppState: () => AppState,
   setAppState: SetAppStateFn,
-  taskListId: string,
 ): Promise<WaitResult> {
   const POLL_INTERVAL_MS = 500
 
@@ -851,7 +930,7 @@ async function waitForNextPromptOrShutdown(
     }
 
     // Check the team's task list for unclaimed tasks
-    const taskPrompt = await tryClaimNextTask(taskListId, identity.agentName)
+    const taskPrompt = await claimNextInProcessTask(identity)
     if (taskPrompt) {
       return {
         type: 'new_message',
@@ -900,6 +979,13 @@ export async function runInProcessTeammate(
     invokingRequestId,
   } = config
   const { setAppState } = toolUseContext
+  const teamFile = readTeamFile(identity.teamName)
+  const scopedTeammateContext: TeammateContext = {
+    ...teammateContext,
+    ...(teamFile
+      ? { streamScopeId: createTeamStreamScopeId(teamFile) }
+      : {}),
+  }
 
   logForDebugging(
     `[inProcessRunner] Starting agent loop for ${identity.agentId}`,
@@ -972,33 +1058,13 @@ export async function runInProcessTeammate(
   // Resolve agent definition - use full system prompt with teammate addendum
   // IMPORTANT: Set permissionMode to 'default' so teammates always get full tool
   // access regardless of the leader's permission mode.
-  const resolvedAgentDefinition: CustomAgentDefinition = {
-    agentType: identity.agentName,
-    whenToUse: `In-process teammate: ${identity.agentName}`,
-    getSystemPrompt: () => teammateSystemPrompt,
-    // Inject team-essential tools so teammates can always respond to
-    // shutdown requests, send messages, and coordinate via the task list,
-    // even with explicit tool lists
-    tools: agentDefinition?.tools
-      ? [
-          ...new Set([
-            ...agentDefinition.tools,
-            SEND_MESSAGE_TOOL_NAME,
-            TEAM_CREATE_TOOL_NAME,
-            TEAM_DELETE_TOOL_NAME,
-            TASK_CREATE_TOOL_NAME,
-            TASK_GET_TOOL_NAME,
-            TASK_LIST_TOOL_NAME,
-            TASK_UPDATE_TOOL_NAME,
-          ]),
-        ]
-      : ['*'],
-    source: 'projectSettings',
-    permissionMode: 'default',
-    // Propagate model from custom agent definition so getAgentModel()
-    // can use it as a fallback when no tool-level model is specified
-    ...(agentDefinition?.model ? { model: agentDefinition.model } : {}),
-  }
+  // runAgent applies definition effort over the parent AppState while the
+  // existing ToolUseContext keeps the teammate on the session thinking mode.
+  const resolvedAgentDefinition = buildInProcessTeammateAgentDefinition(
+    identity.agentName,
+    teammateSystemPrompt,
+    agentDefinition,
+  )
 
   // All messages across all prompts
   const allMessages: Message[] = []
@@ -1012,12 +1078,6 @@ export async function runInProcessTeammate(
   let currentPrompt = wrappedInitialPrompt
   let shouldExit = false
 
-  // Try to claim an available task immediately so the UI can show activity
-  // from the very start. The idle loop handles claiming for subsequent tasks.
-  // Use parentSessionId as the task list ID since the leader creates tasks
-  // under its session ID, not the team name.
-  await tryClaimNextTask(identity.parentSessionId, identity.agentName)
-
   try {
     // Add initial prompt to task.messages for display (wrapped with XML)
     updateTaskState(
@@ -1026,7 +1086,7 @@ export async function runInProcessTeammate(
         ...task,
         messages: appendCappedMessage(
           task.messages,
-          createUserMessage({ content: wrappedInitialPrompt }),
+          createUserMessage({ content: currentPrompt }),
         ),
       }),
       setAppState,
@@ -1157,7 +1217,7 @@ export async function runInProcessTeammate(
       let workWasAborted = false
 
       // Run agent within contexts
-      await runWithTeammateContext(teammateContext, async () => {
+      const runActiveTurn = () => runWithTeammateContext(scopedTeammateContext, async () => {
         return runWithAgentContext(agentContext, async () => {
           // Mark task as running (not idle)
           updateTaskState(
@@ -1200,6 +1260,7 @@ export async function runInProcessTeammate(
             availableTools: toolUseContext.options.tools,
             allowedTools,
             contentReplacementState: teammateReplacementState,
+            streamTargetAgentId: identity.agentId,
           })) {
             // Check lifecycle abort first (kills whole teammate)
             if (abortController.signal.aborted) {
@@ -1275,6 +1336,7 @@ export async function runInProcessTeammate(
           return { success: true, messages: iterationMessages }
         })
       })
+      await withInProcessTeammateActivity(identity, runActiveTurn)
 
       // Clear the work controller from state (it's no longer valid)
       updateTaskState(
@@ -1357,7 +1419,6 @@ export async function runInProcessTeammate(
         taskId,
         toolUseContext.getAppState,
         setAppState,
-        identity.parentSessionId,
       )
 
       switch (waitResult.type) {
@@ -1457,6 +1518,7 @@ export async function runInProcessTeammate(
       emitTaskTerminatedSdk(taskId, 'completed', {
         toolUseId,
         summary: identity.agentId,
+        ownerAgentId: identity.agentId,
       })
     }
 
@@ -1509,6 +1571,7 @@ export async function runInProcessTeammate(
       emitTaskTerminatedSdk(taskId, 'failed', {
         toolUseId,
         summary: identity.agentId,
+        ownerAgentId: identity.agentId,
       })
     }
 

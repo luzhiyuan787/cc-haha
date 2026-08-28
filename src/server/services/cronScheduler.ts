@@ -23,6 +23,23 @@ import {
 } from '../../utils/desktopBundledCli.js'
 import { getProcessEnvWithTerminalShellEnvironment } from '../../utils/terminalShellEnvironment.js'
 import { attributionHeaderEnvForModel } from './attributionHeaderPolicy.js'
+import { diagnosticsService } from './diagnosticsService.js'
+import {
+  buildNetworkEnvironment,
+  loadNetworkSettings,
+} from './networkSettings.js'
+import { resolveLocalIndexMode } from './localIndex/config.js'
+import {
+  captureScheduledRunReadModelTarget,
+  deactivateScheduledRunReadModel,
+  projectScheduledRunsAfterCanonicalWrite,
+  readScheduledRunPage,
+  type ScheduledRunReadModelTarget,
+} from './localIndex/scheduledRunReadModel.js'
+import {
+  paginateScheduledRunRecords,
+  type ScheduledRunSummary,
+} from './localIndex/scheduledRunIndex.js'
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
@@ -67,7 +84,7 @@ export function buildCronTaskSpawnOptions(
  * By extracting server-side we avoid the 10K naive truncation problem where
  * the useful content sits well past the first 10K characters.
  */
-function extractAssistantText(raw: string): string {
+export function extractAssistantText(raw: string): string {
   if (!raw) return ''
   const lines = raw.split('\n')
   const parts: string[] = []
@@ -97,9 +114,15 @@ function extractAssistantText(raw: string): string {
     if (type === 'result') {
       const result = parsed?.result
       if (typeof result === 'string' && result.trim()) {
-        parts.push(result.trim())
+        const text = result.trim()
+        if (text !== parts.at(-1) && text !== parts.join('\n\n')) {
+          parts.push(text)
+        }
       } else if (result?.message?.trim()) {
-        parts.push(result.message.trim())
+        const text = result.message.trim()
+        if (text !== parts.at(-1) && text !== parts.join('\n\n')) {
+          parts.push(text)
+        }
       }
     }
   }
@@ -185,6 +208,11 @@ export function cronMatches(cronExpr: string, date: Date): boolean {
 // ─── Log file I/O ──────────────────────────────────────────────────────────────
 
 type RunsFile = { runs: TaskRun[] }
+type RunsFilePageSource = { data: RunsFile; cursorRevision: string }
+type RunsFileMutationTarget = {
+  sourcePath: string
+  projectionTarget: ScheduledRunReadModelTarget
+}
 
 function getLogFilePath(): string {
   const configDir =
@@ -192,12 +220,23 @@ function getLogFilePath(): string {
   return path.join(configDir, 'scheduled_tasks_log.json')
 }
 
-async function readRunsFile(): Promise<RunsFile> {
+function captureRunsFileMutationTarget(): RunsFileMutationTarget {
+  const sourcePath = getLogFilePath()
+  return {
+    sourcePath,
+    projectionTarget: captureScheduledRunReadModelTarget(sourcePath),
+  }
+}
+
+function parseRunsFile(raw: string): RunsFile {
+  const parsed = JSON.parse(raw) as RunsFile
+  return Array.isArray(parsed.runs) ? parsed : { runs: [] }
+}
+
+async function readRunsFile(filePath = getLogFilePath()): Promise<RunsFile> {
   try {
-    const raw = await fs.readFile(getLogFilePath(), 'utf-8')
-    const parsed = JSON.parse(raw) as RunsFile
-    if (!Array.isArray(parsed.runs)) return { runs: [] }
-    return parsed
+    const raw = await fs.readFile(filePath, 'utf-8')
+    return parseRunsFile(raw)
   } catch (err: unknown) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
       return { runs: [] }
@@ -206,32 +245,142 @@ async function readRunsFile(): Promise<RunsFile> {
   }
 }
 
-async function writeRunsFile(data: RunsFile): Promise<void> {
-  const filePath = getLogFilePath()
+async function readRunsFilePageSource(
+  filePath = getLogFilePath(),
+): Promise<RunsFilePageSource> {
+  try {
+    const raw = await fs.readFile(filePath, 'utf-8')
+    return {
+      data: parseRunsFile(raw),
+      cursorRevision: `file:${crypto.createHash('sha256').update(raw).digest('base64url')}`,
+    }
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { data: { runs: [] }, cursorRevision: 'file:missing' }
+    }
+    throw err
+  }
+}
+
+async function writeRunsFile(
+  data: RunsFile,
+  target = captureRunsFileMutationTarget(),
+): Promise<void> {
+  const filePath = target.sourcePath
   const dir = path.dirname(filePath)
   await fs.mkdir(dir, { recursive: true })
 
   const tmpFile = `${filePath}.tmp.${Date.now()}`
+  const serialized = JSON.stringify(data, null, 2) + '\n'
   try {
-    await fs.writeFile(tmpFile, JSON.stringify(data, null, 2) + '\n', 'utf-8')
+    await fs.writeFile(tmpFile, serialized, 'utf-8')
     await fs.rename(tmpFile, filePath)
   } catch (err) {
     await fs.unlink(tmpFile).catch(() => {})
     throw err
   }
+
+  // The file is canonical. A derived-index failure must never turn a
+  // successful task-history write into a failed business operation.
+  if (resolveLocalIndexMode().mode === 'off') {
+    deactivateScheduledRunReadModel(filePath)
+  } else {
+    void projectScheduledRunsAfterCanonicalWrite(
+      filePath,
+      serialized,
+      data.runs,
+      target.projectionTarget,
+    ).catch(() => {})
+  }
+}
+
+type ScheduledRunPageOptions = {
+  taskId?: string
+  limit?: number
+  cursor?: string
+  summaryOnly?: boolean
+  nonterminalOnly?: boolean
+  completedAfterMs?: number
+}
+
+type ScheduledRunPageResult = {
+  runs: Array<TaskRun | ScheduledRunSummary>
+  nextCursor?: string
+  revision?: number
+  revisionToken?: string
+  reset?: boolean
+}
+
+function scheduledRunShadowDigest(value: unknown): string {
+  return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex')
+}
+
+async function recordScheduledRunShadowComparison(
+  operation: string,
+  canonical: unknown[],
+  projected: unknown[] | null,
+): Promise<void> {
+  const matched = projected !== null && JSON.stringify(canonical) === JSON.stringify(projected)
+  if (matched) return
+  await diagnosticsService.recordEvent({
+    type: 'local_index_scheduled_run_shadow_comparison',
+    severity: 'warn',
+    summary: 'Scheduled-run index shadow comparison differed',
+    details: {
+      operation,
+      fileCount: canonical.length,
+      indexedCount: projected?.length ?? 0,
+      fileHash: scheduledRunShadowDigest(canonical),
+      indexedHash: scheduledRunShadowDigest(projected),
+    },
+  })
+}
+
+async function compareScheduledRunPageInShadow(
+  sourcePath: string,
+  source: RunsFilePageSource,
+  options: ScheduledRunPageOptions,
+  operation: string,
+): Promise<void> {
+  const comparisonOptions: ScheduledRunPageOptions = {
+    ...(options.taskId ? { taskId: options.taskId } : {}),
+    ...(options.nonterminalOnly ? { nonterminalOnly: true } : {}),
+    ...(options.completedAfterMs === undefined
+      ? {}
+      : { completedAfterMs: options.completedAfterMs }),
+    limit: 2_147_483_647,
+    summaryOnly: true,
+  }
+  const canonical = paginateScheduledRunRecords(
+    source.data.runs,
+    comparisonOptions,
+    source.cursorRevision,
+  ).runs
+  const projected = await readScheduledRunPage(sourcePath, comparisonOptions)
+  await recordScheduledRunShadowComparison(
+    operation,
+    canonical,
+    projected?.runs ?? null,
+  )
 }
 
 /** Append a run to the log and trim to keep at most MAX_RUNS_PER_TASK per task. */
-async function appendRun(run: TaskRun): Promise<void> {
-  const data = await readRunsFile()
+async function appendRun(
+  run: TaskRun,
+  target = captureRunsFileMutationTarget(),
+): Promise<void> {
+  const data = await readRunsFile(target.sourcePath)
   data.runs.push(run)
   trimRuns(data)
-  await writeRunsFile(data)
+  await writeRunsFile(data, target)
 }
 
 /** Update an existing run in the log (matched by run.id). */
-async function updateRun(run: TaskRun): Promise<void> {
-  const data = await readRunsFile()
+async function updateRun(
+  run: TaskRun,
+  target = captureRunsFileMutationTarget(),
+): Promise<void> {
+  const data = await readRunsFile(target.sourcePath)
   const idx = data.runs.findIndex((r) => r.id === run.id)
   if (idx !== -1) {
     data.runs[idx] = run
@@ -239,7 +388,7 @@ async function updateRun(run: TaskRun): Promise<void> {
     data.runs.push(run)
   }
   trimRuns(data)
-  await writeRunsFile(data)
+  await writeRunsFile(data, target)
 }
 
 const MAX_RUNS_PER_TASK = 100
@@ -459,6 +608,8 @@ export class CronScheduler {
    * @param options.createSession When true, creates a Session for rich output viewing (used for manual "Run Now")
    */
   async executeTask(task: CronTask, options?: { createSession?: boolean }): Promise<TaskRun> {
+    const runLogTarget = captureRunsFileMutationTarget()
+
     // Prevent concurrent executions of the same task
     const existing = this.runningTasks.get(task.id)
     if (existing) {
@@ -518,7 +669,7 @@ export class CronScheduler {
     await this.cronService.updateLastFired(task.id, startedAt)
 
     // Persist the "running" state
-    await appendRun(run)
+    await appendRun(run, runLogTarget)
 
     const inputPayload = JSON.stringify({
       type: 'user',
@@ -626,7 +777,7 @@ export class CronScheduler {
       }
 
       await this.persistScheduledSessionPermission(sessionId, workDir)
-      await updateRun(completedRun)
+      await updateRun(completedRun, runLogTarget)
 
       // Send IM notification if configured
       if (task.notification?.enabled && task.notification.channels.length > 0) {
@@ -658,7 +809,7 @@ export class CronScheduler {
       }
 
       await this.persistScheduledSessionPermission(sessionId, workDir)
-      await updateRun(failedRun)
+      await updateRun(failedRun, runLogTarget)
 
       return failedRun
     }
@@ -722,6 +873,10 @@ export class CronScheduler {
         explicitProviderEnv?.ANTHROPIC_MODEL ||
         cleanEnv.ANTHROPIC_MODEL,
     )
+    const networkEnv = buildNetworkEnvironment(
+      await loadNetworkSettings(),
+      cleanEnv,
+    )
 
     return {
       ...cleanEnv,
@@ -740,6 +895,7 @@ export class CronScheduler {
       ...(this.shouldMarkManagedOAuth(task.providerId)
         ? await this.buildOfficialOAuthEnv()
         : {}),
+      ...networkEnv,
       ...attributionHeaderEnv,
     }
   }
@@ -829,7 +985,8 @@ export class CronScheduler {
    * killed before they could update the run log.
    */
   private async cleanupStaleRuns(): Promise<void> {
-    const data = await readRunsFile()
+    const target = captureRunsFileMutationTarget()
+    const data = await readRunsFile(target.sourcePath)
     let changed = false
     const now = Date.now()
     const taskTimeoutMs = resolveCronTaskTimeoutMs()
@@ -852,7 +1009,7 @@ export class CronScheduler {
     }
 
     if (changed) {
-      await writeRunsFile(data)
+      await writeRunsFile(data, target)
     }
   }
 
@@ -860,7 +1017,32 @@ export class CronScheduler {
 
   /** Get execution history for a specific task. */
   async getTaskRuns(taskId: string): Promise<TaskRun[]> {
-    const data = await readRunsFile()
+    const sourcePath = getLogFilePath()
+    const mode = resolveLocalIndexMode().mode
+    if (mode === 'off' || mode === 'shadow') {
+      if (mode === 'off') deactivateScheduledRunReadModel(sourcePath)
+      const source = await readRunsFilePageSource(sourcePath)
+      const canonical = paginateScheduledRunRecords(
+        source.data.runs,
+        { taskId, limit: 2_147_483_647 },
+        source.cursorRevision,
+      ).runs as TaskRun[]
+      if (mode === 'shadow') {
+        await compareScheduledRunPageInShadow(
+          sourcePath,
+          source,
+          { taskId },
+          'getTaskRuns',
+        )
+      }
+      return canonical
+    }
+    const projected = await readScheduledRunPage(sourcePath, {
+      taskId,
+      limit: 2_147_483_647,
+    })
+    if (projected) return projected.runs as TaskRun[]
+    const data = await readRunsFile(sourcePath)
     return data.runs
       .filter((r) => r.taskId === taskId)
       .sort(
@@ -871,13 +1053,86 @@ export class CronScheduler {
 
   /** Get recent runs across all tasks. */
   async getRecentRuns(limit = 50): Promise<TaskRun[]> {
-    const data = await readRunsFile()
+    const sourcePath = getLogFilePath()
+    const mode = resolveLocalIndexMode().mode
+    if (mode === 'off' || mode === 'shadow') {
+      if (mode === 'off') deactivateScheduledRunReadModel(sourcePath)
+      const source = await readRunsFilePageSource(sourcePath)
+      const canonical = paginateScheduledRunRecords(
+        source.data.runs,
+        { limit },
+        source.cursorRevision,
+      ).runs as TaskRun[]
+      if (mode === 'shadow') {
+        await compareScheduledRunPageInShadow(
+          sourcePath,
+          source,
+          {},
+          'getRecentRuns',
+        )
+      }
+      return canonical
+    }
+    const projected = await readScheduledRunPage(sourcePath, { limit })
+    if (projected) return projected.runs as TaskRun[]
+    const data = await readRunsFile(sourcePath)
     return data.runs
       .sort(
         (a, b) =>
           new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime(),
       )
       .slice(0, limit)
+  }
+
+  async getRunsPage(options: ScheduledRunPageOptions = {}): Promise<ScheduledRunPageResult> {
+    const sourcePath = getLogFilePath()
+    const mode = resolveLocalIndexMode().mode
+    if (mode === 'off' || mode === 'shadow') {
+      if (mode === 'off') deactivateScheduledRunReadModel(sourcePath)
+      const source = await readRunsFilePageSource(sourcePath)
+      const canonical = paginateScheduledRunRecords(
+        source.data.runs,
+        options,
+        source.cursorRevision,
+      ) as ScheduledRunPageResult
+      if (mode === 'shadow') {
+        await compareScheduledRunPageInShadow(
+          sourcePath,
+          source,
+          options,
+          'getRunsPage',
+        )
+      }
+      return canonical
+    }
+    const projected = await readScheduledRunPage(sourcePath, options)
+    if (projected) return projected as {
+      runs: Array<TaskRun | ScheduledRunSummary>
+      nextCursor?: string
+      revision: number
+      revisionToken: string
+      reset?: boolean
+    }
+
+    const source = await readRunsFilePageSource(sourcePath)
+    return paginateScheduledRunRecords(
+      source.data.runs,
+      options,
+      source.cursorRevision,
+    ) as {
+      runs: Array<TaskRun | ScheduledRunSummary>
+      nextCursor?: string
+      revisionToken?: string
+      reset?: boolean
+    }
+  }
+
+  async getRunDetail(runId: string): Promise<TaskRun | null> {
+    const sourcePath = getLogFilePath()
+    const mode = resolveLocalIndexMode().mode
+    if (mode === 'off') deactivateScheduledRunReadModel(sourcePath)
+    const data = await readRunsFile(sourcePath)
+    return data.runs.find(run => run.id === runId) ?? null
   }
 }
 

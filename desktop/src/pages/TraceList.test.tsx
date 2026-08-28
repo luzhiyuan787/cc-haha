@@ -14,8 +14,10 @@ vi.mock('../api/traces', () => ({
   },
 }))
 
-const { openTraceWindowMock } = vi.hoisted(() => ({
+const { openTraceWindowMock, hostState } = vi.hoisted(() => ({
   openTraceWindowMock: vi.fn(async () => {}),
+  /** Flipped per-test to model H5/browser, where there is no native window API. */
+  hostState: { hasTraceHost: true },
 }))
 
 vi.mock('../lib/desktopHost', async (importOriginal) => {
@@ -24,7 +26,7 @@ vi.mock('../lib/desktopHost', async (importOriginal) => {
     ...actual,
     getDesktopHost: () => ({
       ...actual.getDesktopHost(),
-      trace: { openWindow: openTraceWindowMock },
+      trace: hostState.hasTraceHost ? { openWindow: openTraceWindowMock } : undefined,
     }),
   }
 })
@@ -90,6 +92,7 @@ describe('TraceList', () => {
   beforeEach(() => {
     useSettingsStore.setState({ locale: 'en' })
     useTabStore.setState({ tabs: [], activeTabId: null })
+    hostState.hasTraceHost = true
     vi.mocked(tracesApi.list).mockResolvedValue(traceList)
     vi.mocked(tracesApi.deleteSession).mockResolvedValue({ sessionId: 'session-trace-list', deleted: true })
   })
@@ -128,8 +131,30 @@ describe('TraceList', () => {
 
     // right metrics: calls / duration / compact tokens
     expect(within(row).getByText('3')).toBeInTheDocument()
-    expect(within(row).getByText('4.7s')).toBeInTheDocument()
+    // '4.71s', not '4.7s': the list used to carry its own formatter with one
+    // decimal. It now shares formatDurationMs with the detail view, which is the
+    // whole point — see the minutes case below.
+    expect(within(row).getByText('4.71s')).toBeInTheDocument()
     expect(within(row).getByText('1.5k')).toBeInTheDocument()
+  })
+
+  // Regression: the list had a private formatDuration that stopped at seconds, so a
+  // 12-minute session read "739.0s" here while the detail view — same field, same
+  // t('trace.modelTime') label, shared formatter — read "12m 19s". Anything over a
+  // minute exposes the fork, which is why no existing fixture caught it.
+  it('renders a duration over a minute the same way the detail view does', async () => {
+    vi.mocked(tracesApi.list).mockResolvedValue({
+      ...traceList,
+      traces: [{
+        ...traceList.traces[0]!,
+        summary: { ...traceList.traces[0]!.summary, totalDurationMs: 739_000 },
+      }],
+    })
+
+    render(<TraceList />)
+    const row = await findTraceRow(/Debug stuck agent/)
+
+    expect(within(row).getByText('12m 19s')).toBeInTheDocument()
   })
 
   it('opens a trace tab when the row is clicked or activated via keyboard', async () => {
@@ -138,7 +163,11 @@ describe('TraceList', () => {
     fireEvent.click(await screen.findByText('Debug stuck agent'))
 
     expect(useTabStore.getState().activeTabId).toBe('__trace__session-trace-list')
-    expect(useTabStore.getState().tabs.find((tab) => tab.type === 'trace')?.traceSessionId).toBe('session-trace-list')
+    const traceTab = useTabStore.getState().tabs.find((tab) => tab.type === 'trace')
+    expect(traceTab?.traceSessionId).toBe('session-trace-list')
+    // Titled with the session itself — the tab bar's trace glyph carries the
+    // type, so a "Model trace: " prefix would only eat the visible width.
+    expect(traceTab?.title).toBe('Debug stuck agent')
 
     useTabStore.setState({ tabs: [], activeTabId: null })
     fireEvent.keyDown(within(await findTraceRow(/Debug stuck agent/)).getByRole('button', { name: /Debug stuck agent/ }), { key: 'Enter' })
@@ -156,9 +185,28 @@ describe('TraceList', () => {
     expect(openTraceWindowMock).toHaveBeenCalledWith('session-trace-list')
     expect(useTabStore.getState().activeTabId).toBeNull()
 
-    fireEvent.click(within(row).getByRole('button', { name: 'Trace' }))
+    // The row actions cover only what a row click cannot express. A separate
+    // "open" button would just duplicate the click and crowd the hover strip.
+    expect(within(row).getAllByRole('button').map((button) => button.getAttribute('aria-label')))
+      .toEqual([null, 'Open in separate window', 'Delete trace'])
+  })
 
-    expect(useTabStore.getState().activeTabId).toBe('__trace__session-trace-list')
+  it('opens a browser tab instead of a dead button when there is no desktop shell', async () => {
+    hostState.hasTraceHost = false
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null)
+    render(<TraceList />)
+
+    const row = await findTraceRow(/Debug stuck agent/)
+    fireEvent.click(within(row).getByRole('button', { name: 'Open in separate window' }))
+
+    expect(openTraceWindowMock).not.toHaveBeenCalled()
+    expect(openSpy).toHaveBeenCalledWith(
+      expect.stringContaining('traceWindow=1'),
+      '_blank',
+      'noopener,noreferrer',
+    )
+    expect(openSpy.mock.calls[0]?.[0]).toContain('traceSessionId=session-trace-list')
+    openSpy.mockRestore()
   })
 
   it('requires confirmation before deleting a trace session', async () => {
@@ -193,6 +241,22 @@ describe('TraceList', () => {
 
     expect(useTabStore.getState().activeTabId).toBe(SETTINGS_TAB_ID)
     expect(useTabStore.getState().tabs.find((tab) => tab.sessionId === SETTINGS_TAB_ID)?.type).toBe('settings')
+  })
+
+  it('announces a failed load and retries from inside the error', async () => {
+    vi.mocked(tracesApi.list)
+      .mockRejectedValueOnce(new Error('trace store unreachable'))
+      .mockResolvedValueOnce(traceList)
+
+    render(<TraceList />)
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('trace store unreachable')
+
+    fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }))
+
+    expect(await screen.findByText('/tmp/cc-haha/traces')).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
   it('loads additional trace pages instead of fetching all rows at once', async () => {

@@ -1,12 +1,17 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  OPENAI_CODEX_FRONTIER_EFFECTIVE_CONTEXT_WINDOW,
+  OPENAI_CODEX_MODEL_CATALOG,
   OPENAI_CODEX_LARGE_EFFECTIVE_CONTEXT_WINDOW,
   OPENAI_CODEX_SPARK_EFFECTIVE_CONTEXT_WINDOW,
   OPENAI_CODEX_STANDARD_EFFECTIVE_CONTEXT_WINDOW,
   OPENAI_DEFAULT_MAIN_MODEL,
   getOpenAICodexContextWindowForModel,
+  getOpenAIModelDisplayName,
   isOpenAIResponsesModel,
   resolveOpenAICodexModel,
+  resolveOpenAIReasoningEffort,
+  resolveOpenAIReasoningEffortWithPriority,
 } from './models.js'
 
 describe('openai auth model resolution', () => {
@@ -19,11 +24,15 @@ describe('openai auth model resolution', () => {
     expect(isOpenAIResponsesModel('o3-mini')).toBe(true)
   })
 
-  test('maps opus aliases to the OpenAI default model', () => {
+  test('maps frontier Claude aliases to the OpenAI default model', () => {
     expect(resolveOpenAICodexModel('opus')).toBe(OPENAI_DEFAULT_MAIN_MODEL)
+    expect(resolveOpenAICodexModel('fable')).toBe(OPENAI_DEFAULT_MAIN_MODEL)
   })
 
   test('maps Codex OAuth GPT models to effective Codex context windows', () => {
+    expect(getOpenAICodexContextWindowForModel('gpt-5.6-sol')).toBe(
+      OPENAI_CODEX_FRONTIER_EFFECTIVE_CONTEXT_WINDOW,
+    )
     expect(getOpenAICodexContextWindowForModel('gpt-5.5')).toBe(
       OPENAI_CODEX_STANDARD_EFFECTIVE_CONTEXT_WINDOW,
     )
@@ -39,5 +48,49 @@ describe('openai auth model resolution', () => {
     expect(getOpenAICodexContextWindowForModel('gpt-5.3-codex-spark')).toBe(
       OPENAI_CODEX_SPARK_EFFECTIVE_CONTEXT_WINDOW,
     )
+  })
+
+  test('keeps bundled catalog windows aligned with runtime resolution', () => {
+    for (const model of OPENAI_CODEX_MODEL_CATALOG) {
+      expect(getOpenAICodexContextWindowForModel(model.value)).toBe(
+        model.contextWindow,
+      )
+    }
+  })
+
+  test('exposes GPT-5.6 family metadata and model-native reasoning defaults', () => {
+    expect(OPENAI_CODEX_MODEL_CATALOG.slice(0, 3).map((model) => model.value)).toEqual([
+      'gpt-5.6-sol',
+      'gpt-5.6-terra',
+      'gpt-5.6-luna',
+    ])
+    expect(getOpenAIModelDisplayName('gpt-5.6-sol')).toBe('GPT-5.6-Sol')
+    expect(resolveOpenAIReasoningEffort('gpt-5.6-sol', undefined)).toBe('low')
+    expect(resolveOpenAIReasoningEffort('gpt-5.6-terra', undefined)).toBe('medium')
+    expect(resolveOpenAIReasoningEffort('gpt-5.6-luna', 'max')).toBe('max')
+    expect(resolveOpenAIReasoningEffort('gpt-5.5', 'max')).toBe('medium')
+    expect(resolveOpenAIReasoningEffort('gpt-5.5', 'xhigh')).toBe('xhigh')
+  })
+
+  test('uses the first model-supported effort candidate', () => {
+    expect(
+      resolveOpenAIReasoningEffortWithPriority('gpt-5.6-luna', [
+        'low',
+        'high',
+      ]),
+    ).toBe('low')
+    expect(
+      resolveOpenAIReasoningEffortWithPriority('gpt-5.5', [
+        'max',
+        'high',
+        'xhigh',
+      ]),
+    ).toBe('high')
+    expect(
+      resolveOpenAIReasoningEffortWithPriority('gpt-5.5', [
+        'max',
+        'invalid',
+      ]),
+    ).toBe('medium')
   })
 })

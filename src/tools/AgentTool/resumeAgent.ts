@@ -17,10 +17,15 @@ import {
   filterWhitespaceOnlyAssistantMessages,
 } from '../../utils/messages.js'
 import { getAgentModel } from '../../utils/model/agent.js'
+import {
+  isModelAlias,
+  type ModelAlias,
+} from '../../utils/model/aliases.js'
 import { getQuerySourceForAgent } from '../../utils/promptCategory.js'
 import {
   getAgentTranscript,
   readAgentMetadata,
+  type AgentMetadata,
 } from '../../utils/sessionStorage.js'
 import { buildEffectiveSystemPrompt } from '../../utils/systemPrompt.js'
 import type { SystemPrompt } from '../../utils/systemPromptType.js'
@@ -32,13 +37,31 @@ import { GENERAL_PURPOSE_AGENT } from './built-in/generalPurposeAgent.js'
 import { FORK_AGENT, isForkSubagentEnabled } from './forkSubagent.js'
 import type { AgentDefinition } from './loadAgentsDir.js'
 import { isBuiltInAgent } from './loadAgentsDir.js'
-import { runAgent } from './runAgent.js'
+import { resolvePersistedAgentType, runAgent } from './runAgent.js'
 
 export type ResumeAgentResult = {
   agentId: string
   description: string
   outputFile: string
 }
+
+export function resolveResumedAgentModelOverride(
+  model: unknown,
+): ModelAlias | undefined {
+  return typeof model === 'string' && isModelAlias(model) ? model : undefined
+}
+
+/** Resolve the original lifecycle owner before a resume re-registers the task.
+ * The current nested caller wins; a root SendMessage continuation falls back
+ * to the in-memory task and then to the persisted sidecar after cold restore. */
+export function resolveResumedAgentOwnerAgentId(
+  currentAgentId: string | undefined,
+  existingOwnerAgentId: string | undefined,
+  metadata: Pick<AgentMetadata, 'ownerAgentId'> | null,
+): string | undefined {
+  return currentAgentId ?? existingOwnerAgentId ?? metadata?.ownerAgentId
+}
+
 export async function resumeAgentBackground({
   agentId,
   prompt,
@@ -77,6 +100,15 @@ export async function resumeAgentBackground({
     resumedMessages,
     transcript.contentReplacements,
   )
+  const existingTask = appState.tasks[agentId]
+  const existingOwnerAgentId = existingTask && 'ownerAgentId' in existingTask
+    ? existingTask.ownerAgentId
+    : undefined
+  const ownerAgentId = resolveResumedAgentOwnerAgentId(
+    toolUseContext.agentId,
+    existingOwnerAgentId,
+    meta,
+  )
   // Best-effort: if the original worktree was removed externally, fall back
   // to parent cwd rather than crashing on chdir later.
   const resumedWorktreePath = meta?.worktreePath
@@ -112,6 +144,16 @@ export async function resumeAgentBackground({
   }
 
   const uiDescription = meta?.description ?? '(resumed)'
+  const resumedModelOverride = resolveResumedAgentModelOverride(meta?.model)
+  // Re-attach to the Agent card that originally spawned this agent, preferring
+  // persisted metadata and falling back to the still-registered task. Never
+  // fall back to the resuming caller's own tool_use id: SendMessage routes
+  // stopped agents here, and adopting its id files the agent's tool activity
+  // and completion notification under the SendMessage card. Leaving this
+  // undefined only costs live activity streaming, which is what agents resumed
+  // from pre-existing metadata did anyway.
+  const spawningToolUseId =
+    meta?.toolUseId ?? appState.tasks[agentId]?.toolUseId
 
   let forkParentSystemPrompt: SystemPrompt | undefined
   if (isResumedFork) {
@@ -151,7 +193,7 @@ export async function resumeAgentBackground({
   const resolvedAgentModel = getAgentModel(
     selectedAgent.model,
     toolUseContext.options.mainLoopModel,
-    undefined,
+    resumedModelOverride,
     permissionMode,
   )
 
@@ -162,6 +204,10 @@ export async function resumeAgentBackground({
   const workerTools = isResumedFork
     ? toolUseContext.options.tools
     : assembleToolPool(workerPermissionContext, appState.mcp.tools)
+  const resumedAgentType = resolvePersistedAgentType(
+    meta?.agentType,
+    selectedAgent.agentType,
+  )
 
   const runAgentParams: Parameters<typeof runAgent>[0] = {
     agentDefinition: selectedAgent,
@@ -176,7 +222,9 @@ export async function resumeAgentBackground({
       selectedAgent.agentType,
       isBuiltInAgent(selectedAgent),
     ),
-    model: undefined,
+    // Preserve the original Agent tool's per-invocation model precedence on
+    // follow-up, matching a fresh invocation of the same agent instance.
+    model: resumedModelOverride,
     // Fork resume: pass parent's system prompt (cache-identical prefix).
     // Non-fork: undefined → runAgent recomputes under wrapWithCwd so
     // getCwd() sees resumedWorktreePath.
@@ -191,6 +239,11 @@ export async function resumeAgentBackground({
     // Re-persist so metadata survives runAgent's writeAgentMetadata overwrite
     worktreePath: resumedWorktreePath,
     description: meta?.description,
+    spawningToolUseId,
+    ownerAgentId,
+    streamTargetAgentId: agentId,
+    persistedAgentType: resumedAgentType,
+    alreadyPersistedMessageCount: resumedMessages.length,
     contentReplacementState: resumedReplacementState,
   }
 
@@ -201,7 +254,8 @@ export async function resumeAgentBackground({
     prompt,
     selectedAgent,
     setAppState: rootSetAppState,
-    toolUseId: toolUseContext.toolUseId,
+    toolUseId: spawningToolUseId,
+    ownerAgentId,
   })
 
   const metadata = {
@@ -209,7 +263,7 @@ export async function resumeAgentBackground({
     resolvedAgentModel,
     isBuiltInAgent: isBuiltInAgent(selectedAgent),
     startTime,
-    agentType: selectedAgent.agentType,
+    agentType: resumedAgentType,
     isAsync: true,
   }
 
@@ -217,7 +271,7 @@ export async function resumeAgentBackground({
     agentId,
     parentSessionId: getParentSessionId(),
     agentType: 'subagent' as const,
-    subagentName: selectedAgent.agentType,
+    subagentName: resumedAgentType,
     isBuiltIn: isBuiltInAgent(selectedAgent),
     invokingRequestId,
     invocationKind: 'resume' as const,
@@ -245,6 +299,7 @@ export async function resumeAgentBackground({
         metadata,
         description: uiDescription,
         toolUseContext,
+        parentToolUseId: spawningToolUseId,
         rootSetAppState,
         agentIdForCleanup: agentId,
         enableSummarization:
@@ -253,6 +308,7 @@ export async function resumeAgentBackground({
           getSdkAgentProgressSummariesEnabled(),
         getWorktreeResult: async () =>
           resumedWorktreePath ? { worktreePath: resumedWorktreePath } : {},
+        ownerAgentId,
       }),
     ),
   )

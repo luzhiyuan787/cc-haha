@@ -13,6 +13,7 @@ import {
 import { CronService } from '../services/cronService.js'
 import { ProviderService } from '../services/providerService.js'
 import { resetTerminalShellEnvironmentCacheForTests } from '../../utils/terminalShellEnvironment.js'
+import { resetSettingsCache } from '../../utils/settings/settingsCache.js'
 
 const originalConfigDir = process.env.CLAUDE_CONFIG_DIR
 const originalPath = process.env.PATH
@@ -26,6 +27,12 @@ const originalShell = process.env.SHELL
 const originalZdotdir = process.env.ZDOTDIR
 const originalDisableTerminalShellEnv = process.env.CC_HAHA_DISABLE_TERMINAL_SHELL_ENV
 const originalTaskTimeout = process.env.CC_HAHA_TASK_TIMEOUT_MS
+const originalLocalAccessToken = process.env.CC_HAHA_LOCAL_ACCESS_TOKEN
+const originalSystemProxyUrl = process.env.CC_HAHA_SYSTEM_PROXY_URL
+const originalHttpProxy = process.env.HTTP_PROXY
+const originalHttpsProxy = process.env.HTTPS_PROXY
+const originalLowerHttpProxy = process.env.http_proxy
+const originalLowerHttpsProxy = process.env.https_proxy
 
 const isWindows = process.platform === 'win32'
 const unixOnly = isWindows ? it.skip : it
@@ -114,6 +121,25 @@ function restoreEnv(): void {
   } else {
     delete process.env.CC_HAHA_TASK_TIMEOUT_MS
   }
+  if (originalLocalAccessToken !== undefined) {
+    process.env.CC_HAHA_LOCAL_ACCESS_TOKEN = originalLocalAccessToken
+  } else {
+    delete process.env.CC_HAHA_LOCAL_ACCESS_TOKEN
+  }
+  if (originalSystemProxyUrl !== undefined) {
+    process.env.CC_HAHA_SYSTEM_PROXY_URL = originalSystemProxyUrl
+  } else {
+    delete process.env.CC_HAHA_SYSTEM_PROXY_URL
+  }
+  if (originalHttpProxy !== undefined) process.env.HTTP_PROXY = originalHttpProxy
+  else delete process.env.HTTP_PROXY
+  if (originalHttpsProxy !== undefined) process.env.HTTPS_PROXY = originalHttpsProxy
+  else delete process.env.HTTPS_PROXY
+  if (originalLowerHttpProxy !== undefined) process.env.http_proxy = originalLowerHttpProxy
+  else delete process.env.http_proxy
+  if (originalLowerHttpsProxy !== undefined) process.env.https_proxy = originalLowerHttpsProxy
+  else delete process.env.https_proxy
+  resetSettingsCache()
   resetTerminalShellEnvironmentCacheForTests()
 }
 
@@ -124,6 +150,7 @@ describe('cron scheduler launcher resolution', () => {
     tmpDir = await createTmpDir()
     process.env.CLAUDE_CONFIG_DIR = path.join(tmpDir, 'config')
     process.env.CC_HAHA_DISABLE_TERMINAL_SHELL_ENV = '1'
+    resetSettingsCache()
     resetTerminalShellEnvironmentCacheForTests()
   })
 
@@ -352,6 +379,7 @@ describe('cron scheduler launcher resolution', () => {
     process.env.ANTHROPIC_BASE_URL = 'https://stale-parent.example'
     process.env.ANTHROPIC_MODEL = 'stale-parent-model'
     process.env.CLAUDE_CODE_ENTRYPOINT = 'stale-parent-entrypoint'
+    process.env.CC_HAHA_LOCAL_ACCESS_TOKEN = 'desktop-local-secret'
 
     const provider = await new ProviderService().addProvider({
       presetId: 'custom',
@@ -405,8 +433,86 @@ describe('cron scheduler launcher resolution', () => {
     expect(env.ANTHROPIC_MODEL).toBe('provider-fast')
     expect(env.ANTHROPIC_MODEL).not.toBe('stale-parent-model')
     expect(env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST).toBe('1')
+    expect(env.CC_HAHA_LOCAL_ACCESS_TOKEN).toBe('desktop-local-secret')
     expect(env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('0')
     expect(env.CLAUDE_CODE_ENTRYPOINT).toBe('sdk-cli')
+  })
+
+  unixOnly('executeTask applies direct, system, and manual network settings to the sidecar', async () => {
+    const appRoot = path.join(tmpDir, 'app-root')
+    const sidecarPath = path.join(tmpDir, 'claude-sidecar')
+    const sidecarEnvPath = path.join(tmpDir, 'sidecar.env')
+    const settingsPath = path.join(process.env.CLAUDE_CONFIG_DIR!, 'settings.json')
+
+    await fs.mkdir(appRoot, { recursive: true })
+    await fs.mkdir(path.dirname(settingsPath), { recursive: true })
+    await fs.writeFile(
+      sidecarPath,
+      [
+        '#!/bin/sh',
+        `env | sort > "${sidecarEnvPath}"`,
+        '/bin/cat >/dev/null',
+        'printf \'%s\\n\' \'{"type":"result","result":"network env ok"}\'',
+        'exit 0',
+        '',
+      ].join('\n'),
+      'utf-8',
+    )
+    await fs.chmod(sidecarPath, 0o755)
+
+    process.env.CLAUDE_CLI_PATH = sidecarPath
+    process.env.CLAUDE_APP_ROOT = appRoot
+    process.env.CC_HAHA_SYSTEM_PROXY_URL = 'http://127.0.0.1:7897'
+    process.env.HTTP_PROXY = 'http://stale-parent.example:8080'
+    process.env.HTTPS_PROXY = 'http://stale-parent.example:8080'
+    process.env.http_proxy = 'http://stale-parent.example:8080'
+    process.env.https_proxy = 'http://stale-parent.example:8080'
+
+    const cronService = new CronService()
+    const scheduler = new CronScheduler(cronService)
+    const task = await cronService.createTask({
+      cron: '* * * * *',
+      prompt: 'cron network env test',
+      name: 'Network Env Task',
+      recurring: true,
+      folderPath: tmpDir,
+    })
+    const cases = [
+      { mode: 'direct', url: '', expectedProxyUrl: '' },
+      { mode: 'system', url: '', expectedProxyUrl: 'http://127.0.0.1:7897' },
+      { mode: 'manual', url: ' http://127.0.0.1:7890 ', expectedProxyUrl: 'http://127.0.0.1:7890' },
+    ] as const
+
+    for (const testCase of cases) {
+      await fs.writeFile(
+        settingsPath,
+        JSON.stringify({
+          network: {
+            proxy: { mode: testCase.mode, url: testCase.url },
+          },
+        }),
+        'utf-8',
+      )
+      resetSettingsCache()
+
+      const run = await scheduler.executeTask(task)
+      expect(run.status).toBe('completed')
+      expect(run.output).toBe('network env ok')
+
+      const env = Object.fromEntries(
+        (await fs.readFile(sidecarEnvPath, 'utf-8'))
+          .trim()
+          .split('\n')
+          .map((line) => {
+            const index = line.indexOf('=')
+            return [line.slice(0, index), line.slice(index + 1)]
+          }),
+      )
+      expect(env.HTTP_PROXY).toBe(testCase.expectedProxyUrl)
+      expect(env.HTTPS_PROXY).toBe(testCase.expectedProxyUrl)
+      expect(env.http_proxy).toBe(testCase.expectedProxyUrl)
+      expect(env.https_proxy).toBe(testCase.expectedProxyUrl)
+    }
   })
 
   unixOnly('executeTask launches scheduled tasks with full permissions', async () => {

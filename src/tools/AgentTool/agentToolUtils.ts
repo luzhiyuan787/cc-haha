@@ -414,10 +414,11 @@ export function emitAgentToolActivitiesForMessage(
   message: MessageType,
   taskId: string,
   parentToolUseId: string | undefined,
+  ownerAgentId?: string,
 ): void {
   if (!parentToolUseId) return
   for (const activity of extractAgentToolActivities(message)) {
-    emitAgentToolActivity(taskId, parentToolUseId, activity)
+    emitAgentToolActivity(taskId, parentToolUseId, activity, ownerAgentId)
   }
 }
 
@@ -428,6 +429,7 @@ export function emitTaskProgress(
   description: string,
   startTime: number,
   lastToolName: string,
+  ownerAgentId?: string,
 ): void {
   const progress = getProgressUpdate(tracker)
   emitTaskProgressEvent({
@@ -438,6 +440,7 @@ export function emitTaskProgress(
     totalTokens: progress.tokenCount,
     toolUses: progress.toolUseCount,
     lastToolName,
+    ownerAgentId,
   })
 }
 
@@ -567,10 +570,12 @@ export async function runAsyncAgentLifecycle({
   metadata,
   description,
   toolUseContext,
+  parentToolUseId,
   rootSetAppState,
   agentIdForCleanup,
   enableSummarization,
   getWorktreeResult,
+  ownerAgentId,
 }: {
   taskId: string
   abortController: AbortController
@@ -580,6 +585,10 @@ export async function runAsyncAgentLifecycle({
   metadata: Parameters<typeof finalizeAgentTool>[2]
   description: string
   toolUseContext: ToolUseContext
+  /** Agent card this run belongs to. Always the Agent call that spawned the
+   * agent — never the tool driving a resume, which has its own id and would
+   * otherwise adopt the agent's activity and completion notification. */
+  parentToolUseId: string | undefined
   rootSetAppState: SetAppState
   agentIdForCleanup: string
   enableSummarization: boolean
@@ -587,7 +596,10 @@ export async function runAsyncAgentLifecycle({
     worktreePath?: string
     worktreeBranch?: string
   }>
+  /** Stable lifecycle owner resolved when the run was spawned or resumed. */
+  ownerAgentId?: string
 }): Promise<void> {
+  const agentToolUseId = parentToolUseId
   let stopSummarization: (() => void) | undefined
   const agentMessages: MessageType[] = []
   try {
@@ -644,17 +656,19 @@ export async function runAsyncAgentLifecycle({
       emitAgentToolActivitiesForMessage(
         message,
         taskId,
-        toolUseContext.toolUseId,
+        agentToolUseId,
+        ownerAgentId,
       )
       const lastToolName = getLastToolUseName(message)
       if (lastToolName) {
         emitTaskProgress(
           tracker,
           taskId,
-          toolUseContext.toolUseId,
+          agentToolUseId,
           description,
           metadata.startTime,
           lastToolName,
+          ownerAgentId,
         )
       }
     }
@@ -679,7 +693,7 @@ export async function runAsyncAgentLifecycle({
         toolUses: agentResult.totalToolUseCount,
         durationMs: agentResult.totalDurationMs,
       },
-      toolUseId: toolUseContext.toolUseId,
+      toolUseId: agentToolUseId,
     })
 
     void (async () => {
@@ -727,7 +741,7 @@ export async function runAsyncAgentLifecycle({
         description,
         status: 'killed',
         setAppState: rootSetAppState,
-        toolUseId: toolUseContext.toolUseId,
+        toolUseId: agentToolUseId,
         finalMessage: partialResult,
       })
       void getWorktreeResult().catch(cleanupError =>
@@ -745,7 +759,7 @@ export async function runAsyncAgentLifecycle({
       status: 'failed',
       error: msg,
       setAppState: rootSetAppState,
-      toolUseId: toolUseContext.toolUseId,
+      toolUseId: agentToolUseId,
     })
     void getWorktreeResult().catch(cleanupError =>
       logForDebugging(

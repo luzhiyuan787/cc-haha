@@ -4,6 +4,7 @@ import {
   isSameOrInsidePathForPlatform,
   normalizeDriveRootPathForPlatform,
 } from '../services/windowsDrivePath.js'
+import { canonicalizeExistingFilesystemPath } from '../services/filesystemPathSecurity.js'
 
 const CONTENT_TYPES: Record<string, string> = {
   html: 'text/html; charset=utf-8',
@@ -23,6 +24,10 @@ const CONTENT_TYPES: Record<string, string> = {
   woff2: 'font/woff2',
   txt: 'text/plain; charset=utf-8',
   md: 'text/plain; charset=utf-8',
+  // Reached today only by a PDF linked from a previewed HTML page — a PDF the
+  // user opens directly goes to the system viewer, which is where it belongs.
+  // Correct anyway, and the alternative (application/octet-stream) is a download.
+  pdf: 'application/pdf',
   // Video — served inline via <video> with HTTP byte-range streaming.
   mp4: 'video/mp4',
   webm: 'video/webm',
@@ -44,15 +49,28 @@ export type ResolveWorkDir = (sessionId: string) => Promise<string | null>
 const PREFIX = '/preview-fs/'
 
 /**
- * Upper bound on what we'll serve. The old 50 MB cap existed because the file
- * was buffered into memory via `readFileSync`; that would 413 real dubbed
- * videos. We now STREAM every response through `Bun.file(...)` (including
- * byte-ranges), so the in-memory pressure is gone and we can raise this a lot.
- * We keep a generous-but-finite ceiling (2 GiB) purely as a sanity guard
- * against pathological / runaway files — not as a memory limit.
+ * The general 2 GiB limit applies only to files streamed through `Bun.file`.
+ * HTML documents are transformed before serving and therefore use a much
+ * smaller independent memory bound.
  */
 const MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
+const MAX_TRANSFORMED_HTML_BYTES = 10 * 1024 * 1024
 const ROOT_RELATIVE_HTML_ATTR_RE = /\b(src|href)=(["'])\/(?!\/)([^"']*)\2/gi
+const PREVIEW_HTML_CSP = [
+  'sandbox allow-scripts allow-same-origin allow-modals allow-downloads allow-popups',
+  "default-src 'none'",
+  "script-src 'self' 'unsafe-inline'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob:",
+  "font-src 'self' data:",
+  "media-src 'self' blob:",
+  "worker-src 'self' blob:",
+  "manifest-src 'self'",
+  "connect-src 'none'",
+  "frame-src 'none'",
+  "form-action 'none'",
+  "object-src 'none'",
+].join('; ')
 
 export interface ParsedRange {
   start: number
@@ -150,7 +168,18 @@ export async function handlePreviewFs(
     return new Response('forbidden', { status: 403 })
   }
 
-  return servePreviewFsFile(target, url.pathname, reqHeaders)
+  const [canonicalRoot, canonicalTarget] = await Promise.all([
+    canonicalizeExistingFilesystemPath(root),
+    canonicalizeExistingFilesystemPath(target),
+  ])
+  if (!canonicalRoot || !canonicalTarget) {
+    return new Response('not found', { status: 404 })
+  }
+  if (!isSameOrInsidePathForPlatform(canonicalTarget, canonicalRoot)) {
+    return new Response('forbidden', { status: 403 })
+  }
+
+  return servePreviewFsFile(canonicalTarget, url.pathname, reqHeaders)
 }
 
 function previewHtmlBasePath(pathname: string): string {
@@ -191,8 +220,14 @@ async function servePreviewFsFile(
   reqHeaders?: Headers,
 ): Promise<Response> {
   const ext = path.extname(target).toLowerCase()
-  if ((ext !== '.html' && ext !== '.htm') || reqHeaders?.has('range')) {
+  const isHtml = ext === '.html' || ext === '.htm'
+  if (!isHtml) {
     return serveFileWithRange(target, reqHeaders)
+  }
+  if (reqHeaders?.has('range')) {
+    return serveFileWithRange(target, reqHeaders, {
+      'Content-Security-Policy': PREVIEW_HTML_CSP,
+    })
   }
 
   let stat: fs.Stats
@@ -202,17 +237,24 @@ async function servePreviewFsFile(
     return new Response('not found', { status: 404 })
   }
   if (!stat.isFile()) return new Response('not a file', { status: 404 })
-  if (stat.size > MAX_FILE_BYTES) return new Response('too large', { status: 413 })
+  if (stat.size > MAX_TRANSFORMED_HTML_BYTES) {
+    return new Response('too large', { status: 413 })
+  }
 
-  const content = fs.readFileSync(target, 'utf8')
+  const content = await fs.promises.readFile(target, 'utf8')
   const transformed = rewritePreviewHtml(content, previewHtmlBasePath(requestPathname))
+  const transformedBytes = Buffer.byteLength(transformed)
+  if (transformedBytes > MAX_TRANSFORMED_HTML_BYTES) {
+    return new Response('too large', { status: 413 })
+  }
 
   return new Response(transformed, {
     status: 200,
     headers: {
       'Content-Type': contentTypeForPath(target),
-      'Content-Length': String(Buffer.byteLength(transformed)),
+      'Content-Length': String(transformedBytes),
       'Cache-Control': 'no-cache',
+      'Content-Security-Policy': PREVIEW_HTML_CSP,
     },
   })
 }
@@ -230,7 +272,13 @@ async function servePreviewFsFile(
 export async function serveFileWithRange(
   target: string,
   reqHeaders?: Headers,
+  extraHeaders: Record<string, string> = {},
 ): Promise<Response> {
+  const responseHeaders = (
+    ['.html', '.htm'].includes(path.extname(target).toLowerCase())
+      ? { 'Content-Security-Policy': PREVIEW_HTML_CSP, ...extraHeaders }
+      : extraHeaders
+  )
   let stat: fs.Stats
   try {
     stat = fs.statSync(target)
@@ -255,6 +303,7 @@ export async function serveFileWithRange(
         'Content-Range': `bytes */${size}`,
         'Accept-Ranges': 'bytes',
         'Cache-Control': 'no-cache',
+        ...responseHeaders,
       },
     })
   }
@@ -271,6 +320,7 @@ export async function serveFileWithRange(
         'Accept-Ranges': 'bytes',
         'Content-Length': String(end - start + 1),
         'Cache-Control': 'no-cache',
+        ...responseHeaders,
       },
     })
   }
@@ -283,6 +333,7 @@ export async function serveFileWithRange(
       'Content-Length': String(size),
       'Accept-Ranges': 'bytes',
       'Cache-Control': 'no-cache',
+      ...responseHeaders,
     },
   })
 }

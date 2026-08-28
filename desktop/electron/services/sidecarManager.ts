@@ -1,47 +1,45 @@
 import { spawn, spawnSync, type ChildProcessByStdio } from 'node:child_process'
-import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import {
+  constants as fsConstants,
+  closeSync,
+  existsSync,
+  fchmodSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import type { Readable } from 'node:stream'
 import http from 'node:http'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
+import { isBrowserSafePort } from '../../src/lib/browserSafePort'
 
 export const SERVER_BIND_HOST = '0.0.0.0'
 export const SERVER_CONTROL_HOST = '127.0.0.1'
 export const SERVER_STARTUP_TIMEOUT_MS = 30_000
 export const SERVER_STARTUP_LOG_LIMIT = 80
+export const HOST_DIAGNOSTICS_LINE_LIMIT = 80
+export const HOST_DIAGNOSTICS_BYTE_LIMIT = 256 * 1024
+export const ELECTRON_DIAGNOSTICS_FILE_ENV = 'CC_HAHA_ELECTRON_DIAGNOSTICS_FILE'
+export const RIPGREP_PATH_ENV = 'CC_HAHA_RIPGREP_PATH'
+const HOST_DIAGNOSTICS_LINE_BYTE_LIMIT = 4096
 // Shared with the Tauri shell (src-tauri/src/lib.rs) so both desktop builds
 // reuse the same sticky port across restarts (issue #767).
 export const SERVER_STATE_FILE = 'desktop-server-state.json'
 // Mirrors the server-side fixedPort range (h5AccessService MIN/MAX_FIXED_PORT).
 const MIN_FIXED_PORT = 1024
 const MAX_FIXED_PORT = 65535
-
-/**
- * Ports that Chromium refuses to connect to via fetch / WebSocket, because
- * they have historically been bound by other system services. See
- * https://chromium.googlesource.com/chromium/src/+/refs/heads/main/net/base/port_util.cc
- * for the canonical list. The renderer sidecar server's `h5Access.fixedPort`
- * defaults to 6566 in settings.json, but 6566 is on this list, so the
- * renderer reports `net::ERR_UNSAFE_PORT` and the chat stream never
- * establishes — even though Node's `http.request` and `Bun.serve` are happy
- * with it. We filter the user's fixedPort through this list before the sidecar
- * tries to bind, falling back to an OS-assigned port so the UI comes up.
- */
-const CHROMIUM_UNSAFE_PORTS: ReadonlySet<number> = new Set([
-  1,    7,    9,    11,   13,   15,   17,   19,   20,   21,   22,
-  23,   25,   37,   42,   43,   53,   69,   77,   79,   87,   95,
-  101,  102,  103,  104,  109,  110,  111,  113,  115,  117,  119,
-  123,  135,  137,  139,  143,  161,  179,  389,  427,  465,  512,
-  513,  514,  515,  526,  530,  531,  532,  540,  548,  554,  556,
-  563,  587,  601,  636,  989,  990,  993,  995,  1719, 1720, 1723,
-  2049, 3659, 4045, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668,
-  6669, 6697, 10080,
-])
-
-export function isChromiumUnsafePort(port: number): boolean {
-  return CHROMIUM_UNSAFE_PORTS.has(port)
-}
+const MAX_PORT_RESERVATION_ATTEMPTS = 128
 
 export type SidecarChild = ChildProcessByStdio<null, Readable, Readable>
 
@@ -61,7 +59,11 @@ const PROXY_ENV_KEYS = [
   'HTTPS_PROXY',
   'http_proxy',
   'https_proxy',
+  'ALL_PROXY',
+  'all_proxy',
 ] as const
+export const SYSTEM_PROXY_BRIDGE_ENV = 'CC_HAHA_SYSTEM_PROXY_URL'
+export const SYSTEM_PROXY_ERROR_ENV = 'CC_HAHA_SYSTEM_PROXY_ERROR'
 const LOOPBACK_NO_PROXY_ENTRIES = ['localhost', '127.0.0.1', '::1'] as const
 
 export function resolveHostTriple(platform = process.platform, arch = process.arch): string {
@@ -79,13 +81,54 @@ export function resolveSidecarExecutable(desktopRoot: string, triple = resolveHo
   return process.platform === 'win32' ? `${base}.exe` : base
 }
 
+export function resolveBundledRipgrepExecutable(
+  desktopRoot: string,
+  triple = resolveHostTriple(),
+): string {
+  const extension = triple.includes('windows') ? '.exe' : ''
+  return path.join(desktopRoot, 'src-tauri', 'binaries', `rg${extension}`)
+}
+
+function withBundledRipgrepPath(
+  env: NodeJS.ProcessEnv,
+  desktopRoot: string,
+): NodeJS.ProcessEnv {
+  const bundledRipgrep = resolveBundledRipgrepExecutable(desktopRoot)
+  const explicitRipgrep = env[RIPGREP_PATH_ENV]?.trim()
+  const selectedRipgrep = explicitRipgrep && existsSync(explicitRipgrep)
+    ? explicitRipgrep
+    : existsSync(bundledRipgrep)
+      ? bundledRipgrep
+      : null
+  if (!selectedRipgrep) return env
+
+  const pathKey = process.platform === 'win32'
+    ? Object.keys(env).find(key => key.toLowerCase() === 'path') ?? 'Path'
+    : 'PATH'
+  const currentPath = env[pathKey] ?? ''
+  const ripgrepDirectory = path.dirname(selectedRipgrep)
+  const nextPath = currentPath
+    ? `${currentPath}${path.delimiter}${ripgrepDirectory}`
+    : ripgrepDirectory
+
+  return {
+    ...env,
+    [pathKey]: nextPath,
+    [RIPGREP_PATH_ENV]: explicitRipgrep || bundledRipgrep,
+  }
+}
+
 export function httpToWebSocketUrl(serverHttpUrl: string): string {
   if (serverHttpUrl.startsWith('http://')) return `ws://${serverHttpUrl.slice('http://'.length)}`
   if (serverHttpUrl.startsWith('https://')) return `wss://${serverHttpUrl.slice('https://'.length)}`
   return serverHttpUrl
 }
 
-export async function reserveLocalPort(bindHost = SERVER_BIND_HOST): Promise<number> {
+export type ReserveLocalPortDeps = {
+  reserveCandidate?: (bindHost: string) => Promise<number>
+}
+
+async function reserveLocalPortCandidate(bindHost: string): Promise<number> {
   return await new Promise((resolve, reject) => {
     const server = net.createServer()
     server.once('error', error => reject(error))
@@ -100,6 +143,19 @@ export async function reserveLocalPort(bindHost = SERVER_BIND_HOST): Promise<num
       })
     })
   })
+}
+
+export async function reserveLocalPort(
+  bindHost = SERVER_BIND_HOST,
+  deps: ReserveLocalPortDeps = {},
+): Promise<number> {
+  const reserveCandidate = deps.reserveCandidate ?? reserveLocalPortCandidate
+  for (let attempt = 0; attempt < MAX_PORT_RESERVATION_ATTEMPTS; attempt++) {
+    const port = await reserveCandidate(bindHost)
+    if (isBrowserSafePort(port)) return port
+    console.error(`[desktop] OS assigned browser-blocked server port ${port}; retrying`)
+  }
+  throw new Error('Could not reserve a browser-safe local port')
 }
 
 function canBindPort(bindHost: string, port: number): Promise<boolean> {
@@ -122,15 +178,32 @@ export async function reserveServerPort(
   preferred: number[],
 ): Promise<number> {
   for (const port of preferred) {
-    if (!Number.isInteger(port) || port <= 0 || port > 65535) continue
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+      console.error(`[desktop] preferred server port ${port} is invalid; skipping`)
+      continue
+    }
+    if (!isBrowserSafePort(port)) {
+      console.error(`[desktop] preferred server port ${port} is blocked by browser fetch; skipping`)
+      continue
+    }
     if (await canBindPort(bindHost, port)) return port
     console.error(`[desktop] preferred server port ${port} unavailable`)
   }
   return await reserveLocalPort(bindHost)
 }
 
-export function claudeConfigDir(env: NodeJS.ProcessEnv = process.env): string {
-  return env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude')
+export function claudeConfigDir(
+  env: NodeJS.ProcessEnv = process.env,
+  homeDir = os.homedir(),
+): string {
+  return env.CLAUDE_CONFIG_DIR || path.join(homeDir, '.claude')
+}
+
+export function electronHostDiagnosticsFile(
+  env: NodeJS.ProcessEnv = process.env,
+  homeDir = os.homedir(),
+): string {
+  return path.join(claudeConfigDir(env, homeDir), 'cc-haha', 'diagnostics', 'electron-host.log')
 }
 
 /** Parse h5Access.fixedPort out of cc-haha/settings.json contents. */
@@ -146,7 +219,7 @@ export function parseH5FixedPort(contents: string): number | null {
   if (!h5Access || typeof h5Access !== 'object') return null
   const port = (h5Access as Record<string, unknown>).fixedPort
   if (typeof port !== 'number' || !Number.isInteger(port)) return null
-  return port >= MIN_FIXED_PORT && port <= MAX_FIXED_PORT ? port : null
+  return port >= MIN_FIXED_PORT && port <= MAX_FIXED_PORT && isBrowserSafePort(port) ? port : null
 }
 
 export function readH5FixedPort(env: NodeJS.ProcessEnv = process.env): number | null {
@@ -165,7 +238,7 @@ export function readLastServerPort(env: NodeJS.ProcessEnv = process.env): number
     if (!state || typeof state !== 'object') return null
     const port = (state as Record<string, unknown>).lastPort
     if (typeof port !== 'number' || !Number.isInteger(port)) return null
-    return port > 0 && port <= 65535 ? port : null
+    return isBrowserSafePort(port) ? port : null
   } catch {
     return null
   }
@@ -185,152 +258,10 @@ export function writeLastServerPort(port: number, env: NodeJS.ProcessEnv = proce
 export function preferredServerPorts(env: NodeJS.ProcessEnv = process.env): number[] {
   const ports: number[] = []
   const fixedPort = readH5FixedPort(env)
-  if (fixedPort !== null) {
-    if (CHROMIUM_UNSAFE_PORTS.has(fixedPort)) {
-      // The renderer's fetch/WebSocket refuses to dial this port with
-      // `net::ERR_UNSAFE_PORT`. The sidecar would happily bind it, but the
-      // chat stream would never connect. Skip it so reserveServerPort falls
-      // through to an OS-assigned port that the UI can actually use.
-      console.error(
-        `[desktop] ignoring h5Access.fixedPort=${fixedPort} because Chromium blocks it as unsafe; ` +
-        'update cc-haha/settings.json to use a different port (>= 1024 and not in the unsafe list).',
-      )
-    } else {
-      ports.push(fixedPort)
-    }
-  }
+  if (fixedPort !== null) ports.push(fixedPort)
   const lastPort = readLastServerPort(env)
-  if (lastPort !== null && !ports.includes(lastPort)) {
-    if (!CHROMIUM_UNSAFE_PORTS.has(lastPort)) {
-      ports.push(lastPort)
-    }
-  }
+  if (lastPort !== null && !ports.includes(lastPort)) ports.push(lastPort)
   return ports
-}
-
-/**
- * One-shot health probe against an already-known server URL. Returns a
- * structured result instead of throwing so the IPC handler can surface a
- * stable error shape to the renderer. Uses raw `http.request` to skip
- * system-proxy resolution (#953 follow-up).
- */
-export async function probeServerHealth(
-  serverUrl: string,
-  timeoutMs = 2_000,
-): Promise<{ ok: true } | { ok: false, reason: string }> {
-  const baseUrl = serverUrl.replace(/\/+$/, '')
-  const healthUrl = `${baseUrl}/health`
-
-  const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), timeoutMs)
-  try {
-    const response = await getHealthResponse(healthUrl, controller.signal)
-    if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
-      return { ok: false, reason: `healthcheck returned ${response.statusCode}` }
-    }
-
-    const contentType = (response.headers['content-type'] ?? '').toString()
-    if (!contentType.toLowerCase().includes('application/json')) {
-      return { ok: false, reason: `healthcheck returned non-JSON response from ${healthUrl}` }
-    }
-
-    const rawBody = await readResponseBody(response)
-    let body: unknown = null
-    try {
-      body = JSON.parse(rawBody)
-    } catch {
-      return { ok: false, reason: `healthcheck returned non-JSON body from ${healthUrl}` }
-    }
-    if (!body || typeof body !== 'object' || !('status' in body) || body.status !== 'ok') {
-      return { ok: false, reason: `healthcheck returned invalid response from ${healthUrl}` }
-    }
-    return { ok: true }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    return { ok: false, reason: message }
-  } finally {
-    clearTimeout(timeout)
-  }
-}
-
-/**
- * Generic HTTP request handler for the IPC `runtime:http-request` channel.
- * Forwards arbitrary HTTP requests through `http.request` so the renderer
- * fetch can be patched to delegate loopback traffic here and bypass any
- * session proxy configuration that breaks 127.0.0.1 fetches in Electron
- * (#953 follow-up).
- */
-export async function performHttpRequest(payload: {
-  url: string
-  method?: string
-  headers?: Record<string, string>
-  body?: string
-  timeoutMs?: number
-}): Promise<{ status: number, statusText: string, headers: Record<string, string>, body: string }> {
-  const method = (payload.method ?? 'GET').toUpperCase()
-  const timeoutMs = payload.timeoutMs ?? 30_000
-  let parsed: URL
-  try {
-    parsed = new URL(payload.url)
-  } catch (error) {
-    throw new Error(`invalid http-request url: ${error instanceof Error ? error.message : String(error)}`)
-  }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new Error(`http-request only supports http(s), got ${parsed.protocol}`)
-  }
-
-  const host = parsed.hostname === 'localhost' ? '127.0.0.1' : parsed.hostname
-
-  return await new Promise((resolve, reject) => {
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), timeoutMs)
-    const request = http.request(
-      {
-        host,
-        port: parsed.port || (parsed.protocol === 'https:' ? '443' : '80'),
-        method,
-        path: parsed.pathname + parsed.search,
-        headers: payload.headers ?? {},
-      },
-      response => {
-        const chunks: Buffer[] = []
-        response.on('data', chunk => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)))
-        response.once('end', () => {
-          clearTimeout(timer)
-          const headers: Record<string, string> = {}
-          for (const [k, v] of Object.entries(response.headers)) {
-            if (Array.isArray(v)) headers[k] = v.join(', ')
-            else if (v !== undefined) headers[k] = String(v)
-          }
-          resolve({
-            status: response.statusCode ?? 0,
-            statusText: response.statusMessage ?? '',
-            headers,
-            body: Buffer.concat(chunks).toString('utf-8'),
-          })
-        })
-        response.once('error', error => {
-          clearTimeout(timer)
-          reject(error)
-        })
-      },
-    )
-
-    request.once('error', error => {
-      clearTimeout(timer)
-      reject(error)
-    })
-
-    controller.signal.addEventListener('abort', () => {
-      request.destroy(new Error('http-request timed out'))
-      reject(new Error('http-request timed out'))
-    }, { once: true })
-
-    if (payload.body !== undefined) {
-      request.write(payload.body)
-    }
-    request.end()
-  })
 }
 
 export async function waitForServer(host: string, port: number, timeoutMs = SERVER_STARTUP_TIMEOUT_MS): Promise<void> {
@@ -353,101 +284,45 @@ export async function waitForServer(host: string, port: number, timeoutMs = SERV
 }
 
 async function assertServerHealth(healthUrl: string, timeoutMs: number): Promise<void> {
-  const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), timeoutMs)
-  try {
-    const response = await getHealthResponse(healthUrl, controller.signal)
-    if (response.statusCode === undefined || response.statusCode >= 500) {
-      throw new Error(`healthcheck returned ${response.statusCode ?? 'no-status'}`)
-    }
-    if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
-      throw new Error(`healthcheck returned ${response.statusCode}`)
-    }
-
-    const contentType = (response.headers['content-type'] ?? '').toString()
-    if (!contentType.toLowerCase().includes('application/json')) {
-      throw new Error(`healthcheck returned non-JSON response from ${healthUrl}`)
-    }
-
-    const rawBody = await readResponseBody(response)
-    let body: unknown = null
-    try {
-      body = JSON.parse(rawBody)
-    } catch {
-      throw new Error(`healthcheck returned non-JSON body from ${healthUrl}`)
-    }
-    if (!body || typeof body !== 'object' || !('status' in body) || body.status !== 'ok') {
-      throw new Error(`healthcheck returned invalid response from ${healthUrl}`)
-    }
-  } finally {
-    clearTimeout(timeout)
-  }
-}
-
-/**
- * Probe the sidecar via `http.request` rather than `globalThis.fetch`.
- * The Electron main-process fetch (undici) honors HTTP_PROXY / HTTPS_PROXY /
- * PAC; on corp networks it can refuse to dial loopback for several seconds,
- * past the startup timeout (#953 follow-up). `http.request` skips proxy env
- * entirely and is sufficient for a tiny /health JSON check. Also pins the
- * hostname to IPv4 loopback when given `localhost` to avoid IPv6 routing
- * quirks on Windows.
- */
-function getHealthResponse(
-  healthUrl: string,
-  signal: AbortSignal,
-): Promise<http.IncomingMessage> {
-  return new Promise((resolve, reject) => {
-    let parsed: URL
-    try {
-      parsed = new URL(healthUrl)
-    } catch (error) {
-      reject(error instanceof Error ? error : new Error(String(error)))
-      return
-    }
-    if (parsed.protocol !== 'http:') {
-      reject(new Error(`healthcheck only supports http URLs, got ${parsed.protocol}`))
-      return
-    }
-
-    const host = parsed.hostname === 'localhost' ? '127.0.0.1' : parsed.hostname
-
-    const request = http.request(
-      {
-        host,
-        port: parsed.port,
-        method: 'GET',
-        path: parsed.pathname + parsed.search,
-        headers: {
-          Accept: 'application/json',
-          'Cache-Control': 'no-store',
-        },
+  await new Promise<void>((resolve, reject) => {
+    const request = http.get(healthUrl, {
+      agent: false,
+      headers: {
+        Accept: 'application/json',
+        Connection: 'close',
       },
-      response => {
-        response.once('error', reject)
-        resolve(response)
-      },
-    )
+    }, response => {
+      const chunks: Buffer[] = []
+      response.on('data', chunk => chunks.push(Buffer.from(chunk)))
+      response.on('error', reject)
+      response.on('end', () => {
+        if (response.statusCode === undefined || response.statusCode < 200 || response.statusCode >= 300) {
+          reject(new Error(`healthcheck returned ${response.statusCode ?? 'no status'}`))
+          return
+        }
 
-    request.once('error', reject)
-    signal.addEventListener(
-      'abort',
-      () => {
-        request.destroy(new Error('healthcheck aborted'))
-        reject(new Error('healthcheck aborted'))
-      },
-      { once: true },
-    )
-    request.end()
-  })
-}
+        const contentType = response.headers['content-type'] ?? ''
+        if (!contentType.toLowerCase().includes('application/json')) {
+          reject(new Error(`healthcheck returned non-JSON response from ${healthUrl}`))
+          return
+        }
 
-function readResponseBody(response: http.IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = []
-    response.on('data', chunk => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)))
-    response.once('end', () => resolve(Buffer.concat(chunks).toString('utf-8')))
-    response.once('error', reject)
+        try {
+          const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown
+          if (!body || typeof body !== 'object' || !('status' in body) || body.status !== 'ok') {
+            reject(new Error(`healthcheck returned invalid response from ${healthUrl}`))
+            return
+          }
+          resolve()
+        } catch {
+          reject(new Error(`healthcheck returned invalid response from ${healthUrl}`))
+        }
+      })
+    })
+    request.setTimeout(timeoutMs, () => {
+      request.destroy(new Error(`healthcheck timed out after ${timeoutMs}ms`))
+    })
+    request.on('error', reject)
   })
 }
 
@@ -456,10 +331,207 @@ function sleep(ms: number): Promise<void> {
 }
 
 export function pushStartupLog(logs: string[], line: string) {
-  const trimmed = line.trimEnd()
+  const trimmed = sanitizeHostDiagnostic(line, os.homedir())
   if (!trimmed) return
   if (logs.length >= SERVER_STARTUP_LOG_LIMIT) logs.shift()
   logs.push(trimmed)
+}
+
+export function appendHostDiagnostic(
+  filePath: string | undefined,
+  line: string,
+  { homeDir = os.homedir() }: { homeDir?: string } = {},
+): void {
+  if (!filePath) return
+  const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`
+  let tempDescriptor: number | undefined
+  try {
+    const sanitized = sanitizeHostDiagnostic(line, homeDir)
+    if (!sanitized) return
+    const diagnosticsDir = path.dirname(filePath)
+    ensurePrivateHostDiagnosticsDirectory(diagnosticsDir)
+    assertRegularHostDiagnosticsFileOrMissing(filePath)
+    const existing = readHostDiagnosticsTail(filePath)
+    const lines = existing.trimEnd()
+      ? existing.trimEnd().split('\n').map(entry => sanitizeHostDiagnostic(entry, homeDir)).filter(Boolean)
+      : []
+    lines.push(sanitized)
+    const boundedLines: string[] = []
+    let retainedBytes = 0
+    for (const entry of lines.slice(-HOST_DIAGNOSTICS_LINE_LIMIT).reverse()) {
+      const entryBytes = Buffer.byteLength(entry, 'utf-8') + 1
+      if (retainedBytes + entryBytes > HOST_DIAGNOSTICS_BYTE_LIMIT) break
+      boundedLines.unshift(entry)
+      retainedBytes += entryBytes
+    }
+    const noFollow = process.platform === 'win32' ? 0 : fsConstants.O_NOFOLLOW
+    tempDescriptor = openSync(
+      tempPath,
+      fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | noFollow,
+      0o600,
+    )
+    if (!fstatSync(tempDescriptor).isFile()) {
+      throw new Error(`Refusing non-regular Electron diagnostics file: ${tempPath}`)
+    }
+    if (process.platform !== 'win32') fchmodSync(tempDescriptor, 0o600)
+    writeFileSync(tempDescriptor, `${boundedLines.join('\n')}\n`, 'utf-8')
+    closeSync(tempDescriptor)
+    tempDescriptor = undefined
+    ensurePrivateHostDiagnosticsDirectory(diagnosticsDir)
+    assertRegularHostDiagnosticsFileOrMissing(filePath)
+    renameSync(tempPath, filePath)
+  } catch {
+    if (tempDescriptor !== undefined) {
+      try {
+        closeSync(tempDescriptor)
+      } catch {
+        // Best-effort cleanup must not mask the original diagnostics failure.
+      }
+    }
+    try {
+      rmSync(tempPath, { force: true })
+    } catch {
+      // Best-effort cleanup must not mask the original diagnostics failure.
+    }
+    console.error('[desktop] failed to persist Electron host diagnostics')
+  }
+}
+
+function ensurePrivateHostDiagnosticsDirectory(directory: string): void {
+  const parent = path.dirname(directory)
+  const rootBoundary = path.basename(directory) === 'diagnostics' &&
+      path.basename(parent) === 'cc-haha'
+    ? path.dirname(parent)
+    : parent
+  mkdirSync(rootBoundary, { recursive: true, mode: 0o700 })
+  const boundaryStats = lstatSync(rootBoundary)
+  if (
+    (!boundaryStats.isDirectory() && !boundaryStats.isSymbolicLink()) ||
+    (boundaryStats.isSymbolicLink() && !statSync(rootBoundary).isDirectory())
+  ) {
+    throw new Error(`Refusing non-directory Electron diagnostics root: ${rootBoundary}`)
+  }
+  const rootRealPath = realpathSync(rootBoundary)
+  const relative = path.relative(rootBoundary, directory)
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`Refusing Electron diagnostics directory outside its managed root: ${directory}`)
+  }
+
+  let current = rootBoundary
+  for (const segment of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment)
+    let stats
+    try {
+      stats = lstatSync(current)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      try {
+        mkdirSync(current, { mode: 0o700 })
+      } catch (mkdirError) {
+        if ((mkdirError as NodeJS.ErrnoException).code !== 'EEXIST') throw mkdirError
+      }
+      stats = lstatSync(current)
+    }
+    if (stats.isSymbolicLink()) {
+      throw new Error(`Refusing symbolic link for Electron diagnostics directory: ${current}`)
+    }
+    if (!stats.isDirectory()) {
+      throw new Error(`Refusing non-directory Electron diagnostics path: ${current}`)
+    }
+    const currentRealPath = realpathSync(current)
+    const realRelative = path.relative(rootRealPath, currentRealPath)
+    if (
+      realRelative === '..' ||
+      realRelative.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(realRelative)
+    ) {
+      throw new Error(`Refusing Electron diagnostics directory outside its managed root: ${current}`)
+    }
+  }
+
+  const finalStats = lstatSync(directory)
+  if (finalStats.isSymbolicLink() || !finalStats.isDirectory()) {
+    throw new Error(`Refusing unsafe Electron diagnostics directory: ${directory}`)
+  }
+  if (process.platform !== 'win32') {
+    const descriptor = openSync(
+      directory,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+    )
+    try {
+      if (!fstatSync(descriptor).isDirectory()) {
+        throw new Error(`Refusing non-directory Electron diagnostics path: ${directory}`)
+      }
+      fchmodSync(descriptor, 0o700)
+    } finally {
+      closeSync(descriptor)
+    }
+  }
+}
+
+function assertRegularHostDiagnosticsFileOrMissing(filePath: string): void {
+  try {
+    const stats = lstatSync(filePath)
+    if (stats.isSymbolicLink()) {
+      throw new Error(`Refusing symbolic link for Electron diagnostics file: ${filePath}`)
+    }
+    if (!stats.isFile()) {
+      throw new Error(`Refusing non-regular Electron diagnostics file: ${filePath}`)
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+}
+
+function readHostDiagnosticsTail(filePath: string): string {
+  let descriptor: number | undefined
+  try {
+    const noFollow = process.platform === 'win32' ? 0 : fsConstants.O_NOFOLLOW
+    descriptor = openSync(filePath, fsConstants.O_RDONLY | noFollow)
+    const size = fstatSync(descriptor).size
+    const length = Math.min(size, HOST_DIAGNOSTICS_BYTE_LIMIT)
+    const buffer = Buffer.alloc(length)
+    const bytesRead = readSync(descriptor, buffer, 0, length, size - length)
+    const tail = buffer.subarray(0, bytesRead).toString('utf-8')
+    if (size <= length) return tail
+    const firstNewline = tail.indexOf('\n')
+    return firstNewline >= 0 ? tail.slice(firstNewline + 1) : ''
+  } catch {
+    return ''
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor)
+  }
+}
+
+export function sanitizeHostDiagnostic(line: string, homeDir = os.homedir()): string {
+  let sanitized = line
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/https?:\/\/[^\s<>"')\]}]+/gi, candidate => sanitizeUrlUserinfo(candidate))
+    .replace(/\bBearer\s+[^\s,;]+/gi, 'Bearer [REDACTED]')
+    .replace(
+      /\b((?:(?:[a-z0-9]+_)*(?:api[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|session[_-]?token|password|secret))\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
+      '$1[REDACTED]',
+    )
+    .replace(/\b(?:sk-(?:ant-api03-|proj-)?|ghp_)[A-Za-z0-9_-]{8,}\b/g, '[REDACTED]')
+    .trimEnd()
+  if (homeDir) sanitized = sanitized.replaceAll(homeDir, '[HOME]')
+  return truncateUtf8(sanitized, HOST_DIAGNOSTICS_LINE_BYTE_LIMIT)
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  const buffer = Buffer.from(value, 'utf-8')
+  if (buffer.byteLength <= maxBytes) return value
+  return buffer.subarray(0, maxBytes).toString('utf-8').replace(/\uFFFD$/, '')
+}
+
+function sanitizeUrlUserinfo(candidate: string): string {
+  try {
+    const url = new URL(candidate)
+    if (!url.username && !url.password) return candidate
+    return `${url.protocol}//[REDACTED]@${url.host}${url.pathname}${url.search}${url.hash}`
+  } catch {
+    return '[REDACTED_URL]'
+  }
 }
 
 export function formatStartupError(message: string, logs: string[]): string {
@@ -469,46 +541,51 @@ export function formatStartupError(message: string, logs: string[]): string {
   return `${message}\n\nRecent server logs:\n${logText}`
 }
 
-export function proxyUrlFromElectronProxyRules(rules: string | undefined): string | undefined {
-  if (!rules) return undefined
-
-  for (const rawRule of rules.split(';')) {
-    const rule = rawRule.trim()
-    if (!rule || /^DIRECT$/i.test(rule)) continue
-
-    const match = rule.match(/^(PROXY|HTTPS)\s+(.+)$/i)
-    if (!match) continue
-
-    const scheme = match[1]!.toUpperCase() === 'HTTPS' ? 'https' : 'http'
-    const hostPort = match[2]!.trim()
-    if (!hostPort) continue
-
-    return `${scheme}://${hostPort}`
-  }
-
-  return undefined
+export function clearProxyEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = { ...baseEnv }
+  for (const key of PROXY_ENV_KEYS) delete env[key]
+  delete env[SYSTEM_PROXY_BRIDGE_ENV]
+  delete env[SYSTEM_PROXY_ERROR_ENV]
+  const noProxy = mergeLoopbackNoProxy(env.no_proxy || env.NO_PROXY)
+  return { ...env, NO_PROXY: noProxy, no_proxy: noProxy }
 }
 
-export function mergeProxyEnv(
+export function withSystemProxyBridgeEnv(
   baseEnv: NodeJS.ProcessEnv,
-  proxyUrl: string | undefined,
+  bridgeUrl: string,
 ): NodeJS.ProcessEnv {
-  if (!proxyUrl) return baseEnv
-  if (PROXY_ENV_KEYS.some(key => baseEnv[key])) {
-    const noProxy = mergeLoopbackNoProxy(baseEnv.no_proxy || baseEnv.NO_PROXY)
-    return { ...baseEnv, NO_PROXY: noProxy, no_proxy: noProxy }
-  }
-
-  const noProxy = mergeLoopbackNoProxy(baseEnv.no_proxy || baseEnv.NO_PROXY)
-
   return {
-    ...baseEnv,
-    HTTP_PROXY: proxyUrl,
-    HTTPS_PROXY: proxyUrl,
-    http_proxy: proxyUrl,
-    https_proxy: proxyUrl,
-    NO_PROXY: noProxy,
-    no_proxy: noProxy,
+    ...clearProxyEnv(baseEnv),
+    [SYSTEM_PROXY_BRIDGE_ENV]: bridgeUrl,
+  }
+}
+
+export function withSystemProxyErrorEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  error: unknown,
+): NodeJS.ProcessEnv {
+  const message = error instanceof Error ? error.message : String(error)
+  const sanitized = sanitizeHostDiagnostic(message).replace(/\s+/g, ' ').trim()
+    || 'unknown bridge startup error'
+  return {
+    ...clearProxyEnv(baseEnv),
+    [SYSTEM_PROXY_ERROR_ENV]: `System proxy bridge unavailable: ${sanitized}`,
+  }
+}
+
+export function withAdapterProxyBridgeEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  bridgeUrl: string,
+): NodeJS.ProcessEnv {
+  const env = clearProxyEnv(baseEnv)
+  return {
+    ...env,
+    HTTP_PROXY: bridgeUrl,
+    HTTPS_PROXY: bridgeUrl,
+    http_proxy: bridgeUrl,
+    https_proxy: bridgeUrl,
+    ALL_PROXY: bridgeUrl,
+    all_proxy: bridgeUrl,
   }
 }
 
@@ -582,7 +659,7 @@ export function createServerPlan({
   return {
     command: resolveSidecarExecutable(desktopRoot),
     args: ['server', '--app-root', appRoot, '--host', bindHost, '--port', String(port)],
-    env: buildSidecarEnv(env, h5DistDir),
+    env: buildSidecarEnv(withBundledRipgrepPath(env, desktopRoot), h5DistDir),
   }
 }
 
@@ -605,7 +682,7 @@ export function createAdapterPlan({
     command: resolveSidecarExecutable(desktopRoot),
     args: ['adapters', '--app-root', appRoot, flag],
     env: {
-      ...buildSidecarEnv(env, h5DistDir),
+      ...buildSidecarEnv(withBundledRipgrepPath(env, desktopRoot), h5DistDir),
       ADAPTER_SERVER_URL: httpToWebSocketUrl(serverUrl),
     },
   }
@@ -625,8 +702,31 @@ export function spawnSidecar(plan: SidecarPlan, deps: SpawnSidecarDeps = {}): Si
 
 export type KillSidecarDeps = {
   platform?: NodeJS.Platform
+  env?: NodeJS.ProcessEnv
   spawnAsync?: typeof spawn
   spawnSyncFn?: typeof spawnSync
+}
+
+function getWindowsEnv(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const normalizedName = name.toLowerCase()
+  return Object.entries(env)
+    .find(([key, value]) => key.toLowerCase() === normalizedName && value)?.[1]
+}
+
+export function resolveWindowsTaskkillExecutable(env: NodeJS.ProcessEnv = process.env): string {
+  const systemRoot = getWindowsEnv(env, 'SystemRoot') ?? getWindowsEnv(env, 'windir')
+  return systemRoot
+    ? path.win32.join(systemRoot, 'System32', 'taskkill.exe')
+    : 'taskkill.exe'
+}
+
+function fallbackToDirectSidecarKill(child: SidecarChild, error: unknown) {
+  console.error('[desktop] taskkill failed; falling back to direct sidecar termination', error)
+  try {
+    child.kill()
+  } catch (fallbackError) {
+    console.error('[desktop] direct sidecar termination failed', fallbackError)
+  }
 }
 
 /**
@@ -638,10 +738,24 @@ export type KillSidecarDeps = {
 export function killSidecar(child: SidecarChild, sync = false, deps: KillSidecarDeps = {}) {
   const platform = deps.platform ?? process.platform
   if (platform === 'win32' && child.pid) {
+    const command = resolveWindowsTaskkillExecutable(deps.env)
     const args = ['/F', '/T', '/PID', String(child.pid)]
     const options = { stdio: 'ignore', windowsHide: true } as const
-    if (sync) (deps.spawnSyncFn ?? spawnSync)('taskkill', args, options)
-    else (deps.spawnAsync ?? spawn)('taskkill', args, options)
+    if (sync) {
+      try {
+        const result = (deps.spawnSyncFn ?? spawnSync)(command, args, options)
+        if (result.error) fallbackToDirectSidecarKill(child, result.error)
+      } catch (error) {
+        fallbackToDirectSidecarKill(child, error)
+      }
+    } else {
+      try {
+        const killer = (deps.spawnAsync ?? spawn)(command, args, options)
+        killer.once('error', error => fallbackToDirectSidecarKill(child, error))
+      } catch (error) {
+        fallbackToDirectSidecarKill(child, error)
+      }
+    }
     return
   }
   child.kill()

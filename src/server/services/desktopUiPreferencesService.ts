@@ -6,12 +6,21 @@ import { ApiError } from '../middleware/errorHandler.js'
 import { readRecoverableJsonFile } from './recoverableJsonFile.js'
 import { ensurePersistentStorageUpgraded } from './persistentStorageMigrations.js'
 
-const CURRENT_DESKTOP_UI_PREFERENCES_SCHEMA_VERSION = 2
+const CURRENT_DESKTOP_UI_PREFERENCES_SCHEMA_VERSION = 5
 const MAX_PROJECT_PREFERENCE_ENTRIES = 2_000
+const MAX_PROJECT_DISPLAY_NAME_ENTRIES = 2_000
+const MAX_PROJECT_DISPLAY_NAME_KEY_LENGTH = 4_096
+const MAX_PROJECT_DISPLAY_NAME_LENGTH = 80
 const MAX_PROFILE_DISPLAY_NAME_LENGTH = 80
 const MAX_PROFILE_SUBTITLE_LENGTH = 160
 const MAX_PROFILE_AVATAR_BYTES = 2_000_000
+const MAX_PET_ID_LENGTH = 80
+const MIN_PET_SIZE = 96
+const MAX_PET_SIZE = 192
+const DEFAULT_PET_SIZE = 144
+const MAX_PET_SESSION_ID_LENGTH = 200
 const DEFAULT_PROFILE_SUBTITLE = 'github.com/NanmiCoder/cc-haha'
+const DEFAULT_PET_ID = 'dada-code'
 
 const AVATAR_CONTENT_TYPES = {
   'image/png': { extension: 'png', mediaType: 'image/png' },
@@ -34,10 +43,24 @@ export type DesktopProfilePreferences = {
   avatarUpdatedAt: string | null
 }
 
+export type DesktopPetPreferences = {
+  enabled: boolean
+  selectedPetId: string
+  size: number
+  showTaskPanel: boolean
+  collapsed: boolean
+  motionEnabled: boolean
+  lastSessionId: string | null
+}
+
+export type ProjectDisplayNames = Record<string, string>
+
 export type DesktopUiPreferences = {
   schemaVersion: number
   sidebar: SidebarProjectPreferences
   profile: DesktopProfilePreferences
+  pet: DesktopPetPreferences
+  projectDisplayNames: ProjectDisplayNames
   [key: string]: unknown
 }
 
@@ -61,11 +84,27 @@ const DEFAULT_PROFILE_PREFERENCES: DesktopProfilePreferences = {
   avatarUpdatedAt: null,
 }
 
+const DEFAULT_PET_PREFERENCES: DesktopPetPreferences = {
+  enabled: false,
+  selectedPetId: DEFAULT_PET_ID,
+  size: DEFAULT_PET_SIZE,
+  showTaskPanel: false,
+  collapsed: false,
+  motionEnabled: true,
+  lastSessionId: null,
+}
+
+function createProjectDisplayNames(): ProjectDisplayNames {
+  return Object.fromEntries([]) as ProjectDisplayNames
+}
+
 function defaultPreferences(): DesktopUiPreferences {
   return {
     schemaVersion: CURRENT_DESKTOP_UI_PREFERENCES_SCHEMA_VERSION,
     sidebar: { ...DEFAULT_SIDEBAR_PROJECT_PREFERENCES },
     profile: { ...DEFAULT_PROFILE_PREFERENCES },
+    pet: { ...DEFAULT_PET_PREFERENCES },
+    projectDisplayNames: createProjectDisplayNames(),
   }
 }
 
@@ -84,6 +123,81 @@ function normalizeStringArray(value: unknown): string[] {
   return normalized
 }
 
+function isValidProjectDisplayNameKey(value: unknown): value is string {
+  return typeof value === 'string' &&
+    value.length > 0 &&
+    value.trim().length > 0 &&
+    value.length <= MAX_PROJECT_DISPLAY_NAME_KEY_LENGTH
+}
+
+function normalizeProjectDisplayName(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const normalized = value.trim().replace(/\s+/g, ' ')
+  if (normalized.length === 0 || normalized.length > MAX_PROJECT_DISPLAY_NAME_LENGTH) {
+    return null
+  }
+  return normalized
+}
+
+function setProjectDisplayName(
+  projectDisplayNames: ProjectDisplayNames,
+  projectKey: string,
+  displayName: string,
+): void {
+  Object.defineProperty(projectDisplayNames, projectKey, {
+    value: displayName,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  })
+}
+
+export function normalizeProjectDisplayNames(value: unknown): ProjectDisplayNames {
+  const normalized = createProjectDisplayNames()
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return normalized
+
+  let entryCount = 0
+  for (const [projectKey, displayName] of Object.entries(value)) {
+    if (!isValidProjectDisplayNameKey(projectKey)) continue
+    const normalizedDisplayName = normalizeProjectDisplayName(displayName)
+    if (!normalizedDisplayName) continue
+
+    setProjectDisplayName(normalized, projectKey, normalizedDisplayName)
+    entryCount += 1
+    if (entryCount >= MAX_PROJECT_DISPLAY_NAME_ENTRIES) break
+  }
+
+  return normalized
+}
+
+function validateProjectDisplayNameUpdate(value: unknown): {
+  projectKey: string
+  displayName: string | null
+} {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw ApiError.badRequest('Project display name update must be an object')
+  }
+
+  const patch = value as Record<string, unknown>
+  if (!isValidProjectDisplayNameKey(patch.projectKey)) {
+    throw ApiError.badRequest(
+      `projectKey must be a non-empty string up to ${MAX_PROJECT_DISPLAY_NAME_KEY_LENGTH} characters`,
+    )
+  }
+  if (patch.displayName === null) {
+    return { projectKey: patch.projectKey, displayName: null }
+  }
+
+  const displayName = normalizeProjectDisplayName(patch.displayName)
+  if (!displayName) {
+    throw ApiError.badRequest(
+      `displayName must be a non-empty string up to ${MAX_PROJECT_DISPLAY_NAME_LENGTH} characters`,
+    )
+  }
+
+  return { projectKey: patch.projectKey, displayName }
+}
+
 export function normalizeSidebarProjectPreferences(value: unknown): SidebarProjectPreferences {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return { ...DEFAULT_SIDEBAR_PROJECT_PREFERENCES }
@@ -91,6 +205,7 @@ export function normalizeSidebarProjectPreferences(value: unknown): SidebarProje
 
   const record = value as Record<string, unknown>
   return {
+    ...record,
     projectOrder: normalizeStringArray(record.projectOrder),
     pinnedProjects: normalizeStringArray(record.pinnedProjects),
     hiddenProjects: normalizeStringArray(record.hiddenProjects),
@@ -126,10 +241,79 @@ function normalizeProfilePreferences(value: unknown): DesktopProfilePreferences 
 
   const record = value as Record<string, unknown>
   return {
+    ...record,
     displayName: normalizeProfileDisplayName(record.displayName),
     subtitle: normalizeProfileSubtitle(record.subtitle),
     avatarFile: normalizeAvatarFile(record.avatarFile),
     avatarUpdatedAt: typeof record.avatarUpdatedAt === 'string' ? record.avatarUpdatedAt : null,
+  }
+}
+
+function validateProfilePreferencesPatch(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw ApiError.badRequest('Profile preferences must be an object')
+  }
+  const patch = value as Record<string, unknown>
+  for (const [field, maxLength] of [
+    ['displayName', MAX_PROFILE_DISPLAY_NAME_LENGTH],
+    ['subtitle', MAX_PROFILE_SUBTITLE_LENGTH],
+  ] as const) {
+    if (!Object.prototype.hasOwnProperty.call(patch, field)) continue
+    const candidate = patch[field]
+    if (typeof candidate !== 'string') {
+      throw ApiError.badRequest(`${field} must be a string`)
+    }
+    const normalized = candidate.trim().replace(/\s+/g, ' ')
+    if (normalized.length === 0 || normalized.length > maxLength) {
+      throw ApiError.badRequest(`${field} must be between 1 and ${maxLength} characters`)
+    }
+  }
+  return patch
+}
+
+function normalizePetId(value: unknown): string {
+  if (typeof value !== 'string') return DEFAULT_PET_ID
+  const trimmed = value.trim()
+  if (
+    trimmed.length === 0 ||
+    trimmed.length > MAX_PET_ID_LENGTH ||
+    !/^(?:custom:)?[a-z0-9]+(?:-[a-z0-9]+)*$/.test(trimmed)
+  ) {
+    return DEFAULT_PET_ID
+  }
+  return trimmed
+}
+
+function normalizePetSize(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isInteger(value)) return DEFAULT_PET_SIZE
+  return Math.min(MAX_PET_SIZE, Math.max(MIN_PET_SIZE, value))
+}
+
+function normalizePetSessionId(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed.slice(0, MAX_PET_SESSION_ID_LENGTH) : null
+}
+
+export function normalizeDesktopPetPreferences(value: unknown): DesktopPetPreferences {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return { ...DEFAULT_PET_PREFERENCES }
+  }
+
+  const record = value as Record<string, unknown>
+  return {
+    ...record,
+    enabled: typeof record.enabled === 'boolean' ? record.enabled : DEFAULT_PET_PREFERENCES.enabled,
+    selectedPetId: normalizePetId(record.selectedPetId),
+    size: normalizePetSize(record.size),
+    showTaskPanel: typeof record.showTaskPanel === 'boolean'
+      ? record.showTaskPanel
+      : DEFAULT_PET_PREFERENCES.showTaskPanel,
+    collapsed: typeof record.collapsed === 'boolean' ? record.collapsed : DEFAULT_PET_PREFERENCES.collapsed,
+    motionEnabled: typeof record.motionEnabled === 'boolean'
+      ? record.motionEnabled
+      : DEFAULT_PET_PREFERENCES.motionEnabled,
+    lastSessionId: normalizePetSessionId(record.lastSessionId),
   }
 }
 
@@ -147,11 +331,18 @@ function normalizeDesktopUiPreferences(value: unknown): DesktopUiPreferences | n
   }
 
   const record = value as Record<string, unknown>
+  const sourceSchemaVersion = record.schemaVersion
   return {
     ...record,
-    schemaVersion: CURRENT_DESKTOP_UI_PREFERENCES_SCHEMA_VERSION,
+    schemaVersion: typeof sourceSchemaVersion === 'number'
+      && Number.isSafeInteger(sourceSchemaVersion)
+      && sourceSchemaVersion > CURRENT_DESKTOP_UI_PREFERENCES_SCHEMA_VERSION
+      ? sourceSchemaVersion
+      : CURRENT_DESKTOP_UI_PREFERENCES_SCHEMA_VERSION,
     sidebar: normalizeSidebarProjectPreferences(record.sidebar),
     profile: normalizeProfilePreferences(record.profile),
+    pet: normalizeDesktopPetPreferences(record.pet),
+    projectDisplayNames: normalizeProjectDisplayNames(record.projectDisplayNames),
   }
 }
 
@@ -252,11 +443,19 @@ export class DesktopUiPreferencesService {
     const filePath = this.getPreferencesPath()
     return this.withWriteLock(filePath, async () => {
       const { preferences } = await this.readPreferences()
+      const sidebarPatch = sidebar && typeof sidebar === 'object' && !Array.isArray(sidebar)
+        ? sidebar as Record<string, unknown>
+        : {}
       const nextPreferences: DesktopUiPreferences = {
         ...preferences,
-        schemaVersion: CURRENT_DESKTOP_UI_PREFERENCES_SCHEMA_VERSION,
-        sidebar: normalizeSidebarProjectPreferences(sidebar),
+        schemaVersion: preferences.schemaVersion,
+        sidebar: normalizeSidebarProjectPreferences({
+          ...preferences.sidebar,
+          ...sidebarPatch,
+        }),
         profile: normalizeProfilePreferences(preferences.profile),
+        pet: normalizeDesktopPetPreferences(preferences.pet),
+        projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
       }
 
       await this.writePreferences(nextPreferences)
@@ -269,9 +468,7 @@ export class DesktopUiPreferencesService {
     return this.withWriteLock(filePath, async () => {
       const { preferences } = await this.readPreferences()
       const currentProfile = normalizeProfilePreferences(preferences.profile)
-      const patch = profile && typeof profile === 'object' && !Array.isArray(profile)
-        ? profile as Record<string, unknown>
-        : {}
+      const patch = validateProfilePreferencesPatch(profile)
       const nextProfile = normalizeProfilePreferences({
         ...currentProfile,
         displayName: Object.prototype.hasOwnProperty.call(patch, 'displayName')
@@ -283,13 +480,77 @@ export class DesktopUiPreferencesService {
       })
       const nextPreferences: DesktopUiPreferences = {
         ...preferences,
-        schemaVersion: CURRENT_DESKTOP_UI_PREFERENCES_SCHEMA_VERSION,
+        schemaVersion: preferences.schemaVersion,
         sidebar: normalizeSidebarProjectPreferences(preferences.sidebar),
         profile: {
           ...nextProfile,
           avatarFile: currentProfile.avatarFile,
           avatarUpdatedAt: currentProfile.avatarUpdatedAt,
         },
+        pet: normalizeDesktopPetPreferences(preferences.pet),
+        projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
+      }
+
+      await this.writePreferences(nextPreferences)
+      return nextPreferences
+    })
+  }
+
+  async updateProjectDisplayName(value: unknown): Promise<{
+    projectKey: string
+    displayName: string | null
+  }> {
+    const update = validateProjectDisplayNameUpdate(value)
+    const filePath = this.getPreferencesPath()
+    return this.withWriteLock(filePath, async () => {
+      const { preferences } = await this.readPreferences()
+      const projectDisplayNames = normalizeProjectDisplayNames(preferences.projectDisplayNames)
+      if (update.displayName === null) {
+        delete projectDisplayNames[update.projectKey]
+      } else {
+        if (
+          !Object.hasOwn(projectDisplayNames, update.projectKey) &&
+          Object.keys(projectDisplayNames).length >= MAX_PROJECT_DISPLAY_NAME_ENTRIES
+        ) {
+          throw ApiError.badRequest(
+            `Project display names cannot exceed ${MAX_PROJECT_DISPLAY_NAME_ENTRIES} entries`,
+          )
+        }
+        setProjectDisplayName(projectDisplayNames, update.projectKey, update.displayName)
+      }
+
+      const nextPreferences: DesktopUiPreferences = {
+        ...preferences,
+        schemaVersion: preferences.schemaVersion,
+        sidebar: normalizeSidebarProjectPreferences(preferences.sidebar),
+        profile: normalizeProfilePreferences(preferences.profile),
+        pet: normalizeDesktopPetPreferences(preferences.pet),
+        projectDisplayNames,
+      }
+
+      await this.writePreferences(nextPreferences)
+      return update
+    })
+  }
+
+  async updatePetPreferences(pet: unknown): Promise<DesktopUiPreferences> {
+    const filePath = this.getPreferencesPath()
+    return this.withWriteLock(filePath, async () => {
+      const { preferences } = await this.readPreferences()
+      const currentPet = normalizeDesktopPetPreferences(preferences.pet)
+      const patch = pet && typeof pet === 'object' && !Array.isArray(pet)
+        ? pet as Record<string, unknown>
+        : {}
+      const nextPreferences: DesktopUiPreferences = {
+        ...preferences,
+        schemaVersion: preferences.schemaVersion,
+        sidebar: normalizeSidebarProjectPreferences(preferences.sidebar),
+        profile: normalizeProfilePreferences(preferences.profile),
+        pet: normalizeDesktopPetPreferences({
+          ...currentPet,
+          ...patch,
+        }),
+        projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
       }
 
       await this.writePreferences(nextPreferences)
@@ -332,13 +593,15 @@ export class DesktopUiPreferencesService {
 
       const nextPreferences: DesktopUiPreferences = {
         ...preferences,
-        schemaVersion: CURRENT_DESKTOP_UI_PREFERENCES_SCHEMA_VERSION,
+        schemaVersion: preferences.schemaVersion,
         sidebar: normalizeSidebarProjectPreferences(preferences.sidebar),
         profile: {
           ...normalizeProfilePreferences(preferences.profile),
           avatarFile,
           avatarUpdatedAt: new Date().toISOString(),
         },
+        pet: normalizeDesktopPetPreferences(preferences.pet),
+        projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
       }
 
       await this.writePreferences(nextPreferences)
@@ -357,13 +620,15 @@ export class DesktopUiPreferencesService {
       )
       const nextPreferences: DesktopUiPreferences = {
         ...preferences,
-        schemaVersion: CURRENT_DESKTOP_UI_PREFERENCES_SCHEMA_VERSION,
+        schemaVersion: preferences.schemaVersion,
         sidebar: normalizeSidebarProjectPreferences(preferences.sidebar),
         profile: {
           ...normalizeProfilePreferences(preferences.profile),
           avatarFile: null,
           avatarUpdatedAt: null,
         },
+        pet: normalizeDesktopPetPreferences(preferences.pet),
+        projectDisplayNames: normalizeProjectDisplayNames(preferences.projectDisplayNames),
       }
 
       await this.writePreferences(nextPreferences)
