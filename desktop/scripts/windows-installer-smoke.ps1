@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
   [Parameter(Mandatory = $true)][string]$ArtifactsDir,
   [ValidateSet('x64')][string]$Arch = 'x64'
