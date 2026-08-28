@@ -16,8 +16,23 @@ describe('Electron renderer entry resolution', () => {
     expect(resolveRendererEntry({
       isPackaged: true,
       appRoot: '/Applications/Test.app/Contents/Resources/app.asar',
+      unpackedRoot: '/Applications/Test.app/Contents/Resources/app.asar.unpacked',
       env: { ELECTRON_RENDERER_URL: 'http://127.0.0.1:1420' },
-    })).toBe(path.join('/Applications/Test.app/Contents/Resources/app.asar', 'dist', 'index.html'))
+    })).toBe(path.join('/Applications/Test.app/Contents/Resources/app.asar.unpacked', 'dist', 'index.html'))
+  })
+
+  it('loads the renderer from the unpacked dist copy it ships via asarUnpack', () => {
+    // dist/** is asarUnpacked, and Electron's asar→unpacked remap breaks on
+    // Windows non-ASCII install paths (中文 安装目录 ERR_FILE_NOT_FOUND), so
+    // packaged builds must resolve dist/index.html under app.asar.unpacked.
+    const entry = resolveRendererEntry({
+      isPackaged: true,
+      appRoot: 'C:\\Program Files\\中文 安装目录\\Claude Code Haha\\resources\\app.asar',
+      unpackedRoot: 'C:\\Program Files\\中文 安装目录\\Claude Code Haha\\resources\\app.asar.unpacked',
+      env: {},
+    })
+    expect(entry).toContain('app.asar.unpacked')
+    expect(entry).not.toContain(`app.asar${path.sep}`)
   })
 
   it('rejects non-local development renderer URLs', () => {

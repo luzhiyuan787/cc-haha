@@ -131,6 +131,7 @@ function rendererEntry() {
   return resolveRendererEntry({
     isPackaged: app.isPackaged,
     appRoot: appRoot(),
+    unpackedRoot: unpackedRoot(),
     env: process.env,
   })
 }

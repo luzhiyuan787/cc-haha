@@ -3,6 +3,15 @@ import path from 'node:path'
 export type RendererEntryOptions = {
   isPackaged: boolean
   appRoot: string
+  /**
+   * `app.asar.unpacked` root for packaged builds. The renderer ships via
+   * `asarUnpack: ["dist/**"]` (the sidecar server reads it from disk for the
+   * h5 route), so loading it through the asar placeholder relies on Electron's
+   * asar→unpacked remap — which fails to resolve on Windows installs with
+   * non-ASCII paths. Pointing file:// directly at the unpacked copy skips
+   * that remap entirely.
+   */
+  unpackedRoot?: string
   env?: NodeJS.ProcessEnv
 }
 
@@ -27,5 +36,9 @@ export function resolveRendererEntry(options: RendererEntryOptions): string {
     }
     return devUrl
   }
-  return path.join(options.appRoot, 'dist', 'index.html')
+  return path.join(
+    options.unpackedRoot ?? options.appRoot,
+    'dist',
+    'index.html',
+  )
 }
