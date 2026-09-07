@@ -34,7 +34,6 @@ import {
   type SessionHeaderMetaItem,
 } from '@/components/chat/SessionChatSurface'
 import { getWorktreeDisplayName, WorktreeDetails } from '../components/chat/WorktreeDetails'
-import { ComputerUsePermissionModal } from '../components/chat/ComputerUsePermissionModal'
 import { WorkbenchPanel } from '../components/workbench/WorkbenchPanel'
 import { AgentTeamsStrip } from '../components/agentTeams/AgentTeamsSummary'
 import { snapshotWithHistoricalMembers } from '../components/agentTeams/agentTeamsModel'
@@ -321,7 +320,6 @@ export function ActiveSession() {
   const connectToSession = useChatStore((s) => s.connectToSession)
   const stopBackgroundTask = useChatStore((s) => s.stopBackgroundTask)
   const sessionState = useChatStore((s) => activeTabId ? s.sessions[activeTabId] : undefined)
-  const pendingComputerUsePermission = sessionState?.pendingComputerUsePermission ?? null
   const fetchSessionTasks = useCLITaskStore((s) => s.fetchSessionTasks)
   const trackedTaskSessionId = useCLITaskStore((s) => s.sessionId)
   const cliTasks = useCLITaskStore((s) => s.tasks)
@@ -517,8 +515,9 @@ export function ActiveSession() {
 
   const isActive = isPreparingTurn || chatState !== 'idle' || hasRunningBackgroundTasks
   const totalTokens = getTokenUsageTotal(tokenUsage)
-  const cachedTokens = (tokenUsage.cache_read_tokens ?? 0) +
-    (tokenUsage.cache_creation_tokens ?? 0)
+  const cacheReadTokens = tokenUsage.cache_read_tokens ?? 0
+  const cacheCreationTokens = tokenUsage.cache_creation_tokens ?? 0
+  const cachedTokens = cacheReadTokens + cacheCreationTokens
   useEffect(() => {
     if (!activeTabId) return
     pruneDismissedBackgroundTaskKeys(
@@ -706,10 +705,13 @@ export function ActiveSession() {
                 total: totalTokens.toLocaleString(),
                 input: tokenUsage.input_tokens.toLocaleString(),
                 output: tokenUsage.output_tokens.toLocaleString(),
-                cache: cachedTokens.toLocaleString(),
+                cacheRead: cacheReadTokens.toLocaleString(),
+                cacheWrite: cacheCreationTokens.toLocaleString(),
               })}
             >
-              {t('session.apiTokens', { count: formatTokenCount(totalTokens) })}
+              {t(cachedTokens > 0 ? 'session.apiTokensWithCache' : 'session.apiTokens', {
+                count: formatTokenCount(totalTokens),
+              })}
             </span>
           ),
         }
@@ -765,12 +767,6 @@ export function ActiveSession() {
           </aside>
         </>
       ) : null}
-      overlay={(
-        <ComputerUsePermissionModal
-          sessionId={activeTabId}
-          request={pendingComputerUsePermission?.request ?? null}
-        />
-      )}
     >
           {isEmpty ? (
             <div

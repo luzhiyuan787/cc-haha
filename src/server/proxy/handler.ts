@@ -33,6 +33,7 @@ import {
   type TraceBodySnapshot,
   type TraceProviderInfo,
 } from '../services/traceCaptureService.js'
+import { resolveModelReasoningProfile } from '../../shared/modelReasoning.js'
 
 const providerService = new ProviderService()
 
@@ -266,11 +267,12 @@ async function handleOpenaiChat(
   networkSettings: NetworkSettings,
   traceContext: ProxyTraceContext | null,
 ): Promise<Response> {
-  const deepSeekCompatible = shouldUseDeepSeekReasoningCompat(baseUrl)
+  const knownDeepSeekHost = shouldUseDeepSeekReasoningCompat(baseUrl)
+  const reasoningProfile = resolveModelReasoningProfile(body.model, 'openai_chat')
   const transformed = anthropicToOpenaiChat(body, {
-    roundTripReasoningContent: deepSeekCompatible,
-    passThinkingToggle: deepSeekCompatible,
-    imageContentMode: shouldUseTextOnlyOpenAIChatContent(baseUrl) ? 'text_only' : 'vision',
+    roundTripReasoningContent: knownDeepSeekHost || reasoningProfile?.family === 'deepseek-v4',
+    passThinkingToggle: knownDeepSeekHost,
+    imageContentMode: shouldUseTextOnlyOpenAIChatContent(baseUrl, body.model) ? 'text_only' : 'vision',
   })
   const url = `${baseUrl}/v1/chat/completions`
   const upstreamRequestHeaders = {
@@ -427,8 +429,24 @@ function shouldUseDeepSeekReasoningCompat(baseUrl: string): boolean {
   )
 }
 
-function shouldUseTextOnlyOpenAIChatContent(baseUrl: string): boolean {
-  return shouldUseDeepSeekReasoningCompat(baseUrl)
+function shouldUseTextOnlyOpenAIChatContent(baseUrl: string, model: string): boolean {
+  // DeepSeek's classic Chat endpoint accepts string content only.
+  if (/(^|[./-])deepseek([./-]|$)/i.test(baseUrl)) return true
+
+  // image_url inside a tool message is a gateway extension, not a universal
+  // Chat Completions contract. Only opt opencode models in when their id
+  // explicitly advertises vision capability; unknown gateway models stay safe.
+  if (/(^|[./-])opencode\.ai([:/]|$)/i.test(baseUrl)) {
+    return !hasExplicitVisionModelMarker(model)
+  }
+
+  // Preserve the existing behavior for generic compatible providers whose
+  // capabilities are not controlled by either compatibility policy above.
+  return false
+}
+
+function hasExplicitVisionModelMarker(model: string): boolean {
+  return /(^|[/:._-])vision([/:._-]|$)/i.test(model)
 }
 
 async function handleOpenaiResponses(

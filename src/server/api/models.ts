@@ -35,12 +35,16 @@ import {
 } from '../services/grokOfficialProvider.js'
 import { hahaGrokOAuthService } from '../services/hahaGrokOAuthService.js'
 import { resolveClaudeOfficialRuntimeModel } from '../services/claudeOfficialRuntime.js'
-import { getPresetDefaultEnv } from '../services/providerRuntimeEnv.js'
+import {
+  getPresetDefaultEnv,
+  getPresetReasoningProviderKind,
+} from '../services/providerRuntimeEnv.js'
 import {
   getModelReasoningCapabilityOverride,
   MODEL_REASONING_EFFORTS,
   resolveModelReasoningProfile,
   type ModelReasoningApiFormat,
+  type ModelReasoningProviderKind,
 } from '../../shared/modelReasoning.js'
 
 // ─── Fallback models (used when no provider is configured) ────────────────────
@@ -118,6 +122,7 @@ function buildProviderModelList(
   },
   apiFormat?: ModelReasoningApiFormat,
   presetDefaultEnv: Record<string, string> = {},
+  providerKind?: ModelReasoningProviderKind,
 ): ApiModelInfo[] {
   const modelList: ApiModelInfo[] = []
 
@@ -127,6 +132,7 @@ function buildProviderModelList(
           id,
           apiFormat,
           getModelReasoningCapabilityOverride(id, models, presetDefaultEnv),
+          providerKind,
         )
       : undefined
     return {
@@ -312,6 +318,7 @@ async function handleModelsList(): Promise<Response> {
       activeProvider.models,
       activeProvider.apiFormat,
       getPresetDefaultEnv(activeProvider.presetId),
+      getPresetReasoningProviderKind(activeProvider.presetId),
     )
     return Response.json({
       models: modelList,
@@ -389,6 +396,7 @@ async function handleCurrentModel(req: Request): Promise<Response> {
               activeProvider.models,
               activeProvider.apiFormat,
               getPresetDefaultEnv(activeProvider.presetId),
+              getPresetReasoningProviderKind(activeProvider.presetId),
             )
           : claudeOfficialModel
             ? [...DEFAULT_MODELS]

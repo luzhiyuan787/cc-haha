@@ -302,13 +302,13 @@ describe('ActiveSession task polling', () => {
     expect(screen.getByTestId('chat-input')).toHaveAttribute('data-variant', 'default')
   })
 
-  it('shows the session token badge when usage is cache-only', () => {
-    const sessionId = 'cache-only-token-session'
+  it('labels result usage that includes cache tokens without implying the Trace input/output total', async () => {
+    const sessionId = 'deepseek-cache-token-session'
 
     useSessionStore.setState({
       sessions: [{
         id: sessionId,
-        title: 'Cache Only Token Session',
+        title: 'DeepSeek Cache Token Session',
         createdAt: '2026-05-07T00:00:00.000Z',
         modifiedAt: '2026-05-07T00:00:00.000Z',
         messageCount: 1,
@@ -321,42 +321,35 @@ describe('ActiveSession task polling', () => {
       error: null,
     })
     useTabStore.setState({
-      tabs: [{ sessionId, title: 'Cache Only Token Session', type: 'session', status: 'idle' }],
+      tabs: [{ sessionId, title: 'DeepSeek Cache Token Session', type: 'session', status: 'idle' }],
       activeTabId: sessionId,
     })
     useChatStore.setState({
       sessions: {
         [sessionId]: {
-          messages: [],
-          chatState: 'idle',
+          ...createDefaultSessionState(),
           connectionState: 'connected',
-          streamingText: '',
-          streamingToolInput: '',
-          activeToolUseId: null,
-          activeToolName: null,
-          activeThinkingId: null,
-          pendingPermission: null,
-          pendingComputerUsePermission: null,
-          tokenUsage: {
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_tokens: 1200,
-            cache_creation_tokens: 300,
-          },
-          streamingResponseChars: 0,
-          elapsedSeconds: 0,
-          statusVerb: '',
-          slashCommands: [],
-          agentTaskNotifications: {},
-          elapsedTimer: null,
         },
       },
     })
-
     render(<ActiveSession />)
 
-    const tokenBadge = screen.getByTitle(/cache 1,500/i)
-    expect(tokenBadge).toHaveTextContent('1.5k API tokens')
+    await act(async () => {
+      useChatStore.getState().handleServerMessage(sessionId, {
+        type: 'message_complete',
+        usage: {
+          input_tokens: 107_600,
+          output_tokens: 11_400,
+          cache_read_tokens: 4_971_000,
+          cache_creation_tokens: 10_000,
+        },
+      })
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    const tokenBadge = screen.getByTitle(/cache read 4,971,000.*cache write 10,000/i)
+    expect(tokenBadge).toHaveTextContent('5.1m tokens incl. cache')
   })
 
   it('shows the worktree name in the header and reveals its directory on focus', async () => {

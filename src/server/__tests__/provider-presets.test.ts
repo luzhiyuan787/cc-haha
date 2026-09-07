@@ -94,10 +94,11 @@ describe('provider presets API', () => {
       { region: 'global_en', baseUrl: 'https://api.z.ai/api/anthropic' },
     ])
     expect(zhipu?.authStrategy).toBe('auth_token')
-    expect(zhipu?.defaultModels.main).toBe('glm-5.2[1m]')
-    expect(zhipu?.defaultModels.haiku).toBe('glm-4.7')
-    expect(zhipu?.defaultModels.sonnet).toBe('glm-5.2[1m]')
-    expect(zhipu?.defaultModels.opus).toBe('glm-5.2[1m]')
+    expect(zhipu?.reasoningProviderKind).toBe('zhipu_standard_api')
+    expect(zhipu?.defaultModels.main).toBe('glm-5.3[1m]')
+    expect(zhipu?.defaultModels.haiku).toBe('glm-5.3-flash[1m]')
+    expect(zhipu?.defaultModels.sonnet).toBe('glm-5.3[1m]')
+    expect(zhipu?.defaultModels.opus).toBe('glm-5.3[1m]')
     // Presets must not pin a provider-wide auto-compact window: the env is
     // model-agnostic, so it pinned small-context models at 1M and auto-compact
     // never fired (#1162). Real windows come from modelContextWindows instead.
@@ -197,6 +198,8 @@ describe('provider presets API', () => {
     expect(zhipu?.apiKeyUrl).toBe('https://www.bigmodel.cn/invite?icode=d41B2qi8Z5xNwTGLNPPF3OZLO2QH3C0EBTSr%2BArzMw4%3D')
     expect(zhipu?.promoText).toContain('cc-haha')
     expect(zhipu?.defaultEnv?.CC_HAHA_SEND_DISABLED_THINKING).toBeUndefined()
+    expect(zhipu?.modelContextWindows?.['glm-5.3']).toBe(1000000)
+    expect(zhipu?.modelContextWindows?.['glm-5.3-flash']).toBe(1000000)
     expect(zhipu?.modelContextWindows?.['glm-5.2']).toBe(1000000)
     expect(zhipu?.modelContextWindows?.['glm-5.1']).toBe(200000)
     expect(zhipu?.modelContextWindows?.['glm-4.7']).toBe(200000)
@@ -215,21 +218,21 @@ describe('provider presets API', () => {
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
     })
     expect(shengsuanyun?.modelContextWindows?.['anthropic/claude-opus-4.7']).toBe(1000000)
-    expect(xuanshuapi?.apiKeyUrl).toBe('https://www.xuanshuapi.com/register?aff=CC-HAHA&promo=CC-HAHA')
-    expect(xuanshuapi?.promoText).toContain('5 美元')
-    expect(xuanshuapi?.featured).toBe(true)
+    expect(xuanshuapi?.apiKeyUrl).toBeUndefined()
+    expect(xuanshuapi?.promoText).toBeUndefined()
+    expect(xuanshuapi?.featured).toBeUndefined()
     expect(xuanshuapi?.defaultEnv).toEqual({
       CLAUDE_CODE_SUBAGENT_MODEL: 'claude-sonnet-5',
     })
     expect(xuanshuapi?.modelContextWindows?.['claude-sonnet-5']).toBe(1000000)
-    expect(fennoai?.apiKeyUrl).toBe('https://api.fenno.ai/s/WD8c')
-    expect(fennoai?.promoText).toContain('1.99 美元')
-    expect(fennoai?.featured).toBe(true)
+    expect(fennoai?.apiKeyUrl).toBeUndefined()
+    expect(fennoai?.promoText).toBeUndefined()
+    expect(fennoai?.featured).toBeUndefined()
     expect(fennoai?.modelContextWindows?.['claude-sonnet-5']).toBe(1000000)
     expect(fennoai?.modelContextWindows?.['claude-haiku-4-5']).toBe(200000)
-    expect(qiniuai?.apiKeyUrl).toBe('https://s.qiniu.com/IZbyya')
-    expect(qiniuai?.promoText).toContain('Token')
-    expect(qiniuai?.featured).toBe(true)
+    expect(qiniuai?.apiKeyUrl).toBeUndefined()
+    expect(qiniuai?.promoText).toBeUndefined()
+    expect(qiniuai?.featured).toBeUndefined()
     expect(qiniuai?.modelContextWindows?.['deepseek/deepseek-v4-flash']).toBe(1000000)
     expect(qiniuai?.modelContextWindows?.['z-ai/glm-5.2']).toBe(1000000)
     expect(qiniuai?.modelContextWindows?.['moonshotai/kimi-k3']).toBe(262144)
@@ -276,7 +279,7 @@ describe('provider presets API', () => {
   })
 
   test('retired presets keep the runtime config saved providers resolve from them', () => {
-    for (const id of ['shengsuanyun', 'jiekouai']) {
+    for (const id of ['shengsuanyun', 'jiekouai', 'xuanshuapi', 'fennoai', 'qiniuai']) {
       const preset = PROVIDER_PRESETS.find((candidate) => candidate.id === id)
 
       expect(preset?.deprecated).toBe(true)

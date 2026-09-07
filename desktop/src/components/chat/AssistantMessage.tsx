@@ -13,6 +13,9 @@ import { InlineVideoGallery } from './InlineVideoGallery'
 import { AssistantOutputTargetCard } from './AssistantOutputTargetCard'
 import { openPreviewLink } from '../../lib/openPreviewLink'
 import { extractAssistantOutputTargets } from '../../lib/assistantOutputTargets'
+import { createAssistantMarkdownImageResolver } from '../../lib/markdownImages'
+import { getServerBaseUrl } from '../../lib/desktopRuntime'
+import { isManagedGeneratedImagePath } from '../../lib/attachmentImages'
 import { useWorkspacePanelStore } from '../../stores/workspacePanelStore'
 import { useTranslation, type TranslationKey } from '../../i18n'
 
@@ -97,6 +100,19 @@ export const AssistantMessage = memo(function AssistantMessage({
           ),
     [content, isStreaming, isTurnOutputOwner, sessionId, workDir, turnChangedFiles],
   )
+  const resolveAssistantImageSrc = useMemo(
+    () => {
+      if (isStreaming || !sessionId) return undefined
+      const resolveLocalImage = createAssistantMarkdownImageResolver({
+        baseUrl: getServerBaseUrl(),
+        sessionId,
+      })
+      return (src: string) => isManagedGeneratedImagePath(src)
+        ? null
+        : resolveLocalImage(src)
+    },
+    [isStreaming, sessionId],
+  )
 
   if (!content.trim()) return null
 
@@ -129,6 +145,7 @@ export const AssistantMessage = memo(function AssistantMessage({
             variant={documentLayout ? 'document' : 'default'}
             streaming={isStreaming}
             onLinkClick={sessionId ? handleLinkClick : undefined}
+            resolveImageSrc={resolveAssistantImageSrc}
           />
           {!isStreaming && (
             <InlineImageGallery

@@ -665,6 +665,9 @@ describe('trace capture service', () => {
     const trace = await traceCaptureService.getSessionTrace('session-corrupt')
 
     expect(trace.calls.map((call) => call.id)).toEqual(['call-valid'])
+    // Pre-semantic JSONL remains readable; the desktop falls back to parsing
+    // its complete raw body and retains the legacy path for truncated bodies.
+    expect(trace.calls[0].request.semantic).toBeUndefined()
     expect(trace.events.map((event) => event.id)).toEqual(['event-valid'])
     expect(trace.summary.apiCalls).toBe(1)
   })
@@ -1302,7 +1305,10 @@ describe('session trace API', () => {
     const body = await res.json() as {
       calls: Array<{
         usage?: { inputTokens: number; outputTokens: number }
-        request: { body: { preview: string; truncated: boolean; bytes: number; sha256: string } }
+        request: {
+          body: { preview: string; truncated: boolean; bytes: number; sha256: string }
+          semantic?: unknown
+        }
         response?: { body: { preview: string; truncated: boolean; bytes: number; sha256: string } }
       }>
     }
@@ -1314,8 +1320,10 @@ describe('session trace API', () => {
     expect(body.calls[0].response?.body.preview.length).toBe(2048)
     expect(body.calls[0].response?.body.truncated).toBe(true)
     expect(body.calls[0].usage).toEqual({ inputTokens: 10, outputTokens: 20 })
+    expect(body.calls[0].request.semantic).toBeUndefined()
 
     const stored = await traceCaptureService.getSessionTrace('session-trim-api')
+    expect(stored.calls[0].request.semantic?.request.messages).toHaveLength(1)
     expect(stored.calls[0].request.body.preview.length).toBeGreaterThan(2048)
     expect(stored.calls[0].request.body.truncated).toBe(false)
     expect(stored.calls[0].response?.body.preview.length).toBeGreaterThan(2048)
@@ -1359,7 +1367,7 @@ describe('session trace API', () => {
       call: {
         id: string
         usage?: { inputTokens: number; outputTokens: number }
-        request: { body: { preview: string; truncated: boolean } }
+        request: { body: { preview: string; truncated: boolean }; semantic?: { version: number } }
       }
     }
 
@@ -1368,6 +1376,7 @@ describe('session trace API', () => {
     expect(body.call.request.body.preview.length).toBeGreaterThan(2048)
     expect(body.call.request.body.truncated).toBe(false)
     expect(body.call.request.body.preview).toContain('full detail please')
+    expect(body.call.request.semantic?.version).toBe(1)
     expect(body.call.usage).toEqual({ inputTokens: 64, outputTokens: 16 })
   })
 

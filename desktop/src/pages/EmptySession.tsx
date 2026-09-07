@@ -6,6 +6,7 @@ import { IconButton } from '@/components/ui/IconButton'
 import { ApiError } from '../api/client'
 import { agentsApi } from '../api/agents'
 import { providersApi } from '../api/providers'
+import { getBundledPresetReasoningProviderKind } from '../config/providerPresets'
 import { skillsApi } from '../api/skills'
 import { useTranslation } from '../i18n'
 import { useSessionStore } from '../stores/sessionStore'
@@ -347,6 +348,7 @@ export function EmptySession() {
         ? normalizeRuntimeSelection(
           { ...defaultActiveProviderSelection, effortLevel },
           activeCustomProvider.apiFormat,
+          getBundledPresetReasoningProviderKind(activeCustomProvider.presetId),
         )
         : defaultActiveProviderSelection
       const claudeOAuthRuntimeSelection = !explicitDraftSelection &&

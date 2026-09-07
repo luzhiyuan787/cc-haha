@@ -62,6 +62,15 @@ describe('bundled provider presets', () => {
       { region: 'cn_zh', baseUrl: 'https://open.bigmodel.cn/api/anthropic' },
       { region: 'global_en', baseUrl: 'https://api.z.ai/api/anthropic' },
     ])
+    expect(zhipu?.reasoningProviderKind).toBe('zhipu_standard_api')
+    expect(zhipu?.defaultModels).toEqual({
+      main: 'glm-5.3[1m]',
+      haiku: 'glm-5.3-flash[1m]',
+      sonnet: 'glm-5.3[1m]',
+      opus: 'glm-5.3[1m]',
+    })
+    expect(zhipu?.modelContextWindows?.['glm-5.3']).toBe(1000000)
+    expect(zhipu?.modelContextWindows?.['glm-5.3-flash']).toBe(1000000)
     expect(zhipu && presetMatchesBaseUrl(zhipu, ' HTTPS://API.Z.AI/api/anthropic/ ')).toBe(true)
   })
 
@@ -87,15 +96,13 @@ describe('bundled provider presets', () => {
     expect(shengsuanyun?.featured).toBeUndefined()
     const selectableIds = selectableProviderPresets(BUNDLED_PROVIDER_PRESETS).map((p) => p.id)
     expect(selectableIds).not.toContain('shengsuanyun')
-    expect(selectableIds).toContain('xuanshuapi')
-    expect(selectableIds).toContain('fennoai')
-    expect(selectableIds).toContain('qiniuai')
+    expect(selectableIds).toContain('atlascloud')
     expect(selectableIds).toContain('custom')
   })
 
   // Both gateways mount the Anthropic protocol on the bare host; a /v1 or
   // /anthropic suffix here would double up with the path Claude Code appends.
-  it('points the sponsored gateways at their Anthropic-compatible roots', () => {
+  it('keeps the retired gateways at their Anthropic-compatible roots', () => {
     const fennoai = BUNDLED_PROVIDER_PRESETS.find((preset) => preset.id === 'fennoai')
     const qiniuai = BUNDLED_PROVIDER_PRESETS.find((preset) => preset.id === 'qiniuai')
 
@@ -105,13 +112,23 @@ describe('bundled provider presets', () => {
     expect(qiniuai && presetMatchesBaseUrl(qiniuai, ' HTTPS://API.QNAIGC.COM/ ')).toBe(true)
   })
 
-  // The picker groups featured presets into their own row; losing the flag would
-  // silently demote the sponsors into the generic list.
-  it('keeps the sponsored gateways in the featured row', () => {
-    const featuredIds = BUNDLED_PROVIDER_PRESETS.filter((preset) => preset.featured).map((p) => p.id)
+  it.each(['xuanshuapi', 'fennoai', 'qiniuai'])('retires %s without removing saved-provider metadata', (id) => {
+    const preset = BUNDLED_PROVIDER_PRESETS.find((candidate) => candidate.id === id)
 
-    expect(featuredIds).toContain('fennoai')
-    expect(featuredIds).toContain('qiniuai')
+    expect(preset?.deprecated).toBe(true)
+    expect(preset?.apiKeyUrl).toBeUndefined()
+    expect(preset?.promoText).toBeUndefined()
+    expect(preset?.featured).toBeUndefined()
+    expect(preset?.authStrategy).toBe('auth_token')
+    expect(preset?.defaultEnv).toBeDefined()
+    expect(preset?.modelContextWindows).toBeDefined()
+    expect(selectableProviderPresets(BUNDLED_PROVIDER_PRESETS).map((candidate) => candidate.id))
+      .not.toContain(id)
+  })
+
+  it('keeps Atlas Cloud selectable and featured', () => {
+    expect(selectableProviderPresets(BUNDLED_PROVIDER_PRESETS).filter((preset) => preset.featured).map((preset) => preset.id))
+      .toEqual(['atlascloud'])
   })
 
   it('keeps the retired 接口AI preset resolvable but not selectable', () => {

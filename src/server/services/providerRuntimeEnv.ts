@@ -1,7 +1,10 @@
 import * as fs from 'fs'
 import * as path from 'path'
 
-import { getClaudeCodeModelCapabilities } from '../../shared/modelReasoning.js'
+import {
+  getClaudeCodeModelCapabilities,
+  type ModelReasoningProviderKind,
+} from '../../shared/modelReasoning.js'
 import { MODEL_CONTEXT_WINDOWS_ENV_KEY } from '../../utils/model/modelContextWindows.js'
 import {
   IMAGE_GENERATION_API_KEY_ENV_KEY,
@@ -322,6 +325,12 @@ export function getPresetDefaultEnv(presetId: string): Record<string, string> {
   return PROVIDER_PRESETS.find((preset) => preset.id === presetId)?.defaultEnv ?? {}
 }
 
+export function getPresetReasoningProviderKind(
+  presetId: string,
+): ModelReasoningProviderKind | undefined {
+  return PROVIDER_PRESETS.find((preset) => preset.id === presetId)?.reasoningProviderKind
+}
+
 function omitAuthEnv(env: Record<string, string>): Record<string, string> {
   return Object.fromEntries(
     Object.entries(env).filter(([key]) => !AUTH_ENV_KEYS.has(key.toUpperCase())),
@@ -341,19 +350,20 @@ function getProviderCapabilityEnv(
   models: SavedProvider['models'],
 ): Record<string, string> {
   const apiFormat = provider.apiFormat ?? 'anthropic'
+  const providerKind = getPresetReasoningProviderKind(provider.presetId)
   return {
     ...(models.fable
       ? {
           ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES:
-            getClaudeCodeModelCapabilities(models.fable, apiFormat),
+            getClaudeCodeModelCapabilities(models.fable, apiFormat, undefined, providerKind),
         }
       : {}),
     ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES:
-      getClaudeCodeModelCapabilities(models.haiku, apiFormat),
+      getClaudeCodeModelCapabilities(models.haiku, apiFormat, undefined, providerKind),
     ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES:
-      getClaudeCodeModelCapabilities(models.sonnet, apiFormat),
+      getClaudeCodeModelCapabilities(models.sonnet, apiFormat, undefined, providerKind),
     ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES:
-      getClaudeCodeModelCapabilities(models.opus, apiFormat),
+      getClaudeCodeModelCapabilities(models.opus, apiFormat, undefined, providerKind),
   }
 }
 
