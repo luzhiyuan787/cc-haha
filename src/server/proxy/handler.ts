@@ -687,9 +687,16 @@ async function handleOpenaiChat(
 ): Promise<Response> {
   const knownDeepSeekHost = shouldUseDeepSeekReasoningCompat(baseUrl)
   const reasoningProfile = resolveModelReasoningProfile(body.model, 'openai_chat')
+  // Console Go's upstream pool for OpenCode Zen is heterogeneous: some Chat
+  // Completions backends strict-decode the request body and randomly reject
+  // the non-standard `thinking` toggle with
+  // `json: unknown field "thinking"` (verified ~50/50 per request, not
+  // session-sticky). OpenCode's reasoning models return `reasoning_content`
+  // without the toggle, so keep it for real DeepSeek hosts only.
+  const passThinkingToggle = knownDeepSeekHost && !OPENCODE_HOST_PATTERN.test(baseUrl)
   const transformed = anthropicToOpenaiChat(body, {
     roundTripReasoningContent: knownDeepSeekHost || reasoningProfile?.family === 'deepseek-v4',
-    passThinkingToggle: knownDeepSeekHost,
+    passThinkingToggle,
     imageContentMode: shouldUseTextOnlyOpenAIChatContent(baseUrl, body.model) ? 'text_only' : 'vision',
   })
   const url = buildOpenaiEndpoint(baseUrl, 'chat/completions')

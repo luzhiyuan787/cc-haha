@@ -51,8 +51,12 @@ async function makeProvider(apiFormat: 'openai_chat' | 'openai_responses', baseU
 function mockUpstreamCaptureHeaders(body: unknown) {
   const originalFetch = globalThis.fetch
   let capturedHeaders: Record<string, string> | undefined
+  let capturedBody: Record<string, unknown> | undefined
   globalThis.fetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
     capturedHeaders = Object.fromEntries(new Headers(init?.headers).entries())
+    if (typeof init?.body === 'string') {
+      try { capturedBody = JSON.parse(init.body) } catch { /* non-JSON body */ }
+    }
     return new Response(JSON.stringify(body), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
@@ -60,6 +64,7 @@ function mockUpstreamCaptureHeaders(body: unknown) {
   }) as typeof fetch
   return {
     getCapturedHeaders: () => capturedHeaders,
+    getCapturedBody: () => capturedBody,
     restore: () => {
       globalThis.fetch = originalFetch
     },
@@ -96,7 +101,7 @@ function responsesBody() {
   }
 }
 
-async function callProxy(providerId: string, sessionIdHeader?: string) {
+async function callProxy(providerId: string, sessionIdHeader?: string, extraBody: Record<string, unknown> = {}) {
   const req = new Request(
     `http://localhost:3456/proxy/providers/${providerId}/v1/messages`,
     {
@@ -109,6 +114,7 @@ async function callProxy(providerId: string, sessionIdHeader?: string) {
         model: 'model-main',
         max_tokens: 64,
         messages: [{ role: 'user', content: 'hello' }],
+        ...extraBody,
       }),
     },
   )
@@ -184,6 +190,26 @@ describe('proxy opencode identity headers', () => {
       const headers = upstream.getCapturedHeaders()
       expect(headers?.['x-opencode-session']).toBeUndefined()
       expect(headers?.['user-agent']).toStartWith('cc-haha/')
+    } finally {
+      upstream.restore()
+    }
+  })
+
+  test('never forwards the non-standard thinking toggle to opencode chat (Console Go strict backends reject it)', async () => {
+    const provider = await makeProvider('openai_chat', 'https://opencode.ai/zen/go/')
+    const upstream = mockUpstreamCaptureHeaders(chatCompletionBody())
+    try {
+      const res = await callProxy(provider.id, SESSION_ID, {
+        thinking: { type: 'enabled', budget_tokens: 31999 },
+        tools: [{ name: 'Bash', description: 'run', input_schema: { type: 'object' } }],
+        stream: true,
+      })
+      expect(res.status).toBe(200)
+      const body = upstream.getCapturedBody()
+      expect(body?.thinking).toBeUndefined()
+      // Reasoning intent still maps onto the standard field.
+      expect(body?.reasoning_effort).toBe('high')
+      await waitForTraceCallDone(SESSION_ID)
     } finally {
       upstream.restore()
     }
