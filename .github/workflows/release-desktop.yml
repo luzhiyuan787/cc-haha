@@ -15,6 +15,11 @@ on:
         required: false
         default: true
         type: boolean
+      skip_windows_signing:
+        description: 'Build unsigned Windows artifacts while SignPath onboarding is pending'
+        required: false
+        default: false
+        type: boolean
       publish_draft_release:
         description: 'Publish manual draft artifacts to GitHub Releases'
         required: false
@@ -52,10 +57,12 @@ jobs:
           SIGNPATH_APPLICATION_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_APPLICATION_ARTIFACT_CONFIGURATION_SLUG }}
           SIGNPATH_INSTALLER_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_INSTALLER_ARTIFACT_CONFIGURATION_SLUG }}
           RELEASE_DRAFT: ${{ github.event_name == 'workflow_dispatch' && inputs.draft == true }}
+          SKIP_WINDOWS_SIGNING: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_windows_signing == true }}
         run: |
           # macOS signing + notarization is preferred: Squirrel.Mac auto-update and
-          # first-launch Gatekeeper approval work best with a notarized Developer ID build.
-          # Drafts may still build unsigned while Apple Developer ID setup is being tested.
+          # first-launch Gatekeeper approval and Computer Use client attestation
+          # require a consistent Developer ID build. Drafts use the same native
+          # runtime, so an unsigned macOS lane would be a knowingly broken app.
           missing=()
           [ -n "$CSC_LINK" ] || missing+=("MACOS_CERTIFICATE")
           [ -n "$CSC_KEY_PASSWORD" ] || missing+=("MACOS_CERTIFICATE_PASSWORD")
@@ -63,17 +70,21 @@ jobs:
           [ -n "$APPLE_APP_SPECIFIC_PASSWORD" ] || missing+=("APPLE_APP_SPECIFIC_PASSWORD")
           [ -n "$APPLE_TEAM_ID" ] || missing+=("APPLE_TEAM_ID")
           if [ "${#missing[@]}" -gt 0 ]; then
-            printf '::warning::Missing macOS signing/notarization secrets (%s): macOS artifacts will be unsigned and users must use install-macos-unsigned.sh.\n' "${missing[*]}"
+            printf '::error::Missing macOS signing/notarization secrets (%s): refusing to build a macOS release whose Computer Use runtime cannot pass client attestation.\n' "${missing[*]}"
             echo "macos_signed=false" >> "$GITHUB_OUTPUT"
-            if [ "$RELEASE_DRAFT" != "true" ]; then
-              echo "::error::Refusing to publish a non-draft desktop release without macOS signing/notarization secrets."
-              exit 1
-            fi
+            exit 1
           else
             echo "macos_signed=true" >> "$GITHUB_OUTPUT"
           fi
+          # A maintainer can explicitly release unsigned Windows builds while
+          # SignPath approval is pending, even when its configuration is present.
+          if [ "$SKIP_WINDOWS_SIGNING" = "true" ]; then
+            echo "::warning::Windows signing explicitly skipped for this manual release; Windows artifacts will be unsigned."
+            echo "windows_signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # Drafts may remain unsigned while SignPath onboarding is being tested. Tags and
-          # non-draft releases must have the full GitHub connector configuration available.
+          # non-draft releases otherwise require the full GitHub connector configuration.
           win_missing=()
           [ -n "$SIGNPATH_API_TOKEN" ] || win_missing+=("SIGNPATH_API_TOKEN secret")
           [ -n "$SIGNPATH_ORGANIZATION_ID" ] || win_missing+=("SIGNPATH_ORGANIZATION_ID variable")
@@ -200,17 +211,6 @@ jobs:
         working-directory: desktop
         run: bun run test:windows-storage-recovery
 
-      - name: Prepare bundled ripgrep
-        working-directory: desktop
-        env:
-          SIDECAR_TARGET_TRIPLE: ${{ matrix.target_triple }}
-        run: bun run prepare:ripgrep
-
-      # native/cu-helper/build.sh refuses ad-hoc signing (stable TCC identity
-      # contract), so when the release HAS a Developer ID certificate it must be
-      # imported before the sidecar build; electron-builder only imports CSC_LINK
-      # later, at the artifact-signing step. When the certificate is absent
-      # (unsigned draft release) cu-helper falls back to ad-hoc via the env below.
       - name: Import macOS signing identity for native runtimes
         if: matrix.smoke_platform == 'macos' && needs.signing-preflight.outputs.macos_signed == 'true'
         shell: bash
@@ -222,26 +222,22 @@ jobs:
           certificate_path="${RUNNER_TEMP}/cc-haha-signing.p12"
           keychain_path="${RUNNER_TEMP}/cc-haha-signing.keychain-db"
           keychain_password="$(uuidgen)"
-          rm -f "$certificate_path" "$keychain_path"
-          if [ -f "$CSC_LINK" ]; then
-            cp "$CSC_LINK" "$certificate_path"
-          else
-            printf '%s' "$CSC_LINK" | base64 --decode > "$certificate_path"
-          fi
+          printf '%s' "$CSC_LINK" | base64 --decode > "$certificate_path"
           security create-keychain -p "$keychain_password" "$keychain_path"
           security set-keychain-settings -lut 21600 "$keychain_path"
           security unlock-keychain -p "$keychain_password" "$keychain_path"
           security import "$certificate_path" \
             -k "$keychain_path" \
             -P "$CSC_KEY_PASSWORD" \
-            -A -t cert -f pkcs12 \
-            -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+            -A \
+            -t cert \
+            -f pkcs12
           security set-key-partition-list \
             -S apple-tool:,apple:,codesign: \
-            -s -k "$keychain_password" "$keychain_path" >/dev/null 2>&1
-          USER_KEYCHAINS="$(security list-keychains -d user | tr -d '"')"
-          # shellcheck disable=SC2086
-          security list-keychains -d user -s "$keychain_path" $USER_KEYCHAINS
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
           identity="$(
             security find-identity -v -p codesigning "$keychain_path" \
               | grep -E '"Developer ID Application:' \
@@ -249,23 +245,25 @@ jobs:
               | sed -E 's/^[^"]*"([^"]+)".*$/\1/'
           )"
           if [ -z "$identity" ]; then
-            echo '::error::Imported MACOS_CERTIFICATE does not contain a Developer ID Application identity.'
+            echo "::error::Imported certificate does not contain a Developer ID Application identity."
             exit 1
           fi
-          # build.sh priority (a) + sign-identity.ts both honor this, so the
-          # helper and the bun sidecar land on the SAME certificate.
           echo "CC_HAHA_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "CC_HAHA_CI_KEYCHAIN=$keychain_path" >> "$GITHUB_ENV"
+          echo "CC_HAHA_CI_CERTIFICATE=$certificate_path" >> "$GITHUB_ENV"
           echo "Imported native-runtime signing identity: $identity"
+
+      - name: Prepare bundled ripgrep
+        working-directory: desktop
+        env:
+          SIDECAR_TARGET_TRIPLE: ${{ matrix.target_triple }}
+        run: bun run prepare:ripgrep
 
       - name: Build sidecars
         working-directory: desktop
         env:
           BUN_INSTALL_CACHE_DIR: ${{ runner.temp }}/bun-install-cache
           SIDECAR_TARGET_TRIPLE: ${{ matrix.target_triple }}
-          # Unsigned draft releases have no certificate to import; let the
-          # helper build ad-hoc so macOS artifacts keep shipping (Computer Use
-          # TCC grants will not persist across rebuilds for that lane).
-          CU_HELPER_ALLOW_ADHOC: ${{ matrix.smoke_platform == 'macos' && needs.signing-preflight.outputs.macos_signed != 'true' && '1' || '' }}
         run: bun run build:sidecars
 
       - name: Verify compiled Windows sidecar startup
@@ -288,17 +286,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DEBUG: 'electron-builder,electron-osx-sign,electron-notarize*'
-          # Signed macOS releases require all of these secrets. Keep this step
-          # separate from the unsigned fallback so empty secrets are never passed
-          # to electron-builder as CSC_LINK / APPLE_* env vars.
-          CSC_LINK: ${{ secrets.MACOS_CERTIFICATE }}
-          CSC_KEY_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          # Reuse the keychain prepared for native runtimes. Passing CSC_LINK
+          # would make electron-builder import the same certificate again.
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           MACOS_NOTARIZE: ${{ github.event_name != 'workflow_dispatch' || inputs.notarize_macos }}
         run: |
           set -euo pipefail
+          export CSC_KEYCHAIN="${CC_HAHA_CI_KEYCHAIN:?macOS signing keychain was not prepared}"
           echo "::group::macOS signing diagnostics"
           echo "UTC start: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           sw_vers
@@ -726,6 +722,17 @@ jobs:
           if [ "${#missing[@]}" -gt 0 ]; then
             printf '::error::Missing release assets for %s: %s\n' "${{ matrix.label }}" "${missing[*]}"
             exit 1
+          fi
+
+      - name: Remove temporary macOS signing keychain
+        if: always() && matrix.smoke_platform == 'macos' && needs.signing-preflight.outputs.macos_signed == 'true'
+        shell: bash
+        run: |
+          if [ -n "${CC_HAHA_CI_KEYCHAIN:-}" ]; then
+            security delete-keychain "$CC_HAHA_CI_KEYCHAIN" 2>/dev/null || true
+          fi
+          if [ -n "${CC_HAHA_CI_CERTIFICATE:-}" ]; then
+            rm -f "$CC_HAHA_CI_CERTIFICATE"
           fi
 
       - name: Namespace update metadata assets

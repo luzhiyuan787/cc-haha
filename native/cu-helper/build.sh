@@ -22,11 +22,8 @@
 # per-build throwaway cert rotates that identity on EVERY rebuild, so the user
 # would have to re-grant both permissions after every `swift build`. To keep the
 # grants alive we ALWAYS sign with a STABLE cert and a CONSTANT --identifier.
-# We NEVER fall back to ad-hoc signing by default — if no stable identity exists
-# we stop and tell the user exactly how to create a one-time self-signed Code
-# Signing cert. Unsigned CI jobs (no certificate available) may opt in explicitly
-# with CU_HELPER_ALLOW_ADHOC=1; the identifier stays constant but TCC grants
-# rotate every rebuild, so that mode is only fit for throwaway artifacts.
+# We NEVER fall back to ad-hoc signing — if no stable identity exists we stop and
+# tell the user exactly how to create a one-time self-signed Code Signing cert.
 
 set -euo pipefail
 
@@ -105,8 +102,7 @@ preflight() {
 #      c) the first 'Developer ID Application: ...' identity (release/CI)
 #      d) the first real 'Apple Development: ...' identity in the keychain
 #      e) a self-signed 'cu-helper-dev' identity if one exists
-#      f) $CU_HELPER_ALLOW_ADHOC=1 -> ad-hoc (CI escape hatch, never a default)
-#      g) NONE -> print one-time create instructions and FAIL.
+#      f) NONE -> print one-time create instructions and FAIL (never ad-hoc).
 #
 #    Sets globals: SIGN_IDENTITY (string passed to codesign --sign)
 # ---------------------------------------------------------------------------
@@ -242,20 +238,9 @@ resolve_identity() {
     return 0
   fi
 
-  # f) explicit CI escape hatch: ad-hoc signing is never a DEFAULT, but an
-  #    unsigned CI job that has no certificate can opt in with
-  #    CU_HELPER_ALLOW_ADHOC=1. TCC grants rotate on every rebuild in this mode,
-  #    so it is only acceptable for throwaway/dev artifacts, never for a stable
-  #    release (release-desktop.yml enables it solely when macos_signed=false).
-  if [ "${CU_HELPER_ALLOW_ADHOC:-}" = "1" ]; then
-    SIGN_IDENTITY="-"
-    log "WARNING: CU_HELPER_ALLOW_ADHOC=1 — ad-hoc signing: Accessibility/Screen Recording grants will NOT survive rebuilds of this binary."
-    return 0
-  fi
-
-  # g) nothing usable -> instructions + fail. NEVER ad-hoc unless opted in above.
+  # f) nothing usable -> instructions + fail. NEVER ad-hoc.
   print_self_signed_instructions
-  die "no stable code-signing identity available (refusing to ad-hoc sign; set CU_HELPER_ALLOW_ADHOC=1 only for throwaway CI builds)."
+  die "no stable code-signing identity available (refusing to ad-hoc sign)."
 }
 
 # ---------------------------------------------------------------------------

@@ -111,9 +111,6 @@ jobs:
         env:
           BUN_INSTALL_CACHE_DIR: ${{ runner.temp }}/bun-install-cache
           SIDECAR_TARGET_TRIPLE: ${{ matrix.target_triple }}
-          # Dev builds are unsigned and carry no Developer ID certificate; the
-          # cu-helper would otherwise fail the stable-identity contract check.
-          CU_HELPER_ALLOW_ADHOC: ${{ matrix.smoke_platform == 'macos' && '1' || '' }}
         run: bun run build:sidecars
 
       - name: Verify compiled Windows sidecar startup

@@ -215,6 +215,7 @@ export function normalizeSavedProvider(provider: SavedProvider): SavedProvider {
     disableExperimentalBetas: rawDisableExperimentalBetas,
     imageGeneration: rawImageGeneration,
     model1mSupport: rawModel1mSupport,
+    supportsNestedToolResultMedia: rawSupportsNestedToolResultMedia,
     ...rest
   } = provider
   const rawProvider = provider as SavedProvider & Record<string, unknown>
@@ -226,6 +227,9 @@ export function normalizeSavedProvider(provider: SavedProvider): SavedProvider {
     runtimeKind: provider.runtimeKind ?? 'anthropic_compatible',
     models: normalizeModelMapping(provider.models),
     toolSearchEnabled: normalizeToolSearchEnabled(rawProvider.toolSearchEnabled),
+    ...(typeof rawSupportsNestedToolResultMedia === 'boolean'
+      ? { supportsNestedToolResultMedia: rawSupportsNestedToolResultMedia }
+      : {}),
     ...(normalizeDisableExperimentalBetas(rawDisableExperimentalBetas) ? { disableExperimentalBetas: true } : {}),
     ...(model1mSupport !== undefined ? { model1mSupport } : {}),
     ...(imageGeneration !== undefined ? { imageGeneration } : {}),
@@ -367,6 +371,16 @@ function getProviderCapabilityEnv(
   }
 }
 
+export function resolveProviderApiKey(
+  provider: SavedProvider,
+  presetDefaultEnv: Record<string, string>,
+): string {
+  return provider.apiKey
+    || presetDefaultEnv.ANTHROPIC_AUTH_TOKEN
+    || presetDefaultEnv.ANTHROPIC_API_KEY
+    || ''
+}
+
 export function buildProviderAuthEnv(
   provider: SavedProvider,
   presetDefaultEnv: Record<string, string>,
@@ -377,7 +391,7 @@ export function buildProviderAuthEnv(
   }
 
   const strategy = provider.authStrategy ?? getPresetAuthStrategy(provider.presetId)
-  const key = provider.apiKey || presetDefaultEnv.ANTHROPIC_AUTH_TOKEN || presetDefaultEnv.ANTHROPIC_API_KEY || ''
+  const key = resolveProviderApiKey(provider, presetDefaultEnv)
 
   switch (strategy) {
     case 'api_key':
@@ -405,6 +419,13 @@ export function getManagedEnvKeys(): string[] {
   return [...keys]
 }
 
+export function providerNeedsProxy(
+  apiFormat: ApiFormat,
+  supportsNestedToolResultMedia?: boolean,
+): boolean {
+  return apiFormat !== 'anthropic' || supportsNestedToolResultMedia === false
+}
+
 export function buildProviderManagedEnv(
   provider: SavedProvider,
   options?: { proxyPath?: string; serverPort?: number },
@@ -417,7 +438,10 @@ export function buildProviderManagedEnv(
   }
 
   const apiFormat: ApiFormat = provider.apiFormat ?? 'anthropic'
-  const needsProxy = apiFormat !== 'anthropic'
+  // Anthropic-format providers normally connect directly to the upstream. When
+  // the provider opts out of nested tool-result media, route through the proxy
+  // so images/documents are lifted out of tool_result before forwarding.
+  const needsProxy = providerNeedsProxy(apiFormat, provider.supportsNestedToolResultMedia)
   const proxyPath = options?.proxyPath ?? '/proxy'
   const serverPort = options?.serverPort ?? 3456
   const baseUrl = needsProxy
@@ -505,7 +529,12 @@ export function activeProviderNeedsProxy(configDir: string): boolean {
     const provider = index.providers.find((entry) => entry.id === index.activeId)
     if (!provider) return false
 
-    return (provider.apiFormat ?? 'anthropic') !== 'anthropic'
+    // Keep in sync with buildProviderManagedEnv: anthropic-format providers
+    // that opt out of nested tool-result media also route through the proxy.
+    return providerNeedsProxy(
+      provider.apiFormat ?? 'anthropic',
+      provider.supportsNestedToolResultMedia,
+    )
   } catch {
     return false
   }

@@ -152,55 +152,12 @@ describe('cu-helper build signing timestamp', () => {
   })
 })
 
-function resolveIdentityWithoutStableCert(extraEnv: string[]) {
-  const result = Bun.spawnSync([
-    'bash',
-    '-c',
-    [
-      'source "$1"',
-      'CC_HAHA_SIGN_IDENTITY=""',
-      'CU_HELPER_IDENTITY=""',
-      'first_apple_development_identity() { printf ""; }',
-      'first_developer_id_application_identity() { printf ""; }',
-      'identity_exists() { return 1; }',
-      ...extraEnv,
-      'resolve_identity',
-      'printf "%s" "$SIGN_IDENTITY"',
-    ].join('; '),
-    'cu-helper-build-test',
-    buildScript,
-  ])
-
-  return {
-    exitCode: result.exitCode,
-    stdout: result.stdout.toString(),
-    stderr: result.stderr.toString(),
-  }
-}
-
 describe('cu-helper build signing identity', () => {
   test('falls through to Developer ID when no Apple Development identity exists', () => {
     const result = resolveIdentityWithOnlyDeveloperId()
 
     expect(result.exitCode).toBe(0)
     expect(result.stdout).toBe('Developer ID Application: Example Corp (TEAM123456)')
-  })
-
-  test('fails without a stable identity when ad-hoc is not opted in', () => {
-    const result = resolveIdentityWithoutStableCert([])
-
-    expect(result.exitCode).not.toBe(0)
-    expect(result.stderr).toContain('refusing to ad-hoc sign')
-  })
-
-  test('ad-hoc opts in only via CU_HELPER_ALLOW_ADHOC=1', () => {
-    const optedIn = resolveIdentityWithoutStableCert(['CU_HELPER_ALLOW_ADHOC=1'])
-    expect(optedIn.exitCode).toBe(0)
-    expect(optedIn.stdout).toBe('-')
-    expect(optedIn.stderr).toContain('CU_HELPER_ALLOW_ADHOC=1')
-
-    const otherValue = resolveIdentityWithoutStableCert(['CU_HELPER_ALLOW_ADHOC=true'])
-    expect(otherValue.exitCode).not.toBe(0)
   })
 })
 
