@@ -214,4 +214,67 @@ describe('proxy opencode identity headers', () => {
       upstream.restore()
     }
   })
+
+  test('degrades a forced tool_choice to auto for opencode chat (thinking backends reject forcing)', async () => {
+    const provider = await makeProvider('openai_chat', 'https://opencode.ai/zen/go/')
+    const upstream = mockUpstreamCaptureHeaders(chatCompletionBody())
+    try {
+      const res = await callProxy(provider.id, SESSION_ID, {
+        tools: [{
+          name: 'classify_result',
+          description: 'Report the classification',
+          input_schema: { type: 'object', properties: { shouldBlock: { type: 'boolean' } } },
+        }],
+        tool_choice: { type: 'tool', name: 'classify_result' },
+      })
+      expect(res.status).toBe(200)
+      expect(upstream.getCapturedBody()?.tool_choice).toBe('auto')
+      await waitForTraceCallDone(SESSION_ID)
+    } finally {
+      upstream.restore()
+    }
+  })
+
+  test('degrades a forced tool_choice to auto for opencode responses', async () => {
+    const provider = await makeProvider('openai_responses', 'https://opencode.ai/zen/go/')
+    const upstream = mockUpstreamCaptureHeaders(responsesBody())
+    try {
+      const res = await callProxy(provider.id, SESSION_ID, {
+        tools: [{
+          name: 'classify_result',
+          description: 'Report the classification',
+          input_schema: { type: 'object', properties: { shouldBlock: { type: 'boolean' } } },
+        }],
+        tool_choice: { type: 'tool', name: 'classify_result' },
+      })
+      expect(res.status).toBe(200)
+      expect(upstream.getCapturedBody()?.tool_choice).toBe('auto')
+      await waitForTraceCallDone(SESSION_ID)
+    } finally {
+      upstream.restore()
+    }
+  })
+
+  test('keeps a forced tool_choice on non-opencode providers', async () => {
+    const provider = await makeProvider('openai_chat', 'https://api.example.com')
+    const upstream = mockUpstreamCaptureHeaders(chatCompletionBody())
+    try {
+      const res = await callProxy(provider.id, SESSION_ID, {
+        tools: [{
+          name: 'classify_result',
+          description: 'Report the classification',
+          input_schema: { type: 'object', properties: { shouldBlock: { type: 'boolean' } } },
+        }],
+        tool_choice: { type: 'tool', name: 'classify_result' },
+      })
+      expect(res.status).toBe(200)
+      expect(upstream.getCapturedBody()?.tool_choice).toEqual({
+        type: 'function',
+        function: { name: 'classify_result' },
+      })
+      await waitForTraceCallDone(SESSION_ID)
+    } finally {
+      upstream.restore()
+    }
+  })
 })

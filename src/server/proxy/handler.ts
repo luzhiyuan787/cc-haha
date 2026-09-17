@@ -88,6 +88,28 @@ function buildOpencodeIdentityHeaders(
   return headers
 }
 
+/**
+ * Console Go runs its models in thinking mode, and a thinking backend rejects a
+ * forced tool choice with `Thinking mode does not support this tool_choice` —
+ * the same rule Anthropic applies to extended thinking and OpenAI applies to
+ * its reasoning models. Claude Code's auto-mode permission classifier always
+ * forces its `classify_result` tool, so every classified tool call would 400,
+ * and the CLI falls back to asking the user for permission. Degrading the
+ * forced choice to `auto` keeps the request valid; the classifier prompt still
+ * drives the model to emit the call.
+ */
+function relaxForcedToolChoice(
+  request: Record<string, unknown>,
+  baseUrl: string,
+): void {
+  if (!OPENCODE_HOST_PATTERN.test(baseUrl)) return
+  const choice = request.tool_choice
+  const forced = choice === 'required'
+    || (typeof choice === 'object' && choice !== null
+      && (choice as Record<string, unknown>).type === 'function')
+  if (forced) request.tool_choice = 'auto'
+}
+
 function markTraceErrorRecorded(error: unknown): void {
   if (error && typeof error === 'object') {
     try {
@@ -711,6 +733,7 @@ async function handleOpenaiChat(
     passThinkingToggle,
     imageContentMode: shouldUseTextOnlyOpenAIChatContent(baseUrl, body.model) ? 'text_only' : 'vision',
   })
+  relaxForcedToolChoice(transformed as unknown as Record<string, unknown>, baseUrl)
   if (traceContext) {
     traceContext.protocolTrace = new ProtocolTraceObserver('openai_chat', transformed,
       resolveRequestCompatibility(body, { ...requestOptions, protocol: 'openai_chat' }).outputBudget)
@@ -918,6 +941,7 @@ async function handleOpenaiResponses(
   extraHeaders: Record<string, string> = {},
 ): Promise<Response> {
   const transformed = anthropicToOpenaiResponses(body, { ...requestOptions, cacheKey: promptCacheKey })
+  relaxForcedToolChoice(transformed as unknown as Record<string, unknown>, baseUrl)
   if (traceContext) {
     traceContext.protocolTrace = new ProtocolTraceObserver('openai_responses', transformed,
       resolveRequestCompatibility(body, { ...requestOptions, protocol: 'openai_responses' }).outputBudget)

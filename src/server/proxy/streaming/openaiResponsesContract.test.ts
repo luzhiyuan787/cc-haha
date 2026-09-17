@@ -177,6 +177,24 @@ describe('Responses collection and lifecycle', () => {
   })
 })
 
+test('a text block streamed by deltas is closed at the terminal even without output_text.done', async () => {
+  // Providers such as OpenCode's muse-spark stream text deltas and then jump
+  // straight to response.completed. An unclosed block leaves the client unable
+  // to persist the final assistant text.
+  const input = event('response.created', { response: { id: 'fixture' } })
+    + event('response.output_item.added', { output_index: 0, item: { id: 'msg_1', type: 'message', role: 'assistant', content: [] } })
+    + event('response.content_part.added', { output_index: 0, content_index: 0, part: { type: 'output_text', text: '' } })
+    + event('response.output_text.delta', { output_index: 0, content_index: 0, delta: '你好' })
+    + completed([{ id: 'msg_1', type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '你好' }] }])
+  const events = await collect(input)
+  const start = events.find(item => item.type === 'content_block_start' && item.content_block?.type === 'text')
+  const stop = events.find(item => item.type === 'content_block_stop')
+  expect(start?.content_block.type).toBe('text')
+  expect(stop?.index).toBe(start?.index)
+  expect(events.findIndex(item => item.type === 'content_block_stop'))
+    .toBeLessThan(events.findIndex(item => item.type === 'message_delta'))
+})
+
 test('equivalent final object arguments do not overwrite or duplicate streamed JSON', async () => {
   const input = startTool + event('response.function_call_arguments.delta', { item_id: 'fc_1', delta: tool.arguments }) + completed([{ ...tool, arguments: { text: '你好', path: 'fixture' } }])
   const events = await collect(input)
