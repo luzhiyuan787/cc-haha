@@ -627,8 +627,6 @@ export const kr: Record<TranslationKey, string> = {
   'workspace.allFiles': '모든 파일',
   'workspace.viewTabs': '작업 공간 보기',
   'workspace.filterPlaceholder': '파일 필터링...',
-  'workspace.filterChangedPlaceholder': '변경된 파일 필터링...',
-  'workspace.searchAllPlaceholder': '모든 파일 검색...',
   'workspace.clearFilter': '파일 필터 지우기',
   'workspace.searching': '작업 공간 검색 중...',
   'workspace.searchResults': '파일 검색 결과',

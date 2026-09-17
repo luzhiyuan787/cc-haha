@@ -219,40 +219,6 @@ export function Sidebar({
     }
   }, [sessions])
 
-  useEffect(() => useSessionStore.subscribe((nextState, previousState) => {
-    if (nextState.sessions === previousState.sessions) return
-
-    pendingSessionScrollAnchorRef.current = null
-    if (
-      nextState.indexStatus === previousState.indexStatus
-      || nextState.indexStatus?.mode !== 'on'
-      || nextState.indexStatus.state !== 'building'
-    ) {
-      return
-    }
-
-    const scrollArea = sessionScrollAreaRef.current
-    if (!scrollArea || scrollArea.scrollTop <= 0) return
-    pendingSessionScrollAnchorRef.current = readFirstVisibleSessionAnchor(scrollArea)
-  }), [])
-
-  useLayoutEffect(() => {
-    const anchor = pendingSessionScrollAnchorRef.current
-    pendingSessionScrollAnchorRef.current = null
-    if (!anchor) return
-
-    const scrollArea = sessionScrollAreaRef.current
-    if (!scrollArea || scrollArea.scrollTop <= 0) return
-    const row = findSessionRow(scrollArea, anchor.sessionId)
-    if (!row) return
-
-    const topOffset = row.getBoundingClientRect().top - scrollArea.getBoundingClientRect().top
-    const delta = topOffset - anchor.topOffset
-    if (Number.isFinite(delta) && delta !== 0) {
-      scrollArea.scrollTop += delta
-    }
-  }, [sessions])
-
   useEffect(() => {
     if (!contextMenu) return
     if (!sidebarOpen) setContextMenu(null)

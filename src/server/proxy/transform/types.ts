@@ -169,14 +169,6 @@ export type OpenAIResponsesReasoningItem = {
   encrypted_content?: string
 }
 
-export type OpenAIResponsesReasoningItem = {
-  type: 'reasoning'
-  id?: string
-  summary?: Array<{ type: string; text: string }>
-  content?: Array<{ type: string; text: string }>
-  encrypted_content?: string
-}
-
 export type OpenAIResponsesOutputItem =
   | { type: 'message'; role: string; content: Array<{ type: string; text?: string; refusal?: string }> }
   | { type: 'function_call'; id: string; call_id: string; name: string; arguments: unknown }

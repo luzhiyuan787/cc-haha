@@ -684,7 +684,6 @@ async function handleOpenaiChat(
   const upstreamRequestHeaders = {
     'Content-Type': 'application/json',
     Authorization: `Bearer ${apiKey}`,
-    ...extraHeaders,
   }
   const proxyOptions = getNetworkProxyFetchOptions(networkSettings, url)
   const startedAtMs = Date.now()
@@ -890,7 +889,6 @@ async function handleOpenaiResponses(
   const upstreamRequestHeaders = {
     'Content-Type': 'application/json',
     Authorization: `Bearer ${apiKey}`,
-    ...extraHeaders,
   }
   const proxyOptions = getNetworkProxyFetchOptions(networkSettings, url)
   const startedAtMs = Date.now()
@@ -1292,91 +1290,6 @@ function captureTraceStream(
       { alreadyTruncated: truncated },
     )
     await onComplete(snapshot, error, end).catch(() => {})
-  }
-
-  // The streaming branch decodes a *single* known codec (gzip/x-gzip or
-  // deflate). Stacked or unknown encodings cannot be unwound here — mark the
-  // trace unavailable instead of storing compressed bytes decoded as UTF-8.
-  // The buffered path still unwinds every codec via decodeTraceBytes.
-  const encodings = parseContentEncodings(contentEncoding)
-  const singleKnownCodec = encodings.length === 1 && SUPPORTED_TRACE_CODECS.has(encodings[0]!)
-  const unsupportedEncoding = encodings.length > 0 && !singleKnownCodec
-  const decompressor = singleKnownCodec
-    ? encodings[0] === 'deflate'
-      ? createInflate()
-      : createGunzip()
-    : null
-  // node:zlib streams honor the Writable backpressure contract: write()
-  // returns false when the writable buffer is full and the caller must wait
-  // for 'drain' before writing more. The trace copy is a side channel, but it
-  // still must not buffer an unbounded amount of compressed input.
-  let decompressorFailed = false
-  let decompressorEnded = false
-  // Explicitly ended by design (client cancel, capture cap, upstream read
-  // error): an end() on an unterminated gzip member then errors as expected
-  // and the decoded plain-text prefix is kept. Only a body that fails to
-  // decompress while ending normally marks the trace unavailable — an error
-  // from zlib is delivered asynchronously, so "ended before the error" is not
-  // a reliable signal, but the ending path itself is.
-  let activelyEnded = false
-  let unexpectedDecompressionFailure = false
-  let decompressEnded: Promise<void> = Promise.resolve()
-  if (decompressor) {
-    decompressor.on('data', captureDecoded)
-    // Partial data is already captured; an error mid-stream must not surface
-    // beyond the trace copy.
-    decompressor.on('error', () => {
-      if (!activelyEnded) {
-        unexpectedDecompressionFailure = true
-      }
-      decompressorFailed = true
-    })
-    decompressEnded = new Promise(resolve => {
-      decompressor.on('end', resolve)
-      decompressor.on('error', resolve)
-    })
-  }
-
-  // Resolve when the decompressor is ready for more input. An errored stream
-  // never drains and rejects further writes, so failure also resolves — the
-  // loop must stop feeding it afterwards. An end() from the cancel/cap path
-  // may finish through 'finish'/'close' without ever emitting 'drain', so the
-  // waiter settles on any of the terminal events or the read loop would hang
-  // with the upstream reader lock never released.
-  const waitForDecompressorDrain = (): Promise<void> => {
-    if (!decompressor || decompressorFailed || decompressorEnded) return Promise.resolve()
-    return new Promise<void>(resolve => {
-      const settle = () => {
-        decompressor.off('drain', settle)
-        decompressor.off('error', settle)
-        decompressor.off('finish', settle)
-        decompressor.off('close', settle)
-        resolve()
-      }
-      decompressor.once('drain', settle)
-      decompressor.once('error', settle)
-      decompressor.once('finish', settle)
-      decompressor.once('close', settle)
-    })
-  }
-
-  // End the decompressor gracefully instead of destroying it: destroy()
-  // would drop data already written but not yet flushed as 'data', so a
-  // cancelled or errored stream would lose the decoded prefix. end() flushes
-  // what was received; an unterminated gzip member then errors, which
-  // resolves decompressEnded through the error branch.
-  const finishDecompressor = async () => {
-    if (!decompressor) return
-    if (!decompressorEnded) {
-      decompressorEnded = true
-      try {
-        decompressor.end()
-      } catch {
-        decompressor.destroy()
-        return
-      }
-    }
-    await decompressEnded
   }
 
   // The streaming branch decodes a *single* known codec (gzip/x-gzip or

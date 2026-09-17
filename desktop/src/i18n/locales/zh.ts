@@ -626,8 +626,6 @@ export const zh: Record<TranslationKey, string> = {
   'workspace.allFiles': '所有文件',
   'workspace.viewTabs': '工作区视图',
   'workspace.filterPlaceholder': '筛选文件...',
-  'workspace.filterChangedPlaceholder': '筛选已更改文件...',
-  'workspace.searchAllPlaceholder': '搜索所有文件...',
   'workspace.clearFilter': '清除文件筛选',
   'workspace.searching': '正在搜索工作区...',
   'workspace.searchResults': '文件搜索结果',

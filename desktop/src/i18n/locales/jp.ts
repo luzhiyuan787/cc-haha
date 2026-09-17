@@ -627,8 +627,6 @@ export const jp: Record<TranslationKey, string> = {
   'workspace.allFiles': 'すべてのファイル',
   'workspace.viewTabs': 'ワークスペースビュー',
   'workspace.filterPlaceholder': 'ファイルを絞り込み...',
-  'workspace.filterChangedPlaceholder': '変更されたファイルを絞り込み...',
-  'workspace.searchAllPlaceholder': 'すべてのファイルを検索...',
   'workspace.clearFilter': 'ファイルフィルターをクリア',
   'workspace.searching': 'ワークスペースを検索中...',
   'workspace.searchResults': 'ファイル検索結果',

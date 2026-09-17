@@ -14,10 +14,6 @@ const { sessionsApiMock, runtimeMocks } = vi.hoisted(() => ({
     isMobileViewport: false,
     isDesktopRuntime: false,
   },
-  runtimeMocks: {
-    isMobileViewport: false,
-    isDesktopRuntime: false,
-  },
 }))
 
 vi.mock('../../hooks/useMobileViewport', () => ({

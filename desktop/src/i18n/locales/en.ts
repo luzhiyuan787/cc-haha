@@ -624,8 +624,6 @@ export const en = {
   'workspace.allFiles': 'All files',
   'workspace.viewTabs': 'Workspace views',
   'workspace.filterPlaceholder': 'Filter files...',
-  'workspace.filterChangedPlaceholder': 'Filter changed files...',
-  'workspace.searchAllPlaceholder': 'Search all files...',
   'workspace.clearFilter': 'Clear file filter',
   'workspace.searching': 'Searching workspace...',
   'workspace.searchResults': 'File search results',

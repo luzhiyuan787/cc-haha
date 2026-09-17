@@ -179,19 +179,6 @@ const petInteractiveRegions: Validator = value =>
       && region[key] >= (key === 'width' || key === 'height' ? 1 : 0)
       && region[key] <= 2_000))
 
-const petInteractiveRegions: Validator = value =>
-  Array.isArray(value)
-  && value.length > 0
-  && value.length <= 8
-  && value.every((region) =>
-    isRecord(region)
-    && hasOnlyKeys(region, ['x', 'y', 'width', 'height'])
-    && ['x', 'y', 'width', 'height'].every((key) =>
-      typeof region[key] === 'number'
-      && Number.isInteger(region[key])
-      && region[key] >= (key === 'width' || key === 'height' ? 1 : 0)
-      && region[key] <= 2_000))
-
 const urlWithOptionalBounds: Validator = value =>
   isRecord(value)
   && typeof value.url === 'string'

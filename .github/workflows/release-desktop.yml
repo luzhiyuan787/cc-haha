@@ -265,10 +265,6 @@ jobs:
         env:
           BUN_INSTALL_CACHE_DIR: ${{ runner.temp }}/bun-install-cache
           SIDECAR_TARGET_TRIPLE: ${{ matrix.target_triple }}
-          # Unsigned draft macOS lane: the ephemeral runner has no keychain
-          # identity at all. Ad-hoc here matches the ad-hoc bun sidecar and the
-          # unsigned app bundle; users re-grant TCC per release by design.
-          CU_HELPER_ALLOW_ADHOC: ${{ matrix.smoke_platform == 'macos' && needs.signing-preflight.outputs.macos_signed != 'true' && '1' || '' }}
         run: bun run build:sidecars
 
       - name: Verify compiled Windows sidecar startup

@@ -2791,7 +2791,7 @@ describe('Settings > Providers tab', () => {
     expect(toolSearchCheckbox).toBeChecked()
     await waitFor(() => {
       expect(within(dialog).getByDisplayValue((value) => (
-        typeof value === 'string' && value.includes('"ENABLE_TOOL_SEARCH": "false"')
+        typeof value === 'string' && value.includes('"ENABLE_TOOL_SEARCH": "true"')
       ))).toBeInTheDocument()
     })
 

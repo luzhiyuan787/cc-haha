@@ -445,64 +445,6 @@ describe('settingsStore network persistence', () => {
     })
   })
 
-  it('persists explicit system network mode without a stale manual URL', async () => {
-    const updateUser = vi.fn().mockResolvedValue({})
-    vi.doMock('../api/settings', () => ({
-      settingsApi: {
-        getUser: vi.fn(),
-        updateUser,
-        getPermissionMode: vi.fn(),
-        setPermissionMode: vi.fn(),
-        getCliLauncherStatus: vi.fn(),
-      },
-    }))
-    vi.doMock('../api/models', () => ({
-      modelsApi: {
-        list: vi.fn(),
-        getCurrent: vi.fn(),
-        setCurrent: vi.fn(),
-        getEffort: vi.fn(),
-        setEffort: vi.fn(),
-      },
-    }))
-    vi.doMock('../api/h5Access', () => ({
-      h5AccessApi: {
-        get: vi.fn(),
-        enable: vi.fn(),
-        disable: vi.fn(),
-        regenerate: vi.fn(),
-        update: vi.fn(),
-      },
-    }))
-
-    const { useSettingsStore } = await import('./settingsStore')
-
-    await useSettingsStore.getState().setNetwork({
-      aiRequestTimeoutMs: 600_000,
-      proxy: {
-        mode: 'system',
-        url: '  http://stale.example:8080  ',
-      },
-    })
-
-    expect(useSettingsStore.getState().network).toEqual({
-      aiRequestTimeoutMs: 600_000,
-      proxy: {
-        mode: 'system',
-        url: '',
-      },
-    })
-    expect(updateUser).toHaveBeenCalledWith({
-      network: {
-        aiRequestTimeoutMs: 600_000,
-        proxy: {
-          mode: 'system',
-          url: '',
-        },
-      },
-    })
-  })
-
   it('persists direct network proxy mode without keeping stale proxy URLs active', async () => {
     const updateUser = vi.fn().mockResolvedValue({})
     vi.doMock('../api/settings', () => ({

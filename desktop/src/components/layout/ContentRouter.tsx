@@ -79,11 +79,6 @@ export function ContentRouter() {
     page = teamTab?.teamLeadSessionId
       ? <AgentTeamsWorkbenchTab tabId={activeTabId} leadSessionId={teamTab.teamLeadSessionId} />
       : <EmptySession />
-  } else if (activeTabType === 'team') {
-    const teamTab = tabs.find((t) => t.sessionId === activeTabId)
-    page = teamTab?.teamLeadSessionId
-      ? <AgentTeamsWorkbenchTab tabId={activeTabId} leadSessionId={teamTab.teamLeadSessionId} />
-      : <EmptySession />
   } else if (activeTabType !== 'terminal') {
     page = <ActiveSession />
   }
