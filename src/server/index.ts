@@ -50,6 +50,7 @@ import {
   isPetSessionInProjection,
   PET_SESSION_LIMIT,
 } from './petAccessPolicy.js'
+import { PublicAccessServer, isPublicAccessControlPath } from './publicAccess.js'
 import { settleResponseOnRequestAbort } from './requestLifecycle.js'
 
 function readArgValue(flag: string): string | undefined {
@@ -120,6 +121,8 @@ export async function startBackgroundIndexesInPriorityOrder(
   ) await wait()
   if (!options.signal?.aborted) await startSearch()
 }
+
+const publicAccessServers = new Set<PublicAccessServer>()
 
 let backgroundIndexStartupController: AbortController | undefined
 let backgroundIndexStartup: Promise<void> | undefined
@@ -247,7 +250,19 @@ export function startServer(port = PORT, host = HOST) {
     process.env.SERVER_AUTH_REQUIRED === '1'
   const h5AccessService = new H5AccessService()
 
+  const publicAccess = new PublicAccessServer({
+    handleApiRequest,
+    handleStatic: handleStaticH5Request,
+    websocket: handleWebSocket,
+    serverPort: () => serverPort,
+  })
+  publicAccessServers.add(publicAccess)
   let server: ReturnType<typeof Bun.serve<WebSocketData>>
+
+  // Open SQLite before the first REST request. Discovery still runs in the
+  // background; without this, getPublicStatus() reports `off` and the sidebar
+  // falls through to a full JSONL scan that can exceed the 120s client timeout.
+  void localIndexCoordinator.start().catch(() => undefined)
 
   try {
     server = Bun.serve<WebSocketData>({
@@ -257,6 +272,7 @@ export function startServer(port = PORT, host = HOST) {
 
       async fetch(req, server) {
         const url = new URL(req.url)
+        if (isPublicAccessControlPath(url.pathname)) return publicAccess.control(req)
 
         // Startup probes must not wait on migrations, config reads, or auth.
         // Electron deliberately uses this endpoint to decide when the sidecar
@@ -273,6 +289,7 @@ export function startServer(port = PORT, host = HOST) {
           )
         }
 
+        await localIndexCoordinator.start().catch(() => undefined)
         await ensurePersistentStorageUpgraded()
         const origin = req.headers.get('Origin')
         const clientAddress = server.requestIP(req)?.address ?? null
@@ -526,7 +543,7 @@ export function startServer(port = PORT, host = HOST) {
           try {
             const response = await settleResponseOnRequestAbort(
               req,
-              handleApiRequest(req, url),
+              handleApiRequest(req, url, { remoteBrowser: classifyH5Request(req, url, h5RequestContext) === 'h5-browser' }),
             )
             return withCors(response, cors)
           } catch (error) {
@@ -591,9 +608,17 @@ export function startServer(port = PORT, host = HOST) {
 
       websocket: handleWebSocket,
     })
+    const stop = server.stop.bind(server)
+    server.stop = (closeActiveConnections?: boolean) => {
+      publicAccess.disable()
+      publicAccessServers.delete(publicAccess)
+      return stop(closeActiveConnections)
+    }
     serverPort = server.port
     ProviderService.setServerPort(serverPort)
   } catch (error) {
+    publicAccess.disable()
+    publicAccessServers.delete(publicAccess)
     const message = error instanceof Error && error.message
       ? error.message
       : `Failed to start server. Is port ${port} in use?`
@@ -629,6 +654,8 @@ let shutdownInProgress: Promise<void> | null = null
 export async function stopServerRuntimeForShutdown(
   options: { waitForCli?: boolean } = {},
 ): Promise<void> {
+  for (const remote of publicAccessServers) remote.disable()
+  publicAccessServers.clear()
   teamWatcher.stop()
   cronScheduler.stop()
   backgroundIndexStartupController?.abort()

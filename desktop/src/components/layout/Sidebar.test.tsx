@@ -59,7 +59,7 @@ vi.mock('../../i18n', () => ({
     const translations: Record<string, string> = {
       'sidebar.newSession': 'New Session',
       'sidebar.scheduled': 'Scheduled',
-      'sidebar.market': 'Skills Market',
+      'sidebar.extensions': 'Extension Market',
       'sidebar.settings': 'Settings',
       'sidebar.searchPlaceholder': 'Search sessions',
       'sidebar.noSessions': 'No sessions',
@@ -570,6 +570,54 @@ describe('Sidebar', () => {
 
     expect(screen.getByRole('button', { name: /Alpha hidden/ })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Collapse display' })).toBeInTheDocument()
+  })
+
+  it('does not show a fold control when a project is at or below the collapse threshold', () => {
+    const base = new Date('2026-05-15T10:00:00.000Z').getTime()
+    useSessionStore.setState({
+      sessions: [
+        ...Array.from({ length: 6 }, (_, index) => (
+          makeSession(
+            `alpha-${index + 1}`,
+            `Alpha ${index + 1}`,
+            '/workspace/alpha',
+            new Date(base - index * 1000).toISOString(),
+          )
+        )),
+        makeSession('beta-1', 'Beta only', '/workspace/beta', new Date(base - 7000).toISOString()),
+      ],
+    })
+
+    render(<Sidebar />)
+
+    expect(screen.getByRole('button', { name: /Alpha 1/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Alpha 6/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Beta only/ })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Expand display' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Collapse display' })).not.toBeInTheDocument()
+  })
+
+  it('does not show a fold control after a short project is auto-expanded for history', () => {
+    useSessionStore.setState({
+      sessions: [
+        makeSession('alpha-1', 'Alpha one', '/workspace/alpha', '2026-05-15T10:00:00.000Z'),
+        makeSession('alpha-2', 'Alpha two', '/workspace/alpha', '2026-05-14T10:00:00.000Z'),
+      ],
+    })
+
+    render(<Sidebar />)
+
+    const scroller = screen.getByTestId('sidebar-project-session-list-workspace-alpha')
+    Object.defineProperties(scroller, {
+      clientHeight: { configurable: true, value: 80 },
+      scrollHeight: { configurable: true, value: 80 },
+    })
+    fireEvent.wheel(scroller, { deltaY: 20 })
+
+    expect(screen.getByRole('button', { name: /Alpha one/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Alpha two/ })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Expand display' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Collapse display' })).not.toBeInTheDocument()
   })
 
   it('lets a manual session refresh supersede a stuck automatic refresh', async () => {
@@ -2073,8 +2121,12 @@ describe('Sidebar', () => {
     render(<Sidebar isMobile onRequestClose={onRequestClose} />)
 
     expect(screen.queryByRole('button', { name: 'Scheduled' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Skills Market' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Settings' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Extension Market' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Settings' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    expect(useTabStore.getState().activeTabId).toBe('__settings__')
+    expect(onRequestClose).toHaveBeenCalledTimes(1)
+    onRequestClose.mockClear()
 
     fireEvent.click(screen.getByRole('button', { name: /Open Session/ }))
     expect(onRequestClose).toHaveBeenCalledTimes(1)
@@ -2089,15 +2141,17 @@ describe('Sidebar', () => {
     expect(onRequestClose).toHaveBeenCalledTimes(2)
   })
 
-  it('keeps the market entry available in desktop navigation', () => {
+  it('keeps one unified extension market entry in desktop navigation', () => {
     render(<Sidebar />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Skills Market' }))
+    expect(screen.queryByRole('button', { name: 'sidebar.connectors' })).not.toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: 'Extension Market' })).toHaveLength(1)
+    fireEvent.click(screen.getByRole('button', { name: 'Extension Market' }))
 
     expect(useTabStore.getState().activeTabId).toBe('__market__')
     expect(useTabStore.getState().tabs).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ sessionId: '__market__', title: 'Skills Market', type: 'market' }),
+        expect.objectContaining({ sessionId: '__market__', title: 'Extension Market', type: 'market' }),
       ]),
     )
   })

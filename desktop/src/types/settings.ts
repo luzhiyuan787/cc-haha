@@ -153,6 +153,7 @@ export type UserSettings = {
   effort?: EffortLevel
   alwaysThinkingEnabled?: boolean
   workflowKeywordTriggerEnabled?: boolean
+  agentTeamsEnabled?: boolean
   autoDreamEnabled?: boolean
   skipAutoPermissionPrompt?: boolean
   permissionMode?: PermissionMode

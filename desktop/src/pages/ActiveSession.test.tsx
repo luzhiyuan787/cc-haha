@@ -48,10 +48,15 @@ vi.mock('../components/chat/ChatInput', () => ({
   ),
 }))
 
-vi.mock('../components/workbench/WorkbenchPanel', () => ({
-  WorkbenchPanel: ({ sessionId }: { sessionId: string }) => (
-    <div data-testid="workspace-panel">workspace:{sessionId}</div>
-  ),
+vi.mock('../api/teams', () => ({
+  teamsApi: {
+    getMemberTranscript: teamApiMocks.getMemberTranscript,
+    get: teamApiMocks.getTeam,
+    list: teamApiMocks.listTeams,
+    getWorkbenchForSession: teamApiMocks.getWorkbenchForSession,
+    getWorkbench: teamApiMocks.getWorkbench,
+    sendMemberMessage: teamApiMocks.sendMemberMessage,
+  },
 }))
 
 vi.mock('../api/teams', () => ({
@@ -103,15 +108,33 @@ import { useSessionStore } from '../stores/sessionStore'
 import { useSettingsStore } from '../stores/settingsStore'
 import { useTabStore } from '../stores/tabStore'
 import { useTeamStore } from '../stores/teamStore'
-import { useWorkspacePanelStore } from '../stores/workspacePanelStore'
-import { WORKSPACE_PANEL_DEFAULT_WIDTH } from '../stores/workspacePanelStore'
-import { useTerminalPanelStore } from '../stores/terminalPanelStore'
 import { useActivityPanelStore } from '../stores/activityPanelStore'
 import {
-  TERMINAL_PANEL_DEFAULT_HEIGHT,
-  TERMINAL_PANEL_MAX_HEIGHT,
-  TERMINAL_PANEL_MIN_HEIGHT,
-} from '../stores/terminalPanelStore'
+  WORKSPACE_BOTTOM_DEFAULT_HEIGHT,
+  WORKSPACE_BOTTOM_MAX_HEIGHT,
+  WORKSPACE_BOTTOM_MIN_HEIGHT,
+  WORKSPACE_SIDE_DEFAULT_WIDTH,
+  useWorkspaceStore,
+} from '../stores/workspaceStore'
+
+beforeEach(() => {
+  sessionApiMocks.getGitInfo.mockReset()
+  sessionApiMocks.getGitInfo.mockResolvedValue({
+    branch: 'main',
+    repoName: 'project',
+    workDir: '/workspace/project',
+    changedFiles: 0,
+    worktree: null,
+  })
+  teamApiMocks.getMemberTranscript.mockReset()
+  teamApiMocks.getMemberTranscript.mockResolvedValue({ messages: [] })
+  teamApiMocks.getTeam.mockReset()
+  teamApiMocks.listTeams.mockReset()
+  teamApiMocks.getWorkbenchForSession.mockReset()
+  teamApiMocks.getWorkbenchForSession.mockRejectedValue(new Error('not a team session'))
+  teamApiMocks.getWorkbench.mockReset()
+  teamApiMocks.sendMemberMessage.mockReset()
+})
 
 beforeEach(() => {
   sessionApiMocks.getGitInfo.mockReset()
@@ -142,8 +165,7 @@ afterEach(() => {
   useSettingsStore.setState({ locale: 'en' })
   useTeamStore.getState().stopMemberPolling()
   useTeamStore.setState(useTeamStore.getInitialState(), true)
-  useWorkspacePanelStore.setState(useWorkspacePanelStore.getInitialState(), true)
-  useTerminalPanelStore.setState(useTerminalPanelStore.getInitialState(), true)
+  useWorkspaceStore.setState(useWorkspaceStore.getInitialState(), true)
   useActivityPanelStore.setState(useActivityPanelStore.getInitialState(), true)
   useCLITaskStore.setState(useCLITaskStore.getInitialState(), true)
 })
@@ -197,14 +219,23 @@ describe('ActiveSession task polling', () => {
         },
       },
     })
-    useTerminalPanelStore.getState().openPanel(sessionId)
-
     render(<ActiveSession />)
 
     expect(screen.getByText(
       'The temporary workspace was cleaned up. History is still available; start a new session in /repo to continue.',
     )).toBeInTheDocument()
-    expect(screen.getByTestId(`session-terminal-host-${sessionId}`)).toHaveAttribute('data-cwd', '/repo')
+
+    // Open the terminal the way a user does, through the workspace launcher,
+    // so the cwd under test is the one ActiveSession actually hands down: the
+    // source project, not the worktree path that no longer exists.
+    act(() => {
+      useWorkspaceStore.getState().toggleWorkspace(sessionId)
+    })
+    act(() => {
+      fireEvent.click(screen.getByTestId('workspace-launcher-terminal'))
+    })
+
+    expect(screen.getByTestId('workspace-terminal-host-1')).toHaveAttribute('data-cwd', '/repo')
   })
 
   it('treats a persisted historical session as non-empty before messages finish loading', () => {
@@ -825,7 +856,7 @@ describe('ActiveSession task polling', () => {
     expect(screen.queryByTestId('background-tasks-button')).not.toBeInTheDocument()
 
     act(() => {
-      useWorkspacePanelStore.getState().openPanel(sessionId)
+      useWorkspaceStore.getState().openTarget(sessionId, { kind: 'file', path: 'src/a.ts' })
     })
 
     expect(screen.getByTestId('workbench-panel')).toBeInTheDocument()
@@ -1966,7 +1997,7 @@ describe('ActiveSession task polling', () => {
         },
       },
     })
-    useWorkspacePanelStore.getState().openPanel(sessionId)
+    useWorkspaceStore.getState().openTarget(sessionId, { kind: 'file', path: 'src/a.ts' })
 
     render(<ActiveSession />)
 
@@ -1975,10 +2006,14 @@ describe('ActiveSession task polling', () => {
     const resizeHandle = screen.getByTestId('workspace-resize-handle')
 
     const workbenchPanel = screen.getByTestId('workbench-panel')
+    expect(workbenchPanel.style.maxWidth).toBe('70%')
 
     expect(within(contentRow).getByTestId('message-list')).toBeInTheDocument()
     expect(within(contentRow).getByTestId('message-list')).toHaveAttribute('data-compact', 'true')
-    expect(within(workbenchPanel).getByTestId('workspace-panel')).toHaveTextContent(`workspace:${sessionId}`)
+    // The unified surface renders a tab strip even for a single tab, and the
+    // four-entry launcher when the workspace is empty.
+    expect(within(workbenchPanel).getByTestId('workspace-surface-side')).toBeInTheDocument()
+    expect(within(workbenchPanel).getByTestId('workspace-tab-strip-side')).toBeInTheDocument()
     expect(within(chatColumn).getByTestId('chat-input')).toBeInTheDocument()
     expect(within(chatColumn).getByTestId('chat-input')).toHaveAttribute('data-compact', 'true')
     expect(chatColumn).toHaveClass('flex-1')
@@ -1995,7 +2030,7 @@ describe('ActiveSession task polling', () => {
       fireEvent.keyDown(resizeHandle, { key: 'ArrowLeft' })
     })
 
-    expect(useWorkspacePanelStore.getState().width).toBe(WORKSPACE_PANEL_DEFAULT_WIDTH + 32)
+    expect(useWorkspaceStore.getState().sideWidth).toBe(WORKSPACE_SIDE_DEFAULT_WIDTH + 32)
 
     vi.spyOn(workbenchPanel, 'getBoundingClientRect').mockReturnValue({
       x: 0,
@@ -2023,7 +2058,7 @@ describe('ActiveSession task polling', () => {
       window.dispatchEvent(new Event('pointerup'))
     })
 
-    expect(useWorkspacePanelStore.getState().width).toBe(526)
+    expect(useWorkspaceStore.getState().sideWidth).toBe(526)
   })
 
   it('does not render the workspace panel when closed', () => {
@@ -2073,7 +2108,7 @@ describe('ActiveSession task polling', () => {
     })
 
     render(<ActiveSession />)
-    expect(screen.queryByTestId('workspace-panel')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('workspace-surface-side')).not.toBeInTheDocument()
   })
 
   it('keeps chat as the primary surface on mobile by hiding workspace and terminal panels', () => {
@@ -2122,8 +2157,11 @@ describe('ActiveSession task polling', () => {
         },
       },
     })
-    useWorkspacePanelStore.getState().openPanel(sessionId)
-    useTerminalPanelStore.getState().openPanel(sessionId)
+    useWorkspaceStore.getState().openTarget(sessionId, { kind: 'file', path: 'src/a.ts' })
+    useWorkspaceStore.getState().toggleBottomPanel(
+      sessionId,
+      useSessionStore.getState().sessions.find((entry) => entry.id === sessionId)?.workDir ?? '',
+    )
 
     render(<ActiveSession />)
 
@@ -2131,7 +2169,7 @@ describe('ActiveSession task polling', () => {
     expect(screen.getByTestId('message-list')).toHaveAttribute('data-compact', 'false')
     expect(screen.getByTestId('chat-input')).toHaveAttribute('data-compact', 'false')
     expect(screen.queryByRole('heading', { name: 'Mobile Session' })).not.toBeInTheDocument()
-    expect(screen.queryByTestId('workspace-panel')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('workspace-surface-side')).not.toBeInTheDocument()
     expect(screen.queryByTestId('workspace-resize-handle')).not.toBeInTheDocument()
     expect(screen.queryByTestId('session-terminal-panel')).not.toBeInTheDocument()
     expect(screen.queryByTestId('terminal-resize-handle')).not.toBeInTheDocument()
@@ -2182,25 +2220,33 @@ describe('ActiveSession task polling', () => {
         },
       },
     })
-    useTerminalPanelStore.getState().openPanel(sessionId)
+    useWorkspaceStore.getState().toggleBottomPanel(
+      sessionId,
+      useSessionStore.getState().sessions.find((entry) => entry.id === sessionId)?.workDir ?? '',
+    )
 
     render(<ActiveSession />)
 
     const panel = screen.getByTestId('session-terminal-panel')
     const resizeHandle = screen.getByTestId('terminal-resize-handle')
-    const host = screen.getByTestId(`session-terminal-host-${sessionId}`)
+    const host = screen.getByTestId(`workspace-terminal-host-1`)
 
-    expect(panel).toHaveStyle({ height: `${TERMINAL_PANEL_DEFAULT_HEIGHT}px` })
+    expect(panel).toHaveStyle({ height: `${WORKSPACE_BOTTOM_DEFAULT_HEIGHT}px` })
     expect(host).toHaveAttribute('data-cwd', '/tmp/project-root/packages/app')
     expect(host).toHaveAttribute('data-active', 'true')
     expect(host).toHaveAttribute('data-preserve-on-unmount', 'true')
-    expect(resizeHandle).toHaveAttribute('aria-valuemin', `${TERMINAL_PANEL_MIN_HEIGHT}`)
-    expect(resizeHandle).toHaveAttribute('aria-valuemax', `${TERMINAL_PANEL_MAX_HEIGHT}`)
+    expect(resizeHandle).toHaveAttribute('aria-valuemin', `${WORKSPACE_BOTTOM_MIN_HEIGHT}`)
+    expect(resizeHandle).toHaveAttribute('aria-valuemax', `${WORKSPACE_BOTTOM_MAX_HEIGHT}`)
+    // The hit target overlays the existing panel border instead of adding a
+    // second visible line and a spacer above the terminal tabs.
+    expect(panel).toHaveClass('relative', 'border-t')
+    expect(resizeHandle).toHaveClass('absolute', 'bg-transparent')
+    expect(resizeHandle.firstElementChild).toHaveClass('bg-transparent')
 
     act(() => {
       fireEvent.keyDown(resizeHandle, { key: 'ArrowUp' })
     })
-    expect(useTerminalPanelStore.getState().height).toBe(TERMINAL_PANEL_DEFAULT_HEIGHT + 24)
+    expect(useWorkspaceStore.getState().bottomHeight).toBe(WORKSPACE_BOTTOM_DEFAULT_HEIGHT + 24)
 
     await act(async () => {
       const pointerDown = createEvent.pointerDown(resizeHandle)
@@ -2215,34 +2261,39 @@ describe('ActiveSession task polling', () => {
       window.dispatchEvent(pointerMove)
       window.dispatchEvent(new Event('pointerup'))
     })
-    expect(useTerminalPanelStore.getState().height).toBe(TERMINAL_PANEL_DEFAULT_HEIGHT + 64)
+    expect(useWorkspaceStore.getState().bottomHeight).toBe(WORKSPACE_BOTTOM_DEFAULT_HEIGHT + 64)
 
     act(() => {
       fireEvent.keyDown(resizeHandle, { key: 'End' })
     })
-    expect(useTerminalPanelStore.getState().height).toBe(TERMINAL_PANEL_MAX_HEIGHT)
+    expect(useWorkspaceStore.getState().bottomHeight).toBe(WORKSPACE_BOTTOM_MAX_HEIGHT)
 
     act(() => {
       fireEvent.keyDown(resizeHandle, { key: 'Home' })
     })
-    expect(useTerminalPanelStore.getState().height).toBe(TERMINAL_PANEL_MIN_HEIGHT)
+    expect(useWorkspaceStore.getState().bottomHeight).toBe(WORKSPACE_BOTTOM_MIN_HEIGHT)
 
     act(() => {
       fireEvent.doubleClick(resizeHandle)
     })
-    expect(useTerminalPanelStore.getState().height).toBe(TERMINAL_PANEL_DEFAULT_HEIGHT)
+    expect(useWorkspaceStore.getState().bottomHeight).toBe(WORKSPACE_BOTTOM_DEFAULT_HEIGHT)
 
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Open in Tab' }))
-      await Promise.resolve()
+    // Moving the terminal to the side dock keeps the same PTY and creates no
+    // global app tab — the old "Open in Tab" promotion is gone on purpose.
+    const terminalTabId = useWorkspaceStore.getState().getTabs(sessionId, 'bottom')[0]!.id
+    const runtimeId = (useWorkspaceStore.getState().getTab(sessionId, terminalTabId) as {
+      runtimeId: string
+    }).runtimeId
+
+    act(() => {
+      useWorkspaceStore.getState().moveTabToDock(sessionId, terminalTabId, 'side')
     })
 
-    const terminalTab = useTabStore.getState().tabs.find((tab) => tab.type === 'terminal')
-    expect(useTerminalPanelStore.getState().isPanelOpen(sessionId)).toBe(false)
-    expect(useTerminalPanelStore.getState().getPanelRuntimeId(sessionId)).toBeUndefined()
-    expect(terminalTab?.terminalCwd).toBe('/tmp/project-root/packages/app')
-    expect(terminalTab?.terminalRuntimeId).toBe(`__session_terminal__${sessionId}`)
-    expect(useTabStore.getState().activeTabId).toBe(terminalTab?.sessionId)
+    expect(useWorkspaceStore.getState().getTabs(sessionId, 'side')).toHaveLength(1)
+    expect((useWorkspaceStore.getState().getTab(sessionId, terminalTabId) as {
+      runtimeId: string
+    }).runtimeId).toBe(runtimeId)
+    expect(useTabStore.getState().tabs.some((tab) => tab.type === 'terminal')).toBe(false)
   })
 
   it('keeps the docked terminal usable on a new empty session', () => {
@@ -2290,7 +2341,10 @@ describe('ActiveSession task polling', () => {
         },
       },
     })
-    useTerminalPanelStore.getState().openPanel(sessionId)
+    useWorkspaceStore.getState().toggleBottomPanel(
+      sessionId,
+      useSessionStore.getState().sessions.find((entry) => entry.id === sessionId)?.workDir ?? '',
+    )
 
     render(<ActiveSession />)
 
@@ -2347,16 +2401,266 @@ describe('ActiveSession task polling', () => {
         },
       },
     })
-    useTerminalPanelStore.getState().openPanel(sessionId)
+    useWorkspaceStore.getState().toggleBottomPanel(
+      sessionId,
+      useSessionStore.getState().sessions.find((entry) => entry.id === sessionId)?.workDir ?? '',
+    )
 
     render(<ActiveSession />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Close terminal panel' }))
+    const runtimeIdBefore = screen
+      .getByTestId('workspace-terminal-host-1')
+      .getAttribute('data-runtime-id')
+    expect(runtimeIdBefore).toBeTruthy()
 
-    expect(useTerminalPanelStore.getState().isPanelOpen(sessionId)).toBe(false)
+    act(() => useWorkspaceStore.getState().toggleBottomPanel(sessionId, '/tmp/project'))
+
+    expect(useWorkspaceStore.getState().getSession(sessionId).bottomOpen).toBe(false)
+    // Hidden, not unmounted, and still the same PTY: re-opening must come back
+    // to the same shell rather than starting a new one.
     expect(screen.getByTestId('session-terminal-panel')).toHaveClass('hidden')
-    expect(screen.getByTestId(`session-terminal-host-${sessionId}`)).toHaveAttribute('data-active', 'false')
-    expect(screen.getByTestId(`session-terminal-host-${sessionId}`)).toHaveAttribute('data-runtime-id', `__session_terminal__${sessionId}`)
+    expect(screen.getByTestId('workspace-terminal-host-1')).toHaveAttribute('data-active', 'false')
+    expect(screen.getByTestId('workspace-terminal-host-1'))
+      .toHaveAttribute('data-runtime-id', runtimeIdBefore!)
+  })
+})
+
+describe('ActiveSession header', () => {
+  // 回归锚点：标题曾经是 text-[22px] 且不截断，长标题会折成两行再加一行元数据，
+  // 连同 pt-6/pb-4 把聊天区顶掉约 120px。标题必须单行截断，元数据留在它下面那行。
+  const longTitle = 'Create a todo_cccc-ccccbb directory, write a throwaway todo app with react + vite + tailwindcss, then start it'
+
+  function mountSessionWithLongTitle(sessionId: string) {
+    useSessionStore.setState({
+      sessions: [{
+        id: sessionId,
+        title: longTitle,
+        createdAt: '2026-05-07T00:00:00.000Z',
+        modifiedAt: new Date().toISOString(),
+        messageCount: 2,
+        projectPath: '/workspace/project',
+        workDir: '/workspace/project',
+        workDirExists: true,
+      }],
+      activeSessionId: sessionId,
+      isLoading: false,
+      error: null,
+    })
+    useTabStore.setState({
+      tabs: [{ sessionId, title: longTitle, type: 'session', status: 'idle' }],
+      activeTabId: sessionId,
+    })
+    useChatStore.setState({
+      sessions: {
+        [sessionId]: {
+          messages: [
+            { id: 'msg-1', type: 'user_text', content: 'hi', timestamp: 1 },
+            { id: 'msg-2', type: 'assistant_text', content: 'hello', timestamp: 2 },
+          ],
+          chatState: 'idle',
+          connectionState: 'connected',
+          streamingText: '',
+          streamingToolInput: '',
+          activeToolUseId: null,
+          activeToolName: null,
+          activeThinkingId: null,
+          pendingPermission: null,
+          pendingComputerUsePermission: null,
+          tokenUsage: { input_tokens: 12000, output_tokens: 3000 },
+          streamingResponseChars: 0,
+          elapsedSeconds: 0,
+          statusVerb: '',
+          slashCommands: [],
+          agentTaskNotifications: {},
+          elapsedTimer: null,
+        },
+      },
+    })
+  }
+
+  it('keeps a long title on one truncated line and hovers the full text', () => {
+    const sessionId = 'long-title-session'
+    mountSessionWithLongTitle(sessionId)
+
+    render(<ActiveSession />)
+
+    const heading = within(screen.getByTestId('session-header')).getByRole('heading', { level: 1 })
+    expect(heading).toHaveTextContent(longTitle)
+    expect(heading).toHaveAttribute('title', longTitle)
+    expect(heading).toHaveClass('truncate')
+    expect(heading.className).not.toMatch(/text-\[22px\]/)
+  })
+
+  it('gives the metadata its own line under the title', () => {
+    const sessionId = 'header-meta-session'
+    mountSessionWithLongTitle(sessionId)
+
+    render(<ActiveSession />)
+
+    expect(screen.getByTestId('session-chat-surface')).toHaveAttribute(
+      'data-session-chat-kind',
+      'main',
+    )
+    const header = screen.getByTestId('session-header')
+    const heading = within(header).getByRole('heading', { level: 1 })
+    const titleRow = heading.parentElement as HTMLElement
+    const meta = titleRow.nextElementSibling as HTMLElement
+
+    // 元数据挤在标题右侧时会离标题很远，读起来像飘在角落的另一块内容。
+    expect(within(titleRow).queryByText('2 messages')).not.toBeInTheDocument()
+    expect(within(meta).getByText('2 messages')).toBeInTheDocument()
+    expect(within(meta).getByText('15k API tokens')).toBeInTheDocument()
+    expect(header).toHaveClass('py-3')
+  })
+
+  it('keeps the separators between metadata items, never in front of them', () => {
+    const sessionId = 'idle-header-session'
+    mountSessionWithLongTitle(sessionId)
+
+    render(<ActiveSession />)
+
+    const heading = within(screen.getByTestId('session-header')).getByRole('heading', { level: 1 })
+    const meta = (heading.parentElement as HTMLElement).nextElementSibling as HTMLElement
+
+    // 空闲会话只有三项元数据（tokens / 更新时间 / 消息数），之间两个「·」，开头不该有。
+    // 分隔符是纯装饰，读屏时不该被念出来。
+    expect(meta.textContent?.trimStart().startsWith('·')).toBe(false)
+    expect(meta.querySelectorAll('[aria-hidden="true"]')).toHaveLength(2)
+  })
+})
+
+describe('ActiveSession activity panel auto-close grace', () => {
+  const sessionId = 'activity-grace-session'
+
+  function seedActivitySession(overrides: Record<string, unknown> = {}) {
+    useSessionStore.setState({
+      sessions: [{
+        id: sessionId,
+        title: 'Activity Grace Session',
+        createdAt: '2026-08-02T00:00:00.000Z',
+        modifiedAt: '2026-08-02T00:00:00.000Z',
+        messageCount: 1,
+        projectPath: '/workspace/project',
+        workDir: '/workspace/project',
+        workDirExists: true,
+      }],
+      activeSessionId: sessionId,
+      isLoading: false,
+      error: null,
+    })
+    useTabStore.setState({
+      tabs: [{ sessionId, title: 'Activity Grace Session', type: 'session', status: 'idle' }],
+      activeTabId: sessionId,
+    })
+    useChatStore.setState({
+      sessions: {
+        [sessionId]: {
+          messages: [{ id: 'm1', type: 'assistant_text', content: 'ready', timestamp: 1 }],
+          chatState: 'idle',
+          connectionState: 'connected',
+          historyStatus: 'ready',
+          historyError: null,
+          streamingText: '',
+          streamingToolInput: '',
+          activeToolUseId: null,
+          activeToolName: null,
+          activeThinkingId: null,
+          pendingPermission: null,
+          pendingComputerUsePermission: null,
+          tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
+          elapsedSeconds: 0,
+          statusVerb: '',
+          slashCommands: [],
+          agentTaskNotifications: {},
+          backgroundAgentTasks: {
+            'agent-task-1': {
+              taskId: 'agent-task-1',
+              taskType: 'agent',
+              status: 'running',
+              startedAt: 1,
+              updatedAt: 1,
+            },
+          },
+          elapsedTimer: null,
+          ...overrides,
+        },
+      },
+    })
+  }
+
+  function patchSession(overrides: Record<string, unknown>) {
+    useChatStore.setState((state) => ({
+      sessions: {
+        ...state.sessions,
+        [sessionId]: { ...state.sessions[sessionId], ...overrides },
+      },
+    }) as never)
+  }
+
+  it('keeps the panel open through transient empty states and only closes after the grace period', () => {
+    vi.useFakeTimers()
+    seedActivitySession()
+    render(<ActiveSession />)
+    act(() => {
+      useActivityPanelStore.getState().open(sessionId)
+    })
+    expect(useActivityPanelStore.getState().isOpen(sessionId)).toBe(true)
+
+    // History reload window: activity caches are briefly drained while loading.
+    act(() => {
+      patchSession({ backgroundAgentTasks: {}, messages: [], historyStatus: 'loading' })
+      vi.advanceTimersByTime(5000)
+    })
+    expect(useActivityPanelStore.getState().isOpen(sessionId)).toBe(true)
+
+    // Empty but settled: still within the grace period. The debounce timer is
+    // scheduled when React flushes the effect at act exit, so patch and
+    // advance in separate acts to keep the timeline honest.
+    act(() => {
+      patchSession({ historyStatus: 'ready' })
+    })
+    act(() => {
+      vi.advanceTimersByTime(1000)
+    })
+    expect(useActivityPanelStore.getState().isOpen(sessionId)).toBe(true)
+
+    // The empty state outlives the grace period: genuinely no activity left.
+    act(() => {
+      vi.advanceTimersByTime(1500)
+    })
+    expect(useActivityPanelStore.getState().isOpen(sessionId)).toBe(false)
+  })
+
+  it('cancels the pending close when activity reappears inside the grace period', () => {
+    vi.useFakeTimers()
+    seedActivitySession()
+    render(<ActiveSession />)
+    act(() => {
+      useActivityPanelStore.getState().open(sessionId)
+    })
+
+    act(() => {
+      patchSession({ backgroundAgentTasks: {}, messages: [], historyStatus: 'ready' })
+      vi.advanceTimersByTime(1000)
+    })
+    act(() => {
+      patchSession({
+        messages: [{ id: 'm2', type: 'assistant_text', content: 'back', timestamp: 2 }],
+        backgroundAgentTasks: {
+          'agent-task-1': {
+            taskId: 'agent-task-1',
+            taskType: 'agent',
+            status: 'running',
+            startedAt: 1,
+            updatedAt: 1,
+          },
+        },
+      })
+      vi.advanceTimersByTime(5000)
+    })
+
+    expect(useActivityPanelStore.getState().isOpen(sessionId)).toBe(true)
   })
 })
 

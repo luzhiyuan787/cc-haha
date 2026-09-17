@@ -34,6 +34,17 @@ export type ImageGenerationConfig = {
   apiKey?: string
 }
 
+export type RequestCompatibility = {
+  maxOutputTokens?: number
+  outputTokenLimit?: number
+  outputTokenField?: 'auto' | 'max_tokens' | 'max_completion_tokens' | 'omit'
+  sampling?: 'auto' | 'supported' | 'unsupported'
+  reasoning?: 'auto' | 'supported' | 'unsupported'
+  parallelTools?: 'auto' | 'supported' | 'unsupported'
+  structuredOutput?: 'auto' | 'supported' | 'unsupported'
+  [key: string]: unknown
+}
+
 export type SavedProvider = {
   id: string
   presetId: string
@@ -50,6 +61,7 @@ export type SavedProvider = {
   toolSearchEnabled?: boolean
   disableExperimentalBetas?: boolean
   supportsNestedToolResultMedia?: boolean
+  requestCompatibility?: RequestCompatibility
   imageGeneration?: ImageGenerationConfig
   notes?: string
 }
@@ -69,6 +81,7 @@ export type CreateProviderInput = {
   toolSearchEnabled?: boolean
   disableExperimentalBetas?: boolean
   supportsNestedToolResultMedia?: boolean
+  requestCompatibility?: RequestCompatibility
   imageGeneration?: ImageGenerationConfig
   notes?: string
 }
@@ -87,6 +100,7 @@ export type UpdateProviderInput = {
   toolSearchEnabled?: boolean
   disableExperimentalBetas?: boolean
   supportsNestedToolResultMedia?: boolean
+  requestCompatibility?: RequestCompatibility | null
   imageGeneration?: ImageGenerationConfig | null
   notes?: string
 }
@@ -98,6 +112,7 @@ export type TestProviderConfigInput = {
   authStrategy?: ProviderAuthStrategy
   apiFormat?: ApiFormat
   supportsNestedToolResultMedia?: boolean
+  requestCompatibility?: RequestCompatibility
 }
 
 export type ProviderTestStepResult = {

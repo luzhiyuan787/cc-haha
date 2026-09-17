@@ -1,4 +1,5 @@
-﻿import { OpenAICodexTurnState } from '../openaiAuth/turnState.js';
+﻿import { getConfiguredProviderOutputBudget, getOutputBudgetHeaders, markOutputBudgetSource } from './outputBudget.js'
+import { OpenAICodexTurnState } from '../openaiAuth/turnState.js';
 import type {
   BetaContentBlock,
   BetaContentBlockParam,
@@ -236,6 +237,7 @@ import {
   StreamWatchdogTimeoutError,
   createStreamWatchdogState,
 } from "./streamWatchdog.js";
+import { StreamDecodeSpan } from "./streamDecodeSpan.js";
 import { jsonStringify } from "../../utils/slowOperations.js";
 import {
   isBetaTracingEnabled,
@@ -970,6 +972,7 @@ export async function* executeNonStreamingRequest(
           {
             signal: retryOptions.signal,
             timeout: fallbackTimeoutMs,
+            headers: getOutputBudgetHeaders(retryParams),
           },
         );
       } catch (err) {
@@ -1411,7 +1414,11 @@ async function* queryModel(
   });
 
   queryCheckpoint("query_message_normalization_start");
-  let messagesForAPI = normalizeMessagesForAPI(messages, filteredTools);
+  let messagesForAPI = normalizeMessagesForAPI(
+    messages,
+    filteredTools,
+    options.model,
+  );
   queryCheckpoint("query_message_normalization_end");
 
   // Model-specific post-processing: strip tool-search-specific fields if the
@@ -1875,8 +1882,15 @@ async function* queryModel(
       : undefined;
 
     lastRequestBetas = betasParams;
+    const explicitOutputBudget = Boolean(
+      retryContext?.maxTokensOverride || options.maxOutputTokensOverride ||
+      getConfiguredProviderOutputBudget() ||
+      (Number.isSafeInteger(Number(process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS)) &&
+        Number(process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS) > 0) ||
+      extraBodyParams.max_tokens !== undefined
+    )
 
-    return {
+    return markOutputBudgetSource({
       model: normalizeModelStringForAPI(options.model),
       messages: addCacheBreakpoints(
         messagesForAPI,
@@ -1904,7 +1918,7 @@ async function* queryModel(
         output_config: outputConfig,
       }),
       ...(speed !== undefined && { speed }),
-    };
+    }, explicitOutputBudget ? 'explicit' : 'default');
   };
 
   // Compute log scalars synchronously so the fire-and-forget .then() closure
@@ -1944,6 +1958,11 @@ async function* queryModel(
     deferToolUseCommit: true,
   });
   let ttftMs = 0;
+  // Decode span for this request: first generated delta -> message_stop. Deliberately excludes
+  // the prefill/TTFT phase, so output_tokens / decodeMs is real generation speed rather than a
+  // number diluted by prompt processing. Tool execution happens between API requests, so it
+  // never lands inside this span either.
+  const decodeSpan = new StreamDecodeSpan();
   let partialMessage: BetaMessage | undefined = undefined;
   const contentBlocks: (BetaContentBlock | ConnectorTextBlock)[] = [];
   let usage: NonNullableUsage = EMPTY_USAGE;
@@ -2010,9 +2029,10 @@ async function* queryModel(
             { ...params, stream: true },
             {
               signal,
-              ...(clientRequestId && {
-                headers: { [CLIENT_REQUEST_ID_HEADER]: clientRequestId },
-              }),
+              headers: {
+                ...getOutputBudgetHeaders(params),
+                ...(clientRequestId ? { [CLIENT_REQUEST_ID_HEADER]: clientRequestId } : {}),
+              },
             },
           )
           .withResponse();
@@ -2045,6 +2065,7 @@ async function* queryModel(
     // reset state
     newMessages.length = 0;
     ttftMs = 0;
+    decodeSpan.reset();
     partialMessage = undefined;
     contentBlocks.length = 0;
     usage = EMPTY_USAGE;
@@ -2250,6 +2271,8 @@ async function* queryModel(
         const receivedFirstContentDelta = streamWatchdogState.recordEvent(part);
         resetStreamIdleTimer();
         const now = Date.now();
+
+        decodeSpan.record(receivedFirstContentDelta, now);
 
         // Detect and log streaming stalls (only after first event to avoid counting TTFB)
         if (lastEventTime !== null) {
@@ -2646,6 +2669,11 @@ async function* queryModel(
           type: "stream_event",
           event: part,
           ...(part.type === "message_start" ? { ttftMs } : undefined),
+          // message_stop is the last event of the stream, so `now` closes the decode span.
+          // Absent when the span never opened (see StreamDecodeSpan).
+          ...(part.type === "message_stop"
+            ? { decodeMs: decodeSpan.elapsedMs(now) }
+            : undefined),
         };
       }
       // Clear the idle timeout watchdog now that the stream loop has exited
@@ -3879,6 +3907,14 @@ function isMaxTokensCapEnabled(): boolean {
 
 export function getMaxOutputTokensForModel(model: string): number {
   const maxOutputTokens = getModelMaxOutputTokens(model);
+  const providerBudget = getConfiguredProviderOutputBudget()
+  const globalBudget = Number(process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS)
+  const hasValidGlobalBudget = Number.isSafeInteger(globalBudget) && globalBudget > 0
+  if (!hasValidGlobalBudget && providerBudget !== undefined) {
+    // The provider's explicit setting is not constrained by a guessed model
+    // family maximum. The proxy applies a known endpoint limit when configured.
+    return providerBudget
+  }
 
   // Slot-reservation cap: drop default to 8k for all models. BQ p99 output
   //  = 4,911 tokens; 32k/64k defaults over-reserve 8-16× slot capacity.

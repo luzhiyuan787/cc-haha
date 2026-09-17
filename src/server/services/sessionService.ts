@@ -13,7 +13,7 @@ import * as os from 'node:os'
 import { createInterface } from 'node:readline'
 import { ApiError } from '../middleware/errorHandler.js'
 import { sanitizePath as sanitizePortablePath } from '../../utils/sessionStoragePortable.js'
-import type { FileHistorySnapshot } from '../../utils/fileHistory.js'
+import { migrateFileHistorySnapshot, type FileHistorySnapshot } from '../../utils/fileHistory.js'
 import { findCanonicalGitRoot } from '../../utils/git.js'
 import { calculateUSDCost, MODEL_COSTS } from '../../utils/modelCost.js'
 import {
@@ -69,7 +69,11 @@ import type {
 } from './localIndex/sessionIndex.js'
 import type { LocalIndexStatus } from './localIndex/types.js'
 import { diagnosticsService } from './diagnosticsService.js'
-import { isForkInheritedUsageRecord } from '../../utils/usageAccounting.js'
+import {
+  isBillableUsageRecord,
+  isForkInheritedUsageRecord,
+  usageRecordKey,
+} from '../../utils/usageAccounting.js'
 import {
   ProjectSessionHistory,
   type ProjectHistoryOptions,
@@ -214,6 +218,15 @@ export type MessageEntry = {
   timestamp: string
   model?: string
   usage?: MessageUsage
+  /**
+   * Identity of the API response `usage` belongs to, when it has one.
+   *
+   * A single assistant reply is persisted as one line per content block, each repeating the
+   * whole `usage` object, so any consumer that totals usage must count a given key once.
+   * Computed here (rather than by each consumer) so the rule lives in one place; absent when
+   * the line carries no message id, which by the same convention means "always count it".
+   */
+  usageKey?: string
   parentUuid?: string
   parentToolUseId?: string
   isSidechain?: boolean
@@ -257,6 +270,8 @@ export type TranscriptUsageSnapshot = {
   costDisplay: string
   hasUnknownModelCost: boolean
   totalAPIDuration: number
+  totalDecodeDuration: number
+  totalTtftDuration: number
   totalDuration: number
   totalLinesAdded: number
   totalLinesRemoved: number
@@ -352,6 +367,7 @@ type RawEntry = {
   snapshot?: {
     messageId?: string
     trackedFileBackups?: Record<string, unknown>
+    completedFileBackups?: Record<string, unknown>
     timestamp?: string
   }
   customTitle?: string
@@ -375,6 +391,35 @@ type TranscriptContextAccumulator = {
   estimatedTokensFromMessages: number
   estimatedTokensAfterUsage: number
   transcriptHasMediaInput: boolean
+}
+
+/**
+ * Whether this line's `usage` is the first sighting of its reply.
+ *
+ * Claude Code writes one JSONL line per content block of an assistant message and repeats the
+ * complete `usage` object on every one — a reply with thinking, text and 12 tool_use blocks is
+ * 14 lines carrying the same numbers. Summing raw lines overstated real transcripts by 2.2x,
+ * which is why `stats.ts` and the activity index both deduplicate; the inspector paths had
+ * inherited only the fork check and so reported inflated totals to the context panel.
+ *
+ * Rules (and the key shape) come from `usageAccounting.ts` so every reader of a transcript
+ * agrees about what one session cost.
+ */
+function claimUsageRecord(entry: RawEntry, countedKeys: Set<string>): boolean {
+  const record = entry as unknown as Record<string, unknown>
+  const identity = {
+    version: record.version,
+    sessionId: record.sessionId,
+    requestId: record.requestId,
+    messageId: entry.message?.id,
+    forkedFrom: record.forkedFrom,
+  }
+  if (!isBillableUsageRecord(identity)) return false
+  const key = usageRecordKey(identity)
+  if (key === null) return true
+  if (countedKeys.has(key)) return false
+  countedKeys.add(key)
+  return true
 }
 
 function createTranscriptContextAccumulator(): TranscriptContextAccumulator {
@@ -581,6 +626,14 @@ function getSharedSessionMutationState(
   const created: SharedSessionMutationState = { epoch: 0, bypass: null }
   sharedSessionMutationStates.set(gateway, created)
   return created
+}
+
+// Read-time evidence only: spreads preserve it, JSON serialization does not.
+// A malformed before map must not become indistinguishable from a valid {}.
+const malformedFileHistoryBefore = Symbol('malformed-file-history-before')
+
+export function hasMalformedFileHistoryBefore(snapshot: FileHistorySnapshot): boolean {
+  return (snapshot as FileHistorySnapshot & { [malformedFileHistoryBefore]?: true })[malformedFileHistoryBefore] === true
 }
 
 export class SessionService {
@@ -844,7 +897,9 @@ export class SessionService {
 
     if (status.state === 'off' || status.state === 'degraded') return null
     try {
-      if (!this.localIndexGateway.isSessionScopeReady()) return null
+      if (status.state !== 'building' && !this.localIndexGateway.isSessionScopeReady()) {
+        return null
+      }
     } catch {
       this.markIndexReadFailure()
       return null
@@ -1258,6 +1313,16 @@ export class SessionService {
     workDir: string | null
     projectPath: string
   }> {
+    const sessionId = path.basename(filePath, '.jsonl')
+    const indexedMeta = this.getIndexedSessionMetaById(sessionId)
+    if (indexedMeta) {
+      return {
+        title: indexedMeta.title,
+        modifiedAt: indexedMeta.modifiedAt,
+        workDir: indexedMeta.workDir,
+        projectPath: indexedMeta.projectPath,
+      }
+    }
     const stat = await fs.stat(filePath)
     const projectPath = path.basename(path.dirname(filePath))
     const summary = await this.scanSessionListSummary(filePath, projectPath, stat)
@@ -1266,6 +1331,28 @@ export class SessionService {
       modifiedAt: summary.modifiedAt,
       workDir: summary.workDir ?? null,
       projectPath,
+    }
+  }
+
+  getIndexedSessionMetaById(sessionId: string): {
+    title: string
+    modifiedAt: string
+    projectPath: string
+    workDir: string | null
+  } | null {
+    if (this.getUsableIndexMode() !== 'on') return null
+    try {
+      const row = this.localIndexGateway.getSession?.(sessionId) ?? null
+      if (!row || !this.indexStatusRemainsUsable()) return null
+      return {
+        title: row.title,
+        modifiedAt: row.modifiedAt,
+        projectPath: row.projectPath,
+        workDir: row.workDir,
+      }
+    } catch {
+      this.markIndexReadFailure()
+      return null
     }
   }
 
@@ -1718,6 +1805,14 @@ export class SessionService {
     const usage = isForkInheritedUsageRecord(entry)
       ? undefined
       : normalizeMessageUsage(msg.usage)
+    const usageKey = usage
+      ? usageRecordKey({
+          version: entry.version,
+          sessionId: entry.sessionId,
+          requestId: entry.requestId,
+          messageId: entry.message?.id,
+        }) ?? undefined
+      : undefined
 
     return {
       id: entry.uuid || crypto.randomUUID(),
@@ -1727,6 +1822,7 @@ export class SessionService {
       timestamp: entry.timestamp || new Date().toISOString(),
       model: msg.model,
       ...(usage ? { usage } : {}),
+      ...(usageKey ? { usageKey } : {}),
       parentUuid: entry.parentUuid ?? undefined,
       parentToolUseId,
       isSidechain: entry.isSidechain,
@@ -2874,9 +2970,13 @@ export class SessionService {
     let firstUsageAt: number | null = null
     let lastUsageAt: number | null = null
 
+    const countedUsageKeys = new Set<string>()
+
     for (const entry of entries) {
       currentRuntimeHint = this.applyRuntimeContextMetadata(currentRuntimeHint, entry)
-      if (isForkInheritedUsageRecord(entry)) continue
+      // Fork-inherited lines and the repeated usage objects of a multi-block reply are the
+      // same class of over-count; `claimUsageRecord` rejects both.
+      if (!claimUsageRecord(entry, countedUsageKeys)) continue
       const usage = entry.message?.usage
       const model = entry.message?.model
       if (!usage || typeof model !== 'string') continue
@@ -3007,6 +3107,7 @@ export class SessionService {
     let lastUsageAt: number | null = null
 
     const contextState = createTranscriptContextAccumulator()
+    const countedUsageKeys = new Set<string>()
 
     await this.streamJsonlFile(found.filePath, (entry) => {
       if (typeof entry.message?.model === 'string') {
@@ -3089,9 +3190,9 @@ export class SessionService {
         ? usage.server_tool_use.web_search_requests
         : 0
 
-      // Inherited fork history still describes the current context, but its API usage belongs to
-      // the source session and must not be included in this fork's cumulative usage or cost.
-      if (isForkInheritedUsageRecord(entry)) return
+      // Fork-inherited lines and the repeated usage objects of a multi-block reply are the
+      // same class of over-count; `claimUsageRecord` rejects both.
+      if (!claimUsageRecord(entry, countedUsageKeys)) return
 
       if (
         inputTokens === 0 &&
@@ -3191,6 +3292,11 @@ export class SessionService {
           costDisplay: this.formatCost(totalCostUSD),
           hasUnknownModelCost,
           totalAPIDuration: 0,
+          // Generation timings live only in the CLI process (and the resume snapshot it
+          // writes to project config); a transcript has no per-response span to rebuild
+          // them from, so callers must treat 0 as "unknown" rather than "instant".
+          totalDecodeDuration: 0,
+          totalTtftDuration: 0,
           totalDuration:
             firstUsageAt !== null && lastUsageAt !== null
               ? Math.max(0, Math.round((lastUsageAt - firstUsageAt) / 1000))
@@ -3240,33 +3346,43 @@ export class SessionService {
     const indexed = this.getUsableIndexMode() === 'on'
     const status = indexed ? this.localIndexGateway.getPublicStatus() : null
     return JSON.stringify([scope, this.sessionListCacheGeneration,
-      indexed && status?.state === 'ready' ? status.lastUpdatedAt : 'files'])
+      indexed && (status?.state === 'ready' || status?.state === 'building')
+        ? status.lastUpdatedAt
+        : 'files'])
   }
 
   private async loadProjectHistoryRows(): Promise<ProjectHistoryRow[]> {
     const scope = this.getConfigDir()
     let indexedRows: IndexedSessionRow[] | null = null
-    if (this.getUsableIndexMode() === 'on' && this.localIndexGateway.getPublicStatus().state === 'ready') {
-      try {
-        indexedRows = []
-        // No await between index pages: a coordinator projection cannot shift
-        // the order while this synchronous metadata snapshot is collected.
-        for (let offset = 0; ; offset += 500) {
-          const page = this.localIndexGateway.listSessions({ limit: 500, offset })
-          if (!this.indexStatusRemainsUsable()) throw new Error('Index unavailable')
-          indexedRows.push(...page.sessions)
-          if (offset + page.sessions.length >= page.total) break
-          if (page.sessions.length === 0) throw new Error('Incomplete index page')
+    if (this.getUsableIndexMode() === 'on') {
+      const status = this.localIndexGateway.getPublicStatus()
+      if (status.state === 'ready' || status.state === 'building') {
+        try {
+          indexedRows = []
+          // No await between index pages: a coordinator projection cannot shift
+          // the order while this synchronous metadata snapshot is collected.
+          for (let offset = 0; ; offset += 500) {
+            const page = this.localIndexGateway.listSessions({ limit: 500, offset })
+            if (!this.indexStatusRemainsUsable()) throw new Error('Index unavailable')
+            indexedRows.push(...page.sessions)
+            if (offset + page.sessions.length >= page.total) break
+            if (page.sessions.length === 0) break
+          }
+        } catch {
+          this.markIndexReadFailure()
+          indexedRows = null
         }
-      } catch {
-        this.markIndexReadFailure()
-        indexedRows = null
       }
     }
     if (indexedRows === null) {
+      const indexMode = this.getUsableIndexMode()
+      if (indexMode === 'on') {
+        // Same rule as listSessions: never scan every JSONL just to fill history.
+        return []
+      }
       indexedRows = []
-      // Files remain authoritative in off/shadow/building mode. Summaries are
-      // streamed and shared with the existing list cache; messages never load.
+      // Files remain authoritative in off/shadow mode. Summaries are streamed
+      // and shared with the existing list cache; messages never load.
       for (const file of await this.discoverSessionFiles(undefined, scope)) {
         try {
           const stat = await fs.stat(file.filePath)
@@ -3410,29 +3526,39 @@ export class SessionService {
 
       const status = this.localIndexGateway.getPublicStatus()
       if (requireReady && status.state !== 'ready') return null
-      if (status.state === 'building' && indexedPage.sessions.length === 0) {
-        return null
+      if (indexedPage.sessions.length === 0) {
+        // Building must not fall through to a full JSONL scan. The sidebar
+        // already treats an empty building page as loading.
+        return status.state === 'building'
+          ? { sessions: [], total: indexedPage.total }
+          : null
       }
 
       const sessions: SessionListItem[] = []
       const pathExists = this.createCachedPathExists()
-      const projectsRoot = indexedPage.sessions.length > 0
-        ? await fs.realpath(this.getProjectsDir())
-        : null
+      const projectsRoot = await fs.realpath(this.getProjectsDir())
       for (const row of indexedPage.sessions) {
-        await this.validateIndexedTranscriptPath(
-          row.transcriptPath,
-          row.projectPath,
-          row.id,
-          projectsRoot!,
-        )
-        sessions.push(await this.hydrateIndexedSession(row, pathExists))
+        try {
+          await this.validateIndexedTranscriptPath(
+            row.transcriptPath,
+            row.projectPath,
+            row.id,
+            projectsRoot,
+          )
+          sessions.push(await this.hydrateIndexedSession(row, pathExists))
+        } catch {
+          // Drop a single stale/unreadable row instead of scanning every JSONL.
+        }
       }
-      if (sessions.length !== indexedPage.sessions.length) return null
       if (
         indexedMutationEpoch !== getSharedSessionMutationState(this.localIndexGateway).epoch
       ) {
         return null
+      }
+      if (sessions.length === 0) {
+        return status.state === 'building'
+          ? { sessions: [], total: indexedPage.total }
+          : null
       }
       return { sessions, total: indexedPage.total }
     } catch {
@@ -4620,17 +4746,22 @@ export class SessionService {
 
       if (!snapshotMessageId) continue
 
-      snapshotsByMessageId.set(snapshotMessageId, {
+      const beforeMapValid = !!entry.snapshot.trackedFileBackups && typeof entry.snapshot.trackedFileBackups === 'object' && !Array.isArray(entry.snapshot.trackedFileBackups)
+      snapshotsByMessageId.set(snapshotMessageId, migrateFileHistorySnapshot({
         messageId: snapshotMessageId as FileHistorySnapshot['messageId'],
-        trackedFileBackups:
-          entry.snapshot.trackedFileBackups &&
-          typeof entry.snapshot.trackedFileBackups === 'object'
-            ? (entry.snapshot.trackedFileBackups as FileHistorySnapshot['trackedFileBackups'])
+        trackedFileBackups: beforeMapValid ? entry.snapshot.trackedFileBackups as FileHistorySnapshot['trackedFileBackups'] : {},
+        ...(!beforeMapValid ? { [malformedFileHistoryBefore]: true } : {}),
+        // A corrupt completion marker must not become a legacy before-only
+        // record that can silently fall through to another turn's boundary.
+        ...(Object.prototype.hasOwnProperty.call(entry.snapshot, 'completedFileBackups') ? {
+          completedFileBackups: entry.snapshot.completedFileBackups && typeof entry.snapshot.completedFileBackups === 'object' && !Array.isArray(entry.snapshot.completedFileBackups)
+            ? entry.snapshot.completedFileBackups as FileHistorySnapshot['completedFileBackups']
             : {},
+        } : {}),
         timestamp: new Date(
           entry.snapshot.timestamp || entry.timestamp || new Date().toISOString(),
         ),
-      })
+      }))
     }
 
     return [...snapshotsByMessageId.values()]

@@ -24,7 +24,7 @@ import { sessionsApi } from '../../api/sessions'
 import { teamsApi } from '../../api/teams'
 import { useChatStore } from '../../stores/chatStore'
 import { useWorkspaceChatContextStore } from '../../stores/workspaceChatContextStore'
-import { useWorkspacePanelStore } from '../../stores/workspacePanelStore'
+import { useWorkspaceStore } from '../../stores/workspaceStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useSessionStore } from '../../stores/sessionStore'
 import { useTabStore } from '../../stores/tabStore'
@@ -298,6 +298,11 @@ async function selectAcrossMessageText(
   await waitForSelectionMenuUpdate()
 }
 
+async function expandChangedFileCards() {
+  const toggles = await screen.findAllByRole('button', { name: /^Show \d+ changed files$/ })
+  for (const toggle of toggles) fireEvent.click(toggle)
+}
+
 describe('MessageList nested tool calls', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
@@ -312,7 +317,7 @@ describe('MessageList nested tool calls', () => {
     useWorkspaceChatContextStore.setState(useWorkspaceChatContextStore.getInitialState(), true)
     // The workspace panel store is a shared singleton; reset it so preview tabs opened by
     // one test (clicking a change-card row) don't dedupe/leak into the next test.
-    useWorkspacePanelStore.setState(useWorkspacePanelStore.getInitialState(), true)
+    useWorkspaceStore.setState(useWorkspaceStore.getInitialState(), true)
     vi.spyOn(sessionsApi, 'getTurnCheckpoints').mockImplementation(
       () => new Promise(() => {}),
     )
@@ -5978,9 +5983,143 @@ describe('MessageList nested tool calls', () => {
 
     const cards = await screen.findAllByLabelText('Turn changed files')
     expect(cards).toHaveLength(2)
+    expect(cards.map((card) => card.closest<HTMLElement>('[data-chat-render-item-key]')?.dataset.chatRenderItemKey))
+      .toEqual(['assistant-1', 'assistant-2'])
+    for (const card of cards) {
+      expect(within(card).getByRole('button', { name: 'Show 1 changed files' }).getAttribute('aria-expanded'))
+        .toBe('false')
+      expect(within(card).queryByRole('button', { name: /^Open .* in workspace$/ })).toBeNull()
+    }
+    await expandChangedFileCards()
     expect(screen.getByText('first.ts')).toBeTruthy()
     expect(screen.getByText('second.ts')).toBeTruthy()
     expect(screen.queryByText('third.ts')).toBeNull()
+  })
+
+  it('keeps a chosen file list expanded when a later non-editing turn completes', async () => {
+    const firstCheckpoint = {
+      target: { targetUserMessageId: 'user-edit', userMessageIndex: 0, userMessageCount: 1 },
+      code: { available: true, filesChanged: ['src/kept.ts'], insertions: 1, deletions: 0 },
+    }
+    const getTurnCheckpoints = vi.mocked(sessionsApi.getTurnCheckpoints)
+      .mockResolvedValue({ checkpoints: [firstCheckpoint] })
+    const initialMessages: UIMessage[] = [
+      { id: 'user-edit', type: 'user_text', content: 'Create a source file', timestamp: 1 },
+      { id: 'assistant-edit', type: 'assistant_text', content: 'Created it.', timestamp: 2 },
+    ]
+    useChatStore.setState({
+      sessions: { [ACTIVE_TAB]: makeSessionState({ messages: initialMessages }) },
+    })
+    const { container } = render(<MessageList />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Show 1 changed files' }))
+    expect(screen.getByRole('button', { name: 'Open src/kept.ts in workspace' })).toBeTruthy()
+
+    getTurnCheckpoints.mockResolvedValue({
+      checkpoints: [
+        { ...firstCheckpoint, target: { ...firstCheckpoint.target, userMessageCount: 2 } },
+        {
+          target: { targetUserMessageId: 'user-chat', userMessageIndex: 1, userMessageCount: 2 },
+          code: { available: true, filesChanged: [], insertions: 0, deletions: 0 },
+        },
+      ],
+    })
+    act(() => {
+      useChatStore.setState({
+        sessions: {
+          [ACTIVE_TAB]: makeSessionState({ messages: [
+            ...initialMessages,
+            { id: 'user-chat', type: 'user_text', content: 'What is two plus two?', timestamp: 3 },
+            { id: 'assistant-chat', type: 'assistant_text', content: 'Four.', timestamp: 4 },
+          ] }),
+        },
+      })
+    })
+    await waitFor(() => expect(getTurnCheckpoints).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole('button', { name: 'Hide changed files' }).getAttribute('aria-expanded')).toBe('true')
+    expect(screen.getByRole('button', { name: 'Open src/kept.ts in workspace' })).toBeTruthy()
+    expect(screen.getAllByRole('region', { name: 'Turn changed files' })).toHaveLength(1)
+    const unrelatedReply = container.querySelector<HTMLElement>('[data-chat-render-item-key="assistant-chat"]')!
+    expect(within(unrelatedReply).queryByRole('region', { name: 'Turn changed files' })).toBeNull()
+  })
+
+  it('returns focus to the change summary when its file list was collapsed with the diff open', async () => {
+    vi.mocked(sessionsApi.getTurnCheckpoints).mockResolvedValue({ checkpoints: [{
+      target: { targetUserMessageId: 'user-origin-file', userMessageIndex: 0, userMessageCount: 1 },
+      code: { available: true, filesChanged: ['src/origin.ts'], insertions: 1, deletions: 0 },
+    }] })
+    vi.spyOn(sessionsApi, 'getWorkspaceDiff').mockResolvedValue({
+      state: 'ok', path: 'src/origin.ts', diff: 'diff --git a/src/origin.ts b/src/origin.ts\n+new',
+    })
+    useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({ messages: [
+      { id: 'user-origin-file', type: 'user_text', content: 'Create a source file', timestamp: 1 },
+      { id: 'assistant-origin-file', type: 'assistant_text', content: 'Created it.', timestamp: 2 },
+    ] }) } })
+    const { container } = render(<MessageList />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Show 1 changed files' }))
+    const opener = screen.getByRole('button', { name: 'Open src/origin.ts in workspace' })
+    const renderItem = container.querySelector<HTMLElement>('[data-chat-render-item-key="assistant-origin-file"]')!
+    const scrollIntoView = vi.fn()
+    Object.defineProperty(renderItem, 'scrollIntoView', { configurable: true, value: scrollIntoView })
+
+    fireEvent.click(opener)
+    await waitFor(() => expect(useWorkspaceStore.getState().getSession(ACTIVE_TAB).origin)
+      .toEqual({ sourceTurnKey: 'assistant-origin-file', sourceElementId: opener.id }))
+    fireEvent.click(screen.getByRole('button', { name: 'Hide changed files' }))
+    expect(screen.queryByRole('button', { name: 'Open src/origin.ts in workspace' })).toBeNull()
+    const summary = screen.getByRole('button', { name: 'Show 1 changed files' })
+    // The user can focus another surface while the original file opener is gone.
+    screen.getByRole('button', { name: 'Copy reply' }).focus()
+    act(() => useWorkspaceStore.getState().setLayout(ACTIVE_TAB, 'hidden'))
+
+    await waitFor(() => expect(document.activeElement).toBe(summary))
+    expect(summary.getAttribute('aria-expanded')).toBe('false')
+    expect(useWorkspaceStore.getState().getSession(ACTIVE_TAB).origin).toBeNull()
+    fireEvent.click(summary)
+    expect(screen.getByRole('button', { name: 'Open src/origin.ts in workspace' })).toBeTruthy()
+  })
+
+  it('preserves the expanded change card through virtual unmount and returns to its file opener', async () => {
+    vi.mocked(sessionsApi.getTurnCheckpoints).mockResolvedValue({ checkpoints: [{
+      target: { targetUserMessageId: 'user-virtual-file', userMessageIndex: 0, userMessageCount: 221 },
+      code: { available: true, filesChanged: ['src/virtual.ts'], insertions: 1, deletions: 0 },
+    }] })
+    vi.spyOn(sessionsApi, 'getWorkspaceDiff').mockResolvedValue({
+      state: 'ok', path: 'src/virtual.ts', diff: 'diff --git a/src/virtual.ts b/src/virtual.ts\n+new',
+    })
+    useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState({ messages: [
+      { id: 'user-virtual-file', type: 'user_text', content: 'Create a source file', timestamp: 0 },
+      { id: 'assistant-virtual-file', type: 'assistant_text', content: 'Created it.', timestamp: 1 },
+      ...Array.from({ length: 220 }, (_, index) => ({
+        id: `later-virtual-prompt-${index}`,
+        type: 'user_text' as const,
+        content: `Later prompt ${index}`,
+        timestamp: index + 2,
+      })),
+    ] }) } })
+    const { container } = render(<MessageList />)
+    const scrollArea = container.querySelector<HTMLElement>('.chat-scroll-area')!
+    Object.defineProperty(scrollArea, 'clientHeight', { configurable: true, value: 500 })
+    Object.defineProperty(scrollArea, 'scrollHeight', { configurable: true, value: 222 * 112 })
+    await waitForProgrammaticScrollReset()
+    scrollArea.scrollTop = 0
+    fireEvent.scroll(scrollArea)
+    fireEvent.click(await screen.findByRole('button', { name: 'Show 1 changed files' }))
+    const opener = screen.getByRole('button', { name: 'Open src/virtual.ts in workspace' })
+    fireEvent.click(opener)
+    await waitFor(() => expect(useWorkspaceStore.getState().getSession(ACTIVE_TAB).origin)
+      .toEqual({ sourceTurnKey: 'assistant-virtual-file', sourceElementId: opener.id }))
+
+    await waitForProgrammaticScrollReset()
+    scrollArea.scrollTop = 222 * 112 - 500
+    fireEvent.scroll(scrollArea)
+    await waitFor(() => expect(container.querySelector('[data-chat-render-item-key="assistant-virtual-file"]')).toBeNull())
+    act(() => useWorkspaceStore.getState().setLayout(ACTIVE_TAB, 'hidden'))
+
+    const remountedOpener = await screen.findByRole('button', { name: 'Open src/virtual.ts in workspace' })
+    expect(remountedOpener).not.toBe(opener)
+    await waitFor(() => expect(document.activeElement).toBe(remountedOpener))
+    expect(screen.getByRole('button', { name: 'Hide changed files' }).getAttribute('aria-expanded')).toBe('true')
+    expect(useWorkspaceStore.getState().getSession(ACTIVE_TAB).origin).toBeNull()
   })
 
   it('opens the workspace diff (working-tree) when a historical turn change row is clicked', async () => {
@@ -6014,7 +6153,7 @@ describe('MessageList nested tool calls', () => {
         },
       ],
     })
-    const getWorkspaceDiff = vi.spyOn(sessionsApi, 'getWorkspaceDiff').mockResolvedValue({
+    vi.spyOn(sessionsApi, 'getWorkspaceDiff').mockResolvedValue({
       state: 'ok',
       path: 'src/first.ts',
       diff: 'diff --session a/src/first.ts b/src/first.ts\n-old\n+new',
@@ -6057,12 +6196,20 @@ describe('MessageList nested tool calls', () => {
     render(<MessageList />)
 
     // Clicking the row no longer expands an inline diff inside the card — it jumps to
-    // the right-side workspace and opens a diff tab (via workspacePanelStore.openPreview,
-    // which fetches the *current working-tree* diff through getWorkspaceDiff).
+    // the right-side workspace and opens a review tab scoped to that file, with
+    // the `turn` comparison. The diff itself is fetched when the tab renders, so
+    // what the click has to guarantee is the *target*, not a network call.
+    await expandChangedFileCards()
     fireEvent.click(await screen.findByRole('button', { name: 'Open src/first.ts in workspace' }))
 
     await waitFor(() => {
-      expect(getWorkspaceDiff).toHaveBeenCalledWith(ACTIVE_TAB, 'src/first.ts')
+      const reviewTab = useWorkspaceStore.getState()
+        .getTabs(ACTIVE_TAB, 'side')
+        .find((tab) => tab.kind === 'review')
+      expect(reviewTab).toMatchObject({
+        source: { kind: 'turn' },
+        selectedPath: 'src/first.ts',
+      })
     })
     // The turn-snapshot diff endpoint is no longer used by the card.
     expect(getTurnCheckpointDiff).not.toHaveBeenCalled()
@@ -6097,7 +6244,7 @@ describe('MessageList nested tool calls', () => {
         },
       ],
     })
-    const getWorkspaceDiff = vi.spyOn(sessionsApi, 'getWorkspaceDiff').mockResolvedValue({
+    vi.spyOn(sessionsApi, 'getWorkspaceDiff').mockResolvedValue({
       state: 'ok',
       path: 'src/first.ts',
       diff: 'diff --git a/src/first.ts b/src/first.ts\n-old\n+new',
@@ -6132,10 +6279,17 @@ describe('MessageList nested tool calls', () => {
     // workspace diff for that relative path. Caveat (intended): the workspace diff is the
     // current working-tree diff, NOT the historical turn snapshot — so the turn cwd is no
     // longer carried through, and getTurnCheckpointDiff is not called.
+    await expandChangedFileCards()
     fireEvent.click(await screen.findByRole('button', { name: 'Open src/first.ts in workspace' }))
 
     await waitFor(() => {
-      expect(getWorkspaceDiff).toHaveBeenCalledWith(ACTIVE_TAB, 'src/first.ts')
+      const reviewTab = useWorkspaceStore.getState()
+        .getTabs(ACTIVE_TAB, 'side')
+        .find((tab) => tab.kind === 'review')
+      expect(reviewTab).toMatchObject({
+        source: { kind: 'turn' },
+        selectedPath: 'src/first.ts',
+      })
     })
     expect(getTurnCheckpointDiff).not.toHaveBeenCalled()
   })
@@ -6165,7 +6319,7 @@ describe('MessageList nested tool calls', () => {
         },
       ],
     })
-    const getWorkspaceDiff = vi.spyOn(sessionsApi, 'getWorkspaceDiff').mockResolvedValue({
+    vi.spyOn(sessionsApi, 'getWorkspaceDiff').mockResolvedValue({
       state: 'ok',
       path: 'src/live.ts',
       diff: 'diff --session a/src/live.ts b/src/live.ts\n+live',
@@ -6196,11 +6350,197 @@ describe('MessageList nested tool calls', () => {
 
     // The card only renders if the transcript checkpoint (id 'transcript-user-1') was
     // matched to the local message ('local-user-temp-id') by userMessageIndex.
+    await expandChangedFileCards()
     expect(await screen.findByText('live.ts')).toBeTruthy()
     // Clicking the row jumps to the right-side workspace diff for the relativized path.
     fireEvent.click(screen.getByRole('button', { name: 'Open src/live.ts in workspace' }))
     await waitFor(() => {
-      expect(getWorkspaceDiff).toHaveBeenCalledWith(ACTIVE_TAB, 'src/live.ts')
+      const reviewTab = useWorkspaceStore.getState()
+        .getTabs(ACTIVE_TAB, 'side')
+        .find((tab) => tab.kind === 'review')
+      expect(reviewTab).toMatchObject({
+        source: { kind: 'turn' },
+        selectedPath: 'src/live.ts',
+      })
+    })
+  })
+
+  it('reloads live turn checkpoints when the completed transcript mutation is committed', async () => {
+    const getTurnCheckpoints = vi.spyOn(sessionsApi, 'getTurnCheckpoints')
+      .mockResolvedValueOnce({ checkpoints: [] })
+      .mockResolvedValue({
+        checkpoints: [
+          {
+            target: {
+              targetUserMessageId: 'transcript-user-1',
+              userMessageIndex: 0,
+              userMessageCount: 1,
+            },
+            code: {
+              available: true,
+              filesChanged: ['/private/tmp/generated/src/App.jsx'],
+              insertions: 12,
+              deletions: 3,
+            },
+            workDir: '/private/tmp',
+          },
+        ],
+      })
+
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          chatState: 'idle',
+          historyMutationEpoch: 1,
+          messages: [
+            {
+              id: 'local-user-1',
+              type: 'user_text',
+              content: '在 /tmp 下创建项目',
+              timestamp: 1,
+            },
+            {
+              id: 'assistant-1',
+              type: 'assistant_text',
+              content: '完成。',
+              timestamp: 2,
+            },
+          ],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    await waitFor(() => {
+      expect(getTurnCheckpoints).toHaveBeenCalledTimes(1)
+    })
+    expect(screen.queryByText('App.jsx')).toBeNull()
+
+    act(() => {
+      useChatStore.setState((state) => ({
+        sessions: {
+          ...state.sessions,
+          [ACTIVE_TAB]: {
+            ...state.sessions[ACTIVE_TAB]!,
+            historyMutationEpoch: 2,
+          },
+        },
+      }))
+    })
+
+    await expandChangedFileCards()
+    expect(await screen.findByText('App.jsx')).toBeTruthy()
+    expect(getTurnCheckpoints).toHaveBeenCalledTimes(2)
+  })
+
+  it('aborts the stale turn checkpoint request when the viewed session changes', async () => {
+    const requests: Array<{ sessionId: string; signal?: AbortSignal }> = []
+    vi.mocked(sessionsApi.getTurnCheckpoints).mockImplementation((sessionId, options) => {
+      requests.push({ sessionId, signal: options?.signal })
+      return new Promise((_resolve, reject) => {
+        options?.signal?.addEventListener('abort', () => {
+          reject(options.signal?.reason ?? new DOMException('The operation was aborted', 'AbortError'))
+        }, { once: true })
+      })
+    })
+
+    const completedMessages: UIMessage[] = [
+      { id: 'user-1', type: 'user_text', content: 'Generate a file', timestamp: 1 },
+      { id: 'assistant-1', type: 'assistant_text', content: 'Done', timestamp: 2 },
+    ]
+    useChatStore.setState({
+      sessions: {
+        'session-one': makeSessionState({ messages: completedMessages }),
+        'session-two': makeSessionState({ messages: completedMessages }),
+      },
+    })
+
+    const { rerender } = render(<MessageList sessionId="session-one" />)
+    await waitFor(() => expect(requests).toHaveLength(1))
+    expect(requests[0]).toMatchObject({ sessionId: 'session-one' })
+    expect(requests[0]?.signal?.aborted).toBe(false)
+
+    rerender(<MessageList sessionId="session-two" />)
+
+    await waitFor(() => expect(requests).toHaveLength(2))
+    expect(requests[0]?.signal?.aborted).toBe(true)
+    expect(requests[1]).toMatchObject({ sessionId: 'session-two' })
+    expect(requests[1]?.signal?.aborted).toBe(false)
+  })
+
+  it('rewinds a live turn with the authoritative checkpoint id when the local UI id differs', async () => {
+    vi.spyOn(sessionsApi, 'getTurnCheckpoints').mockResolvedValue({
+      checkpoints: [
+        {
+          target: {
+            targetUserMessageId: 'transcript-user-1',
+            userMessageIndex: 0,
+            userMessageCount: 1,
+          },
+          code: {
+            available: true,
+            filesChanged: ['src/live.ts'],
+            insertions: 1,
+            deletions: 0,
+          },
+        },
+      ],
+    })
+    const rewind = vi.spyOn(sessionsApi, 'rewind').mockResolvedValue({
+      target: {
+        targetUserMessageId: 'transcript-user-1',
+        userMessageIndex: 0,
+        userMessageCount: 1,
+      },
+      conversation: {
+        messagesRemoved: 2,
+      },
+      code: {
+        available: true,
+        filesChanged: ['src/live.ts'],
+        insertions: 1,
+        deletions: 0,
+      },
+    })
+
+    useChatStore.setState({
+      reloadHistory: vi.fn().mockResolvedValue(undefined),
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            {
+              id: 'local-user-temp-id',
+              type: 'user_text',
+              content: '实时这一轮',
+              timestamp: 1,
+            },
+            {
+              id: 'assistant-1',
+              type: 'assistant_text',
+              content: 'done',
+              timestamp: 2,
+            },
+          ],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    await expandChangedFileCards()
+    await screen.findByText('live.ts')
+    fireEvent.click(screen.getByRole('button', { name: 'Undo current turn changes' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Undo current turn?' })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Undo current turn' }))
+
+    await waitFor(() => {
+      expect(rewind).toHaveBeenCalledWith(ACTIVE_TAB, {
+        targetUserMessageId: 'transcript-user-1',
+        userMessageIndex: 0,
+        expectedContent: '实时这一轮',
+        mode: 'both',
+      })
     })
   })
 
@@ -6423,6 +6763,7 @@ describe('MessageList nested tool calls', () => {
 
     render(<MessageList />)
 
+    await expandChangedFileCards()
     expect(await screen.findByText('blank-response.ts')).toBeTruthy()
   })
 
@@ -6468,6 +6809,7 @@ describe('MessageList nested tool calls', () => {
 
     render(<MessageList />)
 
+    await expandChangedFileCards()
     expect(await screen.findByText('first.ts')).toBeTruthy()
     expect(screen.queryByText('Markdown')).toBeNull()
 
@@ -6726,6 +7068,7 @@ describe('MessageList nested tool calls', () => {
 
     render(<MessageList />)
 
+    await expandChangedFileCards()
     const historicalCard = (await screen.findByText('first.ts')).closest('section')
     expect(historicalCard).toBeTruthy()
     fireEvent.click(
@@ -6806,6 +7149,7 @@ describe('MessageList nested tool calls', () => {
 
     render(<MessageList />)
 
+    await expandChangedFileCards()
     await screen.findByText('first.ts')
     const undoButton = screen.getByRole('button', { name: 'Undo current turn changes' })
     expect((undoButton as HTMLButtonElement).disabled).toBe(false)
@@ -6833,7 +7177,7 @@ describe('MessageList nested tool calls', () => {
     expect(reloadHistory).toHaveBeenCalledWith(ACTIVE_TAB)
   })
 
-  it('keeps Bash-only undo reachable when the completed turn has no checkpointed files', async () => {
+  it('hides the file-change card after a Bash-only turn completes without checkpointed files', async () => {
     vi.spyOn(sessionsApi, 'getTurnCheckpoints').mockResolvedValue({
       checkpoints: [
         {
@@ -6853,33 +7197,6 @@ describe('MessageList nested tool calls', () => {
         },
       ],
     })
-    const rewind = vi.spyOn(sessionsApi, 'rewind').mockResolvedValue({
-      target: {
-        targetUserMessageId: 'transcript-user-1',
-        userMessageIndex: 0,
-        userMessageCount: 1,
-      },
-      conversation: {
-        messagesRemoved: 4,
-        removedMessageIds: [
-          'transcript-user-1',
-          'transcript-tool-1',
-          'transcript-result-1',
-          'transcript-assistant-1',
-        ],
-      },
-      code: {
-        available: true,
-        filesChanged: [],
-        insertions: 0,
-        deletions: 0,
-      },
-      restoreAvailable: true,
-      unverifiedChangeSources: ['Bash'],
-      mode: 'both',
-    })
-    vi.spyOn(sessionsApi, 'getMessages').mockResolvedValue({ messages: [] })
-
     render(<MessageList />)
 
     // Drive the first turn through the same store actions and server events as
@@ -6888,7 +7205,7 @@ describe('MessageList nested tool calls', () => {
     // make the regression self-consistent by construction.
     const store = useChatStore.getState()
     act(() => {
-      store.sendMessage(ACTIVE_TAB, 'write only with Bash')
+      store.sendMessage(ACTIVE_TAB, 'read the calendar')
       store.handleServerMessage(ACTIVE_TAB, {
         type: 'content_start',
         blockType: 'tool_use',
@@ -6899,7 +7216,7 @@ describe('MessageList nested tool calls', () => {
         type: 'tool_use_complete',
         toolName: 'Bash',
         toolUseId: 'bash-only-1',
-        input: { command: "printf 'bash-only\\n' > qa/rewind-bash-only.txt" },
+        input: { command: 'lark-cli calendar list' },
       })
       store.handleServerMessage(ACTIVE_TAB, {
         type: 'tool_result',
@@ -6918,35 +7235,16 @@ describe('MessageList nested tool calls', () => {
       store.handleServerMessage(ACTIVE_TAB, { type: 'status', state: 'idle' })
     })
 
-    const undoButton = await screen.findByRole('button', { name: 'Undo current turn changes' })
-    expect((undoButton as HTMLButtonElement).disabled).toBe(false)
-    expect(screen.getByText(
-      'Undo restores the files above; changes from Bash were not checkpointed and will remain',
-    )).toBeTruthy()
-
-    fireEvent.click(undoButton)
-    const dialog = await screen.findByRole('dialog', { name: 'Undo current turn?' })
-    expect(within(dialog).getByText(
-      'Note: file changes made by Bash were not checkpointed, so undo will not revert them.',
-    )).toBeTruthy()
-    expect((
-      within(dialog).getByRole('button', { name: 'Roll back conversation only' }) as HTMLButtonElement
-    ).disabled).toBe(false)
-
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Undo current turn' }))
-
     await waitFor(() => {
-      expect(rewind).toHaveBeenCalledWith(ACTIVE_TAB, {
-        targetUserMessageId: 'transcript-user-1',
-        userMessageIndex: 0,
-        expectedContent: 'write only with Bash',
-        mode: 'both',
-      })
+      expect(sessionsApi.getTurnCheckpoints).toHaveBeenCalled()
     })
-    expect(useUIStore.getState().toasts.at(-1)).toMatchObject({
-      type: 'warning',
-      message: 'Rewound 4 messages and restored the checkpointed files; changes from Bash were not checkpointed and remain on disk.',
-    })
+    expect(await screen.findByText('BASH_ONLY_DONE')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Undo current turn changes' })).toBeNull()
+    expect(screen.queryByLabelText('Turn changed files')).toBeNull()
+    expect(screen.queryByText('0 files changed')).toBeNull()
+    expect(screen.queryByText(
+      'Undo restores the files above; changes from Bash were not checkpointed and will remain',
+    )).toBeNull()
   })
 
   it('rewinds a failed continue through the authoritative conversation-only target', async () => {
@@ -7043,6 +7341,7 @@ describe('MessageList nested tool calls', () => {
       store.handleServerMessage(ACTIVE_TAB, { type: 'status', state: 'idle' })
     })
 
+    await expandChangedFileCards()
     expect(await screen.findByText('kept.ts')).toBeTruthy()
     const conversationUndo = await screen.findByRole('button', { name: 'Roll back conversation' })
     expect(screen.getByText('Provider request failed')).toBeTruthy()
@@ -7096,6 +7395,7 @@ describe('MessageList nested tool calls', () => {
         ],
       })
     })
+    await expandChangedFileCards()
     expect(await screen.findByText('kept.ts')).toBeTruthy()
     expect(useChatStore.getState().sessions[ACTIVE_TAB]?.composerPrefill).toMatchObject({
       text: 'continue',
@@ -7180,7 +7480,7 @@ describe('MessageList nested tool calls', () => {
     expect(await screen.findByRole('button', { name: 'Roll back conversation' })).toBeTruthy()
   })
 
-  it('does not render cards for turns without file changes', async () => {
+  it.each([{ sources: [] }, { sources: ['Bash'] }])('does not render cards for turns without file changes (sources=$sources)', async ({ sources }) => {
     vi.spyOn(sessionsApi, 'getTurnCheckpoints').mockResolvedValue({
       checkpoints: [
         {
@@ -7208,6 +7508,7 @@ describe('MessageList nested tool calls', () => {
             insertions: 0,
             deletions: 0,
           },
+          unverifiedChangeSources: sources,
         },
       ],
     })
@@ -7249,6 +7550,7 @@ describe('MessageList nested tool calls', () => {
 
     const cards = await screen.findAllByLabelText('Turn changed files')
     expect(cards).toHaveLength(1)
+    await expandChangedFileCards()
     expect(screen.getByText('first.ts')).toBeTruthy()
     expect(screen.queryByText('second.ts')).toBeNull()
     expect(screen.queryByRole('button', { name: 'Roll back conversation' })).toBeNull()
@@ -7363,6 +7665,7 @@ describe('MessageList nested tool calls', () => {
     expect(within(firstProgressItem as HTMLElement).queryByRole('button', { name: 'Open' })).toBeNull()
     expect(within(secondProgressItem as HTMLElement).queryByRole('button', { name: 'Open' })).toBeNull()
     expect(within(finalItem as HTMLElement).getByRole('button', { name: 'Open' })).toBeTruthy()
+    await expandChangedFileCards()
     expect(within(turnCard).getByText('ink-survey-philosophy.md')).toBeTruthy()
   })
 
@@ -7551,16 +7854,15 @@ describe('MessageList nested tool calls', () => {
     vi.spyOn(renderItem, 'getBoundingClientRect').mockReturnValue({ top: 120, bottom: 480, left: 60, right: 620 } as DOMRect)
 
     await act(async () => {
-      useWorkspacePanelStore.getState().openPanel(ACTIVE_TAB)
-      useWorkspacePanelStore.setState({
-        originBySession: {
-          [ACTIVE_TAB]: { sourceTurnKey: 'assistant-origin', sourceElementId: 'origin-opener' },
-        },
+      useWorkspaceStore.getState().openTarget(ACTIVE_TAB, { kind: 'file', path: 'a.ts' })
+      useWorkspaceStore.getState().setOrigin(ACTIVE_TAB, {
+        sourceTurnKey: 'assistant-origin',
+        sourceElementId: 'origin-opener',
       })
       await Promise.resolve()
     })
     await act(async () => {
-      useWorkspacePanelStore.getState().closePanel(ACTIVE_TAB)
+      useWorkspaceStore.getState().setLayout(ACTIVE_TAB, 'hidden')
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
     })
 
@@ -7590,16 +7892,15 @@ describe('MessageList nested tool calls', () => {
     vi.spyOn(renderItem, 'getBoundingClientRect').mockReturnValue({ top: 80, bottom: 460, left: 60, right: 620 } as DOMRect)
 
     await act(async () => {
-      useWorkspacePanelStore.getState().openPanel(ACTIVE_TAB)
-      useWorkspacePanelStore.setState({
-        originBySession: {
-          [ACTIVE_TAB]: { sourceTurnKey: 'assistant-clipped', sourceElementId: 'clipped-origin-opener' },
-        },
+      useWorkspaceStore.getState().openTarget(ACTIVE_TAB, { kind: 'file', path: 'a.ts' })
+      useWorkspaceStore.getState().setOrigin(ACTIVE_TAB, {
+        sourceTurnKey: 'assistant-clipped',
+        sourceElementId: 'clipped-origin-opener',
       })
       await Promise.resolve()
     })
     await act(async () => {
-      useWorkspacePanelStore.getState().closePanel(ACTIVE_TAB)
+      useWorkspaceStore.getState().setLayout(ACTIVE_TAB, 'hidden')
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
     })
 
@@ -7634,16 +7935,15 @@ describe('MessageList nested tool calls', () => {
     }))
 
     await act(async () => {
-      useWorkspacePanelStore.getState().openPanel(ACTIVE_TAB)
-      useWorkspacePanelStore.setState({
-        originBySession: {
-          [ACTIVE_TAB]: { sourceTurnKey: 'virtual-origin-0', sourceElementId: 'virtual-origin-opener' },
-        },
+      useWorkspaceStore.getState().openTarget(ACTIVE_TAB, { kind: 'file', path: 'a.ts' })
+      useWorkspaceStore.getState().setOrigin(ACTIVE_TAB, {
+        sourceTurnKey: 'virtual-origin-0',
+        sourceElementId: 'virtual-origin-opener',
       })
       await Promise.resolve()
     })
     await act(async () => {
-      useWorkspacePanelStore.getState().closePanel(ACTIVE_TAB)
+      useWorkspaceStore.getState().setLayout(ACTIVE_TAB, 'hidden')
       await Promise.resolve()
     })
 
@@ -7662,7 +7962,7 @@ describe('MessageList nested tool calls', () => {
     })
 
     expect(document.activeElement).toBe(opener)
-    expect(useWorkspacePanelStore.getState().getOrigin(ACTIVE_TAB)).toBeNull()
+    expect(useWorkspaceStore.getState().getSession(ACTIVE_TAB).origin).toBeNull()
     vi.unstubAllGlobals()
   })
 
@@ -7677,13 +7977,9 @@ describe('MessageList nested tool calls', () => {
         }),
       },
     })
-    useWorkspacePanelStore.setState({
-      panelBySession: {
-        [ACTIVE_TAB]: { isOpen: false, activeView: 'changed' },
-      },
-      originBySession: {
-        [ACTIVE_TAB]: { sourceTurnKey: 'assistant-return', sourceElementId: 'return-origin-opener' },
-      },
+    useWorkspaceStore.getState().setOrigin(ACTIVE_TAB, {
+      sourceTurnKey: 'assistant-return',
+      sourceElementId: 'return-origin-opener',
     })
     const frames: FrameRequestCallback[] = []
     vi.stubGlobal('requestAnimationFrame', vi.fn((callback: FrameRequestCallback) => {
@@ -7712,7 +8008,7 @@ describe('MessageList nested tool calls', () => {
 
     expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' })
     expect(document.activeElement).toBe(opener)
-    expect(useWorkspacePanelStore.getState().getOrigin(ACTIVE_TAB)).toBeNull()
+    expect(useWorkspaceStore.getState().getSession(ACTIVE_TAB).origin).toBeNull()
     vi.unstubAllGlobals()
   })
 })

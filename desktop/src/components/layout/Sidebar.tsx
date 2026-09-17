@@ -1,5 +1,6 @@
 import { forwardRef, useEffect, useLayoutEffect, useState, useCallback, useMemo, useRef } from 'react'
 import { Bell, Check, ChevronDown, Clock, Folder, FolderOpen, FolderPlus, GitBranch, MoreHorizontal, Pin, PinOff, RefreshCw, RotateCcw, SquarePen, X } from 'lucide-react'
+import { releaseWorkspaceSession } from '../../lib/workspace/releaseSession'
 import { useSessionStore } from '../../stores/sessionStore'
 import { useUIStore } from '../../stores/uiStore'
 import { useTranslation, type TranslationKey } from '../../i18n'
@@ -26,7 +27,7 @@ import {
 } from './sidebarTaskGroups'
 import { sessionsApi } from '../../api/sessions'
 import type { SessionListItem } from '../../types/session'
-import { useTabStore, SETTINGS_TAB_ID, SCHEDULED_TAB_ID, MARKET_TAB_ID } from '../../stores/tabStore'
+import { useTabStore, SETTINGS_TAB_ID, SCHEDULED_TAB_ID, MARKET_TAB_ID, CONNECTORS_TAB_ID } from '../../stores/tabStore'
 import { useChatStore } from '../../stores/chatStore'
 import { useOpenTargetStore } from '../../stores/openTargetStore'
 import {
@@ -48,6 +49,7 @@ const desktopHost = getDesktopHost()
 const isDesktopRuntime = desktopHost.isDesktop
 const isWindows = typeof navigator !== 'undefined' && /Win/.test(navigator.platform)
 const SESSION_LIST_AUTO_REFRESH_MS = 30_000
+const SESSION_LIST_BUILDING_REFRESH_MS = 1_500
 const SESSION_LIST_FOCUS_REFRESH_MIN_MS = 5_000
 const PROJECT_ORDER_STORAGE_KEY = 'cc-haha-sidebar-project-order'
 const PROJECT_PINNED_STORAGE_KEY = 'cc-haha-sidebar-pinned-projects'
@@ -117,6 +119,7 @@ export function Sidebar({
   const isLoading = useSessionStore((s) => s.isLoading)
   const error = useSessionStore((s) => s.error)
   const indexStatus = useSessionStore((s) => s.indexStatus)
+  const indexBuilding = indexStatus?.mode === 'on' && indexStatus.state === 'building'
   const fetchSessions = useSessionStore((s) => s.fetchSessions)
   const deleteSession = useSessionStore((s) => s.deleteSession)
   const deleteSessions = useSessionStore((s) => s.deleteSessions)
@@ -180,7 +183,41 @@ export function Sidebar({
   } | null>(null)
   const sessionScrollAreaRef = useRef<HTMLDivElement>(null)
   const pendingSessionScrollAnchorRef = useRef<SessionScrollAnchor | null>(null)
-  const refreshSessionsNow = useSessionListAutoRefresh(fetchSessions)
+  const refreshSessionsNow = useSessionListAutoRefresh(fetchSessions, indexBuilding)
+
+  useEffect(() => useSessionStore.subscribe((nextState, previousState) => {
+    if (nextState.sessions === previousState.sessions) return
+
+    pendingSessionScrollAnchorRef.current = null
+    if (
+      nextState.indexStatus === previousState.indexStatus
+      || nextState.indexStatus?.mode !== 'on'
+      || nextState.indexStatus.state !== 'building'
+    ) {
+      return
+    }
+
+    const scrollArea = sessionScrollAreaRef.current
+    if (!scrollArea || scrollArea.scrollTop <= 0) return
+    pendingSessionScrollAnchorRef.current = readFirstVisibleSessionAnchor(scrollArea)
+  }), [])
+
+  useLayoutEffect(() => {
+    const anchor = pendingSessionScrollAnchorRef.current
+    pendingSessionScrollAnchorRef.current = null
+    if (!anchor) return
+
+    const scrollArea = sessionScrollAreaRef.current
+    if (!scrollArea || scrollArea.scrollTop <= 0) return
+    const row = findSessionRow(scrollArea, anchor.sessionId)
+    if (!row) return
+
+    const topOffset = row.getBoundingClientRect().top - scrollArea.getBoundingClientRect().top
+    const delta = topOffset - anchor.topOffset
+    if (Number.isFinite(delta) && delta !== 0) {
+      scrollArea.scrollTop += delta
+    }
+  }, [sessions])
 
   useEffect(() => useSessionStore.subscribe((nextState, previousState) => {
     if (nextState.sessions === previousState.sessions) return
@@ -770,6 +807,7 @@ export function Sidebar({
     if (!pendingDeleteSessionId) return
     await deleteSession(pendingDeleteSessionId)
     disconnectSession(pendingDeleteSessionId)
+    releaseWorkspaceSession(pendingDeleteSessionId)
     closeTab(pendingDeleteSessionId)
     setPendingDeleteSessionId(null)
   }, [closeTab, deleteSession, disconnectSession, pendingDeleteSessionId])
@@ -821,6 +859,7 @@ export function Sidebar({
       const result = await deleteSessions(ids)
       for (const sessionId of result.successes) {
         disconnectSession(sessionId)
+        releaseWorkspaceSession(sessionId)
         closeTab(sessionId)
       }
 
@@ -1051,19 +1090,20 @@ export function Sidebar({
         )}
         {!isMobile && (
           <NavItem
-            active={activeTabId === MARKET_TAB_ID}
+            active={activeTabId === MARKET_TAB_ID || activeTabId === CONNECTORS_TAB_ID}
             collapsed={!expanded}
-            label={t('sidebar.market')}
+            label={t('sidebar.extensions')}
             touchFriendly={isMobile}
             onClick={() => {
-              useTabStore.getState().openTab(MARKET_TAB_ID, t('sidebar.market'), 'market')
+              useTabStore.getState().openTab(MARKET_TAB_ID, t('sidebar.extensions'), 'market')
               closeMobileDrawer()
             }}
             icon={<StorefrontIcon />}
           >
-            {t('sidebar.market')}
+            {t('sidebar.extensions')}
           </NavItem>
         )}
+
       </div>
 
       {expanded ? (
@@ -1232,6 +1272,7 @@ export function Sidebar({
                   ? []
                   : getVisibleProjectSessions(project.sessions, sessionsExpanded, activeTabId)
                 const hiddenCount = project.sessions.length - visibleItems.length
+                const showSessionFoldControl = project.sessions.length > PROJECT_GROUP_VISIBLE_COUNT
                 const groupIds = project.sessions.map((session) => session.id)
                 const groupSelectedCount = groupIds.filter((id) => selectedSessionIds.has(id)).length
                 const history = projectHistory[project.key]
@@ -1440,7 +1481,7 @@ export function Sidebar({
                             </div>
                           ))}
                         </ProjectSessionList>
-                        {(hiddenCount > 0 || sessionsExpanded) && (
+                        {showSessionFoldControl && (
                           <div className="mt-2 flex justify-start px-2.5">
                             <button
                               type="button"
@@ -1469,7 +1510,7 @@ export function Sidebar({
         <div className="flex-1" aria-hidden="true" />
       )}
 
-      {!isMobile && (
+      {(
         <div
           data-testid="sidebar-settings-dock"
           className={`sidebar-settings-dock absolute bottom-0 left-0 right-0 border-t border-[var(--color-border)] p-3 ${expanded ? '' : 'flex justify-center'}`}
@@ -1690,15 +1731,21 @@ export function Sidebar({
   )
 }
 
-function useSessionListAutoRefresh(fetchSessions: () => Promise<void>): () => Promise<void> {
+function useSessionListAutoRefresh(
+  fetchSessions: () => Promise<void>,
+  indexBuilding = false,
+): () => Promise<void> {
   const inFlightRef = useRef<Promise<void> | null>(null)
   const lastStartedAtRef = useRef(0)
+  const minIntervalMs = indexBuilding
+    ? SESSION_LIST_BUILDING_REFRESH_MS
+    : SESSION_LIST_FOCUS_REFRESH_MIN_MS
 
   const refreshSessions = useCallback((force = false) => {
     if (inFlightRef.current && !force) return inFlightRef.current
 
     const now = Date.now()
-    if (!force && now - lastStartedAtRef.current < SESSION_LIST_FOCUS_REFRESH_MIN_MS) {
+    if (!force && now - lastStartedAtRef.current < minIntervalMs) {
       return Promise.resolve()
     }
 
@@ -1713,7 +1760,7 @@ function useSessionListAutoRefresh(fetchSessions: () => Promise<void>): () => Pr
       })
     inFlightRef.current = request
     return request
-  }, [fetchSessions])
+  }, [fetchSessions, minIntervalMs])
 
   useEffect(() => {
     void refreshSessions(true)
@@ -1728,14 +1775,14 @@ function useSessionListAutoRefresh(fetchSessions: () => Promise<void>): () => Pr
     const timer = window.setInterval(() => {
       if (!isDocumentVisible()) return
       void refreshSessions()
-    }, SESSION_LIST_AUTO_REFRESH_MS)
+    }, indexBuilding ? SESSION_LIST_BUILDING_REFRESH_MS : SESSION_LIST_AUTO_REFRESH_MS)
 
     return () => {
       window.removeEventListener('focus', refreshIfVisible)
       document.removeEventListener('visibilitychange', refreshIfVisible)
       window.clearInterval(timer)
     }
-  }, [refreshSessions])
+  }, [refreshSessions, indexBuilding])
 
   return useCallback(() => refreshSessions(true), [refreshSessions])
 }

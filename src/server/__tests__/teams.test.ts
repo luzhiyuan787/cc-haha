@@ -218,6 +218,7 @@ function disabledIndexGateway(): LocalIndexGateway {
     isSessionScopeReady: () => false,
     listSessions: () => ({ sessions: [], total: 0 }),
     findSessionFiles: () => [],
+    getSession: () => null,
     async rebuild() { return this.getPublicStatus() },
   }
 }
@@ -3615,6 +3616,7 @@ describe('TeamService', () => {
       isSessionScopeReady: () => true,
       listSessions: () => ({ sessions: [], total: 0 }),
       findSessionFiles: () => [],
+      getSession: () => null,
       getSessionEntryLocators: () => ({
         source: { path: filePath, size: stat.size, mtimeMs: stat.mtimeMs, fileIdentity: null, fingerprint, indexedBytes: stat.size, parserVersion: 3, state: 'ready', lastErrorCode: null, updatedAtMs: 1 },
         entries: [
@@ -3727,6 +3729,7 @@ describe('TeamService', () => {
       isSessionScopeReady: () => true,
       listSessions: () => ({ sessions: [], total: 0 }),
       findSessionFiles: () => [],
+      getSession: () => null,
       getSessionEntryLocators: () => locatorPage,
       async rebuild() { return this.getPublicStatus() },
     }
@@ -3866,6 +3869,7 @@ describe('TeamService', () => {
       isSessionScopeReady: () => true,
       listSessions: () => ({ sessions: [], total: 0 }),
       findSessionFiles: () => [],
+      getSession: () => null,
       getSessionEntryLocators: () => locatorPage,
       async rebuild() { return this.getPublicStatus() },
     }
@@ -3952,6 +3956,7 @@ describe('TeamService', () => {
       isSessionScopeReady: () => true,
       listSessions: () => ({ sessions: [], total: 0 }),
       findSessionFiles: () => [],
+      getSession: () => null,
       getSessionEntryLocators: () => ({
         source: {
           path: filePath,

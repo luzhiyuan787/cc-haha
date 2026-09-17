@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import '@testing-library/jest-dom'
 
-import { Settings } from '../pages/Settings'
+import { DesktopSettings as Settings } from '../pages/Settings'
 import { useSettingsStore } from '../stores/settingsStore'
 import { useUIStore } from '../stores/uiStore'
 import { useUpdateStore } from '../stores/updateStore'
@@ -249,6 +249,7 @@ describe('Settings > General tab', () => {
       autoModeOptInAccepted: false,
       thinkingEnabled: true,
       workflowKeywordTriggerEnabled: true,
+      agentTeamsEnabled: true,
       autoDreamEnabled: false,
       skipWebFetchPreflight: true,
       desktopNotificationsEnabled: true,
@@ -640,6 +641,24 @@ describe('Settings > General tab', () => {
     })
   })
 
+  it.each([14400, 43200, 2147483])('saves a long request timeout of %i seconds', async (seconds) => {
+    render(<Settings />)
+    fireEvent.click(screen.getByText('General'))
+    const timeoutInput = screen.getByLabelText('AI request timeout')
+    fireEvent.change(timeoutInput, { target: { value: String(seconds) } })
+    fireEvent.blur(timeoutInput)
+    expect(timeoutInput).toHaveValue(seconds)
+    const saveButton = screen.getAllByRole('button', { name: 'Save' })[0]!
+    expect(saveButton).not.toBeDisabled()
+
+    await act(async () => {
+      fireEvent.click(saveButton)
+    })
+    expect(useSettingsStore.getState().setNetwork).toHaveBeenCalledWith(expect.objectContaining({
+      aiRequestTimeoutMs: seconds * 1000,
+    }))
+  })
+
   it('validates typed provider network timeout and supports precise step controls', () => {
     render(<Settings />)
 
@@ -647,8 +666,8 @@ describe('Settings > General tab', () => {
     const timeoutInput = screen.getByLabelText('AI request timeout')
     const saveButton = screen.getAllByRole('button', { name: 'Save' })[0]!
 
-    fireEvent.change(timeoutInput, { target: { value: '2000' } })
-    expect(screen.getByText('Enter a whole number from 30 to 1800 seconds.')).toBeInTheDocument()
+    fireEvent.change(timeoutInput, { target: { value: '2147484' } })
+    expect(screen.getByText('Enter a whole number from 30 to 2147483 seconds.')).toBeInTheDocument()
     expect(saveButton).toBeDisabled()
 
     fireEvent.change(timeoutInput, { target: { value: '90' } })
@@ -1247,6 +1266,52 @@ describe('Settings > General tab', () => {
       })
       expect(toggle).toBeChecked()
       expect(updateUser).toHaveBeenLastCalledWith({ workflowKeywordTriggerEnabled: true })
+    } finally {
+      updateUser.mockRestore()
+    }
+  })
+
+  it('saves Agent Teams changes and explains when they take effect', async () => {
+    const updateUser = vi.spyOn(settingsApi, 'updateUser').mockResolvedValue({ ok: true })
+    try {
+      render(<Settings />)
+      fireEvent.click(screen.getByText('General'))
+      const toggle = screen.getByRole('switch', { name: 'Enable Agent Teams' })
+      expect(toggle).toBeChecked()
+      expect(screen.getByText('Applies to new sessions. Restart the app to apply changes to existing sessions.')).toBeVisible()
+
+      await act(async () => { fireEvent.click(toggle) })
+      expect(toggle).not.toBeChecked()
+      expect(updateUser).toHaveBeenLastCalledWith({ agentTeamsEnabled: false })
+      await act(async () => { fireEvent.click(toggle) })
+      expect(toggle).toBeChecked()
+      expect(updateUser).toHaveBeenLastCalledWith({ agentTeamsEnabled: true })
+    } finally {
+      updateUser.mockRestore()
+    }
+  })
+
+  it('disables Agent Teams while saving and reports failure after rolling back', async () => {
+    let rejectSave!: (error: Error) => void
+    const updateUser = vi.spyOn(settingsApi, 'updateUser').mockImplementation(() => new Promise((_, reject) => {
+      rejectSave = reject
+    }))
+    try {
+      render(<Settings />)
+      fireEvent.click(screen.getByText('General'))
+      const toggle = screen.getByRole('switch', { name: 'Enable Agent Teams' })
+      fireEvent.click(toggle)
+      expect(toggle).toBeDisabled()
+      expect(toggle).not.toBeChecked()
+      expect(updateUser).toHaveBeenCalledTimes(1)
+
+      await act(async () => { rejectSave(new Error('disk full')) })
+      expect(toggle).toBeEnabled()
+      expect(toggle).toBeChecked()
+      expect(useUIStore.getState().toasts.at(-1)).toMatchObject({
+        type: 'error',
+        message: 'Failed to save Agent Teams settings. Please try again.',
+      })
     } finally {
       updateUser.mockRestore()
     }
@@ -2190,7 +2255,7 @@ describe('Settings > Providers tab', () => {
 
     expect(MOCK_DELETE_PROVIDER).not.toHaveBeenCalled()
     expect(screen.getByRole('dialog')).toBeInTheDocument()
-    expect(screen.getByText('Delete provider "MiniMax-M2.7-highspeed(openai)"? This cannot be undone.')).toBeInTheDocument()
+    expect(screen.getByText('Delete model configuration "MiniMax-M2.7-highspeed(openai)"? This cannot be undone.')).toBeInTheDocument()
 
     const dialog = screen.getByRole('dialog')
     await act(async () => {
@@ -2201,12 +2266,31 @@ describe('Settings > Providers tab', () => {
     expect(MOCK_DELETE_PROVIDER).toHaveBeenCalledWith('provider-1')
   })
 
+  it.each([
+    ['zh', '模型配置', '模型管理', '添加模型', '配置名称'],
+    ['zh-TW', '模型設定', '模型管理', '新增模型', '設定名稱'],
+    ['en', 'Model Settings', 'Model Management', 'Add Model', 'Configuration name'],
+    ['jp', 'モデル設定', 'モデル管理', 'モデルを追加', '設定名'],
+    ['kr', '모델 설정', '모델 관리', '모델 추가', '설정 이름'],
+  ] as const)('uses model terminology throughout settings in %s', (locale, menu, title, add, name) => {
+    useSettingsStore.setState({ locale })
+    render(<Settings />)
+
+    expect(screen.getByRole('button', { name: new RegExp(menu) })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: title })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(add) }))
+
+    const dialog = screen.getByRole('dialog')
+    expect(within(dialog).getByRole('heading', { name: add })).toBeInTheDocument()
+    expect(within(dialog).getByLabelText(new RegExp(name))).toBeInTheDocument()
+  })
+
   it('keeps custom provider creation available when presets are unavailable', async () => {
     providerStoreState.presets = []
 
     render(<Settings />)
 
-    const addButton = screen.getByRole('button', { name: /Add Provider/i })
+    const addButton = screen.getByRole('button', { name: /Add Model/i })
     expect(addButton).toBeEnabled()
 
     fireEvent.click(addButton)
@@ -2232,7 +2316,7 @@ describe('Settings > Providers tab', () => {
       providerStoreState.presets = [ZHIPU_REGIONAL_PRESET]
 
       render(<Settings />)
-      fireEvent.click(screen.getByRole('button', { name: /Add Provider/i }))
+      fireEvent.click(screen.getByRole('button', { name: /Add Model/i }))
 
       const dialog = screen.getByRole('dialog')
       await waitFor(() => expect(settleSettings).toBeTypeOf('function'))
@@ -2266,7 +2350,7 @@ describe('Settings > Providers tab', () => {
     providerStoreState.presets = [ZHIPU_REGIONAL_PRESET]
 
     render(<Settings />)
-    fireEvent.click(screen.getByRole('button', { name: /Add Provider/i }))
+    fireEvent.click(screen.getByRole('button', { name: /Add Model/i }))
 
     const dialog = screen.getByRole('dialog')
     await waitFor(() => expect(resolveSettings).toBeTypeOf('function'))
@@ -2317,7 +2401,7 @@ describe('Settings > Providers tab', () => {
 
     render(<Settings />)
 
-    fireEvent.click(screen.getByRole('button', { name: /Add Provider/i }))
+    fireEvent.click(screen.getByRole('button', { name: /Add Model/i }))
 
     const dialog = screen.getByRole('dialog')
     expect(within(dialog).queryByRole('combobox')).not.toBeInTheDocument()
@@ -2351,7 +2435,7 @@ describe('Settings > Providers tab', () => {
     }]
 
     render(<Settings />)
-    fireEvent.click(screen.getByRole('button', { name: /Add Provider/i }))
+    fireEvent.click(screen.getByRole('button', { name: /Add Model/i }))
 
     const dialog = screen.getByRole('dialog')
     const mediaSupport = within(dialog).getByLabelText('Preserve nested tool result media')
@@ -2407,7 +2491,7 @@ describe('Settings > Providers tab', () => {
 
     render(<Settings />)
 
-    fireEvent.click(screen.getByRole('button', { name: /添加服务商/i }))
+    fireEvent.click(screen.getByRole('button', { name: /添加模型/i }))
 
     const dialog = screen.getByRole('dialog')
     expect(within(dialog).getByPlaceholderText('例如： deepseek-v4-flash')).toBeInTheDocument()
@@ -2449,7 +2533,7 @@ describe('Settings > Providers tab', () => {
 
     render(<Settings />)
 
-    fireEvent.click(screen.getByRole('button', { name: /Add Provider|添加服务商/i }))
+    fireEvent.click(screen.getByRole('button', { name: /Add Model|添加模型/i }))
     const dialog = screen.getByRole('dialog')
     await waitFor(() => {
       const settingsTextarea = dialog.querySelector('textarea')
@@ -2514,7 +2598,7 @@ describe('Settings > Providers tab', () => {
 
     render(<Settings />)
 
-    fireEvent.click(screen.getByRole('button', { name: /Add Provider|添加服务商/i }))
+    fireEvent.click(screen.getByRole('button', { name: /Add Model|添加模型/i }))
     const dialog = screen.getByRole('dialog')
     const settingsTextarea = await waitFor(() => {
       const textarea = dialog.querySelector('textarea')
@@ -2603,7 +2687,7 @@ describe('Settings > Providers tab', () => {
 
     render(<Settings />)
 
-    fireEvent.click(screen.getByRole('button', { name: /Add Provider|添加服务商/i }))
+    fireEvent.click(screen.getByRole('button', { name: /Add Model|添加模型/i }))
     const dialog = screen.getByRole('dialog')
     await waitFor(() => {
       const settingsTextarea = dialog.querySelector('textarea')
@@ -2685,7 +2769,7 @@ describe('Settings > Providers tab', () => {
 
     render(<Settings />)
 
-    fireEvent.click(screen.getByRole('button', { name: /Add Provider/i }))
+    fireEvent.click(screen.getByRole('button', { name: /Add Model/i }))
     const dialog = screen.getByRole('dialog')
     const toolSearchCheckbox = within(dialog).getByRole('checkbox', { name: 'Enable Tool Search' })
 
@@ -2707,7 +2791,7 @@ describe('Settings > Providers tab', () => {
     expect(toolSearchCheckbox).toBeChecked()
     await waitFor(() => {
       expect(within(dialog).getByDisplayValue((value) => (
-        typeof value === 'string' && value.includes('"ENABLE_TOOL_SEARCH": "true"')
+        typeof value === 'string' && value.includes('"ENABLE_TOOL_SEARCH": "false"')
       ))).toBeInTheDocument()
     })
 
@@ -2763,7 +2847,7 @@ describe('Settings > Providers tab', () => {
 
     render(<Settings />)
 
-    fireEvent.click(screen.getByRole('button', { name: /Add Provider/i }))
+    fireEvent.click(screen.getByRole('button', { name: /Add Model/i }))
     const dialog = screen.getByRole('dialog')
     const disableBetasCheckbox = within(dialog).getByRole('checkbox', { name: 'Disable experimental beta headers' })
     expect(within(dialog).getByText(
@@ -2840,7 +2924,7 @@ describe('Settings > Providers tab', () => {
 
     render(<Settings />)
 
-    fireEvent.click(screen.getByRole('button', { name: /Add Provider|添加服务商/i }))
+    fireEvent.click(screen.getByRole('button', { name: /Add Model|添加模型/i }))
     const dialog = screen.getByRole('dialog')
     await waitFor(() => {
       const settingsTextarea = dialog.querySelector('textarea')
@@ -2902,7 +2986,7 @@ describe('Settings > Providers tab', () => {
 
     render(<Settings />)
 
-    fireEvent.click(screen.getByRole('button', { name: /Add Provider/i }))
+    fireEvent.click(screen.getByRole('button', { name: /Add Model/i }))
 
     const dialog = screen.getByRole('dialog')
     const apiKeyInput = within(dialog).getByPlaceholderText('sk-...')
@@ -2940,7 +3024,7 @@ describe('Settings > Providers tab', () => {
 
     render(<Settings />)
 
-    fireEvent.click(screen.getByRole('button', { name: /Add Provider|添加服务商/i }))
+    fireEvent.click(screen.getByRole('button', { name: /Add Model|添加模型/i }))
     const dialog = screen.getByRole('dialog')
     await waitFor(() => {
       expect(dialog.querySelector('textarea')?.value).toContain('"ANTHROPIC_MODEL"')
@@ -2977,7 +3061,7 @@ describe('Settings > Providers tab', () => {
 
     render(<Settings />)
 
-    fireEvent.click(screen.getByRole('button', { name: /Add Provider|添加服务商/i }))
+    fireEvent.click(screen.getByRole('button', { name: /Add Model|添加模型/i }))
     const dialog = screen.getByRole('dialog')
     const fetchButton = within(dialog).getByRole('button', { name: /Fetch models|获取模型/i })
 

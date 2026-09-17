@@ -6,6 +6,7 @@ import {
   type ModelReasoningProviderKind,
 } from '../../shared/modelReasoning.js'
 import { MODEL_CONTEXT_WINDOWS_ENV_KEY } from '../../utils/model/modelContextWindows.js'
+import { PROVIDER_MAX_OUTPUT_TOKENS_ENV_KEY } from '../../utils/managedEnvConstants.js'
 import {
   IMAGE_GENERATION_API_KEY_ENV_KEY,
   IMAGE_GENERATION_BASE_URL_ENV_KEY,
@@ -61,6 +62,7 @@ export const MANAGED_PROVIDER_ENV_KEYS = [
   'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
   ATTRIBUTION_HEADER_ENV_KEY,
   MODEL_CONTEXT_WINDOWS_ENV_KEY,
+  PROVIDER_MAX_OUTPUT_TOKENS_ENV_KEY,
   OPENAI_OAUTH_PROVIDER_ENV_KEY,
   OPENAI_CODEX_OAUTH_FILE_ENV_KEY,
   GROK_OAUTH_PROVIDER_ENV_KEY,
@@ -457,10 +459,14 @@ export function buildProviderManagedEnv(
 
   const presetDefaultEnv = getPresetDefaultEnv(provider.presetId)
   const providerCapabilityEnv = getProviderCapabilityEnv(provider, models)
+  const maxOutputTokens = provider.requestCompatibility?.maxOutputTokens
 
   return {
     ...providerCapabilityEnv,
     ...omitAuthEnv(presetDefaultEnv),
+    ...(typeof maxOutputTokens === 'number' && Number.isSafeInteger(maxOutputTokens) && maxOutputTokens > 0 && {
+      [PROVIDER_MAX_OUTPUT_TOKENS_ENV_KEY]: String(maxOutputTokens),
+    }),
     ...(provider.autoCompactWindow !== undefined && {
       CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(provider.autoCompactWindow),
     }),
