@@ -65,6 +65,29 @@ const TRACE_RECORDED_ERROR_MARKER = Symbol('cc-haha-trace-recorded-error')
 // paths that only see object throws.
 const recordedTraceErrorContexts = new WeakSet<ProxyTraceContext>()
 
+const OPENCODE_HOST_PATTERN = /(^|[./-])opencode\.ai([:/]|$)/i
+
+/**
+ * Identity headers required by OpenCode Zen Go endpoints.
+ *
+ * OpenCode now rejects unverified requests that lack `x-opencode-session`
+ * (used to route/optimize prompt caching) or use a generic user agent.
+ * We reuse the stable per-conversation session id resolved from the CLI and
+ * identify the client as cc-haha. See https://opencode.ai/docs/go/.
+ */
+function buildOpencodeIdentityHeaders(
+  baseUrl: string,
+  sessionId: string | undefined,
+): Record<string, string> {
+  if (!OPENCODE_HOST_PATTERN.test(baseUrl)) return {}
+  const version = typeof MACRO !== 'undefined' ? String(MACRO.VERSION) : 'local'
+  const headers: Record<string, string> = {
+    'User-Agent': `cc-haha/${version}`,
+  }
+  if (sessionId) headers['x-opencode-session'] = sessionId
+  return headers
+}
+
 function markTraceErrorRecorded(error: unknown): void {
   if (error && typeof error === 'object') {
     try {
@@ -237,6 +260,10 @@ export async function handleProxyRequest(req: Request, url: URL): Promise<Respon
     requestCompatibility: config.requestCompatibility,
     budgetSource: req.headers.get(OUTPUT_BUDGET_SOURCE_HEADER) === 'default' ? 'default' : 'explicit',
   }
+  const opencodeIdentityHeaders = buildOpencodeIdentityHeaders(
+    baseUrl,
+    promptCacheKey ?? req.headers.get('x-claude-code-session-id')?.trim() ?? undefined,
+  )
 
   try {
     if (config.apiFormat === 'anthropic') {
@@ -262,9 +289,9 @@ export async function handleProxyRequest(req: Request, url: URL): Promise<Respon
       return await handleAnthropicCompatible(body, baseUrl, config.apiKey, config.authStrategy, req.headers, isStream, networkSettings, traceContext)
     }
     if (config.apiFormat === 'openai_chat') {
-      return await handleOpenaiChat(body, baseUrl, config.apiKey, isStream, networkSettings, traceContext, requestOptions)
+      return await handleOpenaiChat(body, baseUrl, config.apiKey, isStream, networkSettings, traceContext, requestOptions, opencodeIdentityHeaders)
     }
-    return await handleOpenaiResponses(body, baseUrl, config.apiKey, isStream, networkSettings, traceContext, promptCacheKey, requestOptions)
+    return await handleOpenaiResponses(body, baseUrl, config.apiKey, isStream, networkSettings, traceContext, promptCacheKey, requestOptions, opencodeIdentityHeaders)
   } catch (err) {
     if (traceContext && !wasTraceErrorRecorded(err) && !recordedTraceErrorContexts.has(traceContext)) {
       void recordProxyTrace({
@@ -667,13 +694,21 @@ async function handleOpenaiChat(
   networkSettings: NetworkSettings,
   traceContext: ProxyTraceContext | null,
   requestOptions: RequestCompatibilityOptions = {},
+  extraHeaders: Record<string, string> = {},
 ): Promise<Response> {
   const knownDeepSeekHost = shouldUseDeepSeekReasoningCompat(baseUrl)
   const reasoningProfile = resolveModelReasoningProfile(body.model, 'openai_chat')
+  // Console Go's upstream pool for OpenCode Zen is heterogeneous: some Chat
+  // Completions backends strict-decode the request body and randomly reject
+  // the non-standard `thinking` toggle with
+  // `json: unknown field "thinking"` (verified ~50/50 per request, not
+  // session-sticky). OpenCode's reasoning models return `reasoning_content`
+  // without the toggle, so keep it for real DeepSeek hosts only.
+  const passThinkingToggle = knownDeepSeekHost && !OPENCODE_HOST_PATTERN.test(baseUrl)
   const transformed = anthropicToOpenaiChat(body, {
     ...requestOptions,
     roundTripReasoningContent: knownDeepSeekHost || reasoningProfile?.family === 'deepseek-v4',
-    passThinkingToggle: knownDeepSeekHost,
+    passThinkingToggle,
     imageContentMode: shouldUseTextOnlyOpenAIChatContent(baseUrl, body.model) ? 'text_only' : 'vision',
   })
   if (traceContext) {
@@ -684,6 +719,7 @@ async function handleOpenaiChat(
   const upstreamRequestHeaders = {
     'Content-Type': 'application/json',
     Authorization: `Bearer ${apiKey}`,
+    ...extraHeaders,
   }
   const proxyOptions = getNetworkProxyFetchOptions(networkSettings, url)
   const startedAtMs = Date.now()
@@ -879,6 +915,7 @@ async function handleOpenaiResponses(
   traceContext: ProxyTraceContext | null,
   promptCacheKey?: string,
   requestOptions: RequestCompatibilityOptions = {},
+  extraHeaders: Record<string, string> = {},
 ): Promise<Response> {
   const transformed = anthropicToOpenaiResponses(body, { ...requestOptions, cacheKey: promptCacheKey })
   if (traceContext) {
@@ -889,6 +926,7 @@ async function handleOpenaiResponses(
   const upstreamRequestHeaders = {
     'Content-Type': 'application/json',
     Authorization: `Bearer ${apiKey}`,
+    ...extraHeaders,
   }
   const proxyOptions = getNetworkProxyFetchOptions(networkSettings, url)
   const startedAtMs = Date.now()

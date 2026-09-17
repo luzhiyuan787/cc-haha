@@ -24,6 +24,9 @@
 # grants alive we ALWAYS sign with a STABLE cert and a CONSTANT --identifier.
 # We NEVER fall back to ad-hoc signing — if no stable identity exists we stop and
 # tell the user exactly how to create a one-time self-signed Code Signing cert.
+# Exception: ephemeral CI release lanes with no keychain at all may opt in
+# explicitly via CU_HELPER_ALLOW_ADHOC=1 (unsigned drafts only; TCC re-grants
+# per release are accepted there).
 
 set -euo pipefail
 
@@ -238,7 +241,16 @@ resolve_identity() {
     return 0
   fi
 
-  # f) nothing usable -> instructions + fail. NEVER ad-hoc.
+  # f) nothing usable. The default remains: NEVER ad-hoc. The ONLY sanctioned
+  #    escape hatch is an explicit CU_HELPER_ALLOW_ADHOC=1, meant for ephemeral
+  #    CI release lanes (unsigned drafts) where no keychain identity can exist.
+  #    It accepts the known trade-off: every rebuild rotates the identity, so
+  #    users must re-grant Accessibility + Screen Recording per release.
+  if [ "${CU_HELPER_ALLOW_ADHOC:-}" = "1" ] || [ "${CU_HELPER_ALLOW_ADHOC:-}" = "true" ]; then
+    SIGN_IDENTITY="-"
+    log "warning: CU_HELPER_ALLOW_ADHOC is set — signing ad-hoc (TCC grants rotate on every rebuild)."
+    return 0
+  fi
   print_self_signed_instructions
   die "no stable code-signing identity available (refusing to ad-hoc sign)."
 }

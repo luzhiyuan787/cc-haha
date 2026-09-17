@@ -70,9 +70,12 @@ jobs:
           [ -n "$APPLE_APP_SPECIFIC_PASSWORD" ] || missing+=("APPLE_APP_SPECIFIC_PASSWORD")
           [ -n "$APPLE_TEAM_ID" ] || missing+=("APPLE_TEAM_ID")
           if [ "${#missing[@]}" -gt 0 ]; then
-            printf '::error::Missing macOS signing/notarization secrets (%s): refusing to build a macOS release whose Computer Use runtime cannot pass client attestation.\n' "${missing[*]}"
             echo "macos_signed=false" >> "$GITHUB_OUTPUT"
-            exit 1
+            if [ "$RELEASE_DRAFT" != "true" ]; then
+              printf '::error::Missing macOS signing/notarization secrets (%s): refusing to publish a non-draft release whose Computer Use runtime cannot pass client attestation.\n' "${missing[*]}"
+              exit 1
+            fi
+            printf '::warning::Missing macOS signing/notarization secrets (%s): macOS artifacts will be unsigned. Ship install-macos-unsigned.sh with the DMG.\n' "${missing[*]}"
           else
             echo "macos_signed=true" >> "$GITHUB_OUTPUT"
           fi
@@ -265,6 +268,10 @@ jobs:
         env:
           BUN_INSTALL_CACHE_DIR: ${{ runner.temp }}/bun-install-cache
           SIDECAR_TARGET_TRIPLE: ${{ matrix.target_triple }}
+          # Unsigned draft macOS lane: the ephemeral runner has no keychain
+          # identity at all. Ad-hoc here matches the ad-hoc bun sidecar and the
+          # unsigned app bundle; users re-grant TCC per release by design.
+          CU_HELPER_ALLOW_ADHOC: ${{ matrix.smoke_platform == 'macos' && needs.signing-preflight.outputs.macos_signed != 'true' && '1' || '' }}
         run: bun run build:sidecars
 
       - name: Verify compiled Windows sidecar startup

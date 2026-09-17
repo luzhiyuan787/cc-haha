@@ -76,7 +76,7 @@ async function call(label: string, anthropicBody: Record<string, unknown>) {
   const redacted = text.replaceAll(String(opencode.apiKey), '«redacted»')
   const failed = !res.ok || /unknown field|error/.test(redacted.slice(0, 200)) && res.status !== 200
   console.log(`\n### ${label} → HTTP ${res.status}`)
-  console.log(redacted.slice(0, 600).replace(/\s+/g, ' '))
+  console.log(redacted.slice(0, 300).replace(/\s+/g, ' '))
   return res.status
 }
 
