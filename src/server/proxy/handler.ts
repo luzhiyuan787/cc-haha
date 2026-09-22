@@ -22,7 +22,7 @@ import { anthropicToOpenaiResponses } from './transform/anthropicToOpenaiRespons
 import { RequestCompatibilityError, resolveRequestCompatibility, type RequestCompatibilityOptions } from './transform/requestCompatibility.js'
 import { ProtocolTraceObserver, observeProtocolStream, type ProtocolTraceTransport } from './protocolTrace.js'
 import { OUTPUT_BUDGET_SOURCE_HEADER } from '../../services/api/outputBudget.js'
-import { hoistToolResultMediaForCompatibility } from './transform/anthropicMediaHoist.js'
+import { hoistToolResultMediaForCompatibility, shouldHoistNestedToolResultMedia } from './transform/anthropicMediaHoist.js'
 import { openaiChatToAnthropic } from './transform/openaiChatToAnthropic.js'
 import { openaiResponsesToAnthropic } from './transform/openaiResponsesToAnthropic.js'
 import { openaiChatStreamToAnthropic } from './streaming/openaiChatStreamToAnthropic.js'
@@ -44,6 +44,8 @@ import {
   type TraceProviderInfo,
 } from '../services/traceCaptureService.js'
 import { resolveModelReasoningProfile } from '../../shared/modelReasoning.js'
+import { resolveModelApiFormat } from '../../shared/modelApiFormats.js'
+import { applyUpstreamHeaders, resolveUpstreamHeaders } from './upstreamHeaders.js'
 
 const providerService = new ProviderService()
 
@@ -65,28 +67,16 @@ const TRACE_RECORDED_ERROR_MARKER = Symbol('cc-haha-trace-recorded-error')
 // paths that only see object throws.
 const recordedTraceErrorContexts = new WeakSet<ProxyTraceContext>()
 
-const OPENCODE_HOST_PATTERN = /(^|[./-])opencode\.ai([:/]|$)/i
-
 /**
- * Identity headers required by OpenCode Zen Go endpoints.
+ * OpenCode's Console Go backend pool, matched by host.
  *
- * OpenCode now rejects unverified requests that lack `x-opencode-session`
- * (used to route/optimize prompt caching) or use a generic user agent.
- * We reuse the stable per-conversation session id resolved from the CLI and
- * identify the client as cc-haha. See https://opencode.ai/docs/go/.
+ * Identity headers (x-opencode-session, User-Agent) now come from the preset's
+ * `upstreamHeaders` template (see ./upstreamHeaders.ts) rather than from a
+ * hardcoded host check here. What stays host-keyed is request-body adaptation,
+ * because the gateway does not translate between protocols: its Chat backends
+ * are heterogeneous and its models run in thinking mode.
  */
-function buildOpencodeIdentityHeaders(
-  baseUrl: string,
-  sessionId: string | undefined,
-): Record<string, string> {
-  if (!OPENCODE_HOST_PATTERN.test(baseUrl)) return {}
-  const version = typeof MACRO !== 'undefined' ? String(MACRO.VERSION) : 'local'
-  const headers: Record<string, string> = {
-    'User-Agent': `cc-haha/${version}`,
-  }
-  if (sessionId) headers['x-opencode-session'] = sessionId
-  return headers
-}
+const OPENCODE_HOST_PATTERN = /(^|[./-])opencode\.ai([:/]|$)/i
 
 /**
  * Console Go runs its models in thinking mode, and a thinking backend rejects a
@@ -277,24 +267,32 @@ export async function handleProxyRequest(req: Request, url: URL): Promise<Respon
   const baseUrl = config.baseUrl.replace(/\/+$/, '')
   const networkSettings = await loadNetworkSettings()
   const traceContext = buildProxyTraceContext(req, config, body)
-  const promptCacheKey = resolvePromptCacheKey(body, req.headers.get('x-claude-code-session-id'))
+  const inboundSessionId = req.headers.get('x-claude-code-session-id')
+  const promptCacheKey = resolvePromptCacheKey(body, inboundSessionId)
   const requestOptions: RequestCompatibilityOptions = {
     requestCompatibility: config.requestCompatibility,
     budgetSource: req.headers.get(OUTPUT_BUDGET_SOURCE_HEADER) === 'default' ? 'default' : 'explicit',
   }
-  const opencodeIdentityHeaders = buildOpencodeIdentityHeaders(
-    baseUrl,
-    promptCacheKey ?? req.headers.get('x-claude-code-session-id')?.trim() ?? undefined,
-  )
+  // Gateways that bind the wire format to the URL path announce their exceptions
+  // on the preset; a model matching no rule keeps the provider's own format.
+  // Resolved per request because one provider record can serve several formats.
+  const modelApiFormat = resolveModelApiFormat(config.modelApiFormats, body.model)
+  const apiFormat = modelApiFormat ?? config.apiFormat
+  const upstreamHeaders = resolveUpstreamHeaders(config.upstreamHeaders, { sessionId: inboundSessionId })
 
   try {
-    if (config.apiFormat === 'anthropic') {
+    if (apiFormat === 'anthropic') {
       // Anthropic-format providers normally connect directly to the upstream
       // endpoint (see providerRuntimeEnv). Only providers that explicitly opt out
       // of nested tool-result media (supportsNestedToolResultMedia=false) route
       // through the proxy so images/documents can be lifted out of tool_result
       // before the request reaches an endpoint that would drop them.
-      if (config.supportsNestedToolResultMedia) {
+      //
+      // That reasoning is about the provider's *own* format, so the guard only
+      // applies without a per-model override: an OpenAI-format provider whose
+      // model routes to anthropic still reaches the proxy, and its upstream is a
+      // native Messages endpoint that accepts nested media unchanged.
+      if (modelApiFormat === undefined && config.supportsNestedToolResultMedia) {
         return Response.json(
           {
             type: 'error',
@@ -308,12 +306,17 @@ export async function handleProxyRequest(req: Request, url: URL): Promise<Respon
           { status: 400 },
         )
       }
-      return await handleAnthropicCompatible(body, baseUrl, config.apiKey, config.authStrategy, req.headers, isStream, networkSettings, traceContext)
+      const hoistNestedMedia = shouldHoistNestedToolResultMedia({
+        providerApiFormat: config.apiFormat,
+        resolvedApiFormat: apiFormat,
+        supportsNestedToolResultMedia: config.supportsNestedToolResultMedia,
+      })
+      return await handleAnthropicCompatible(body, baseUrl, config.apiKey, config.authStrategy, req.headers, isStream, networkSettings, traceContext, upstreamHeaders, hoistNestedMedia)
     }
-    if (config.apiFormat === 'openai_chat') {
-      return await handleOpenaiChat(body, baseUrl, config.apiKey, isStream, networkSettings, traceContext, requestOptions, opencodeIdentityHeaders)
+    if (apiFormat === 'openai_chat') {
+      return await handleOpenaiChat(body, baseUrl, config.apiKey, isStream, networkSettings, traceContext, requestOptions, upstreamHeaders)
     }
-    return await handleOpenaiResponses(body, baseUrl, config.apiKey, isStream, networkSettings, traceContext, promptCacheKey, requestOptions, opencodeIdentityHeaders)
+    return await handleOpenaiResponses(body, baseUrl, config.apiKey, isStream, networkSettings, traceContext, promptCacheKey, requestOptions, upstreamHeaders)
   } catch (err) {
     if (traceContext && !wasTraceErrorRecorded(err) && !recordedTraceErrorContexts.has(traceContext)) {
       void recordProxyTrace({
@@ -500,8 +503,13 @@ async function handleAnthropicCompatible(
   isStream: boolean,
   networkSettings: NetworkSettings,
   traceContext: ProxyTraceContext | null,
+  upstreamHeaders: Record<string, string> = {},
+  hoistNestedMedia = true,
 ): Promise<Response> {
-  const transformed = hoistToolResultMediaForCompatibility(body)
+  // The media hoist is a compatibility rewrite for endpoints that drop media
+  // nested in tool_result. A native Messages endpoint accepts it unchanged, so it
+  // only runs when the provider actually asked for it.
+  const transformed = hoistNestedMedia ? hoistToolResultMediaForCompatibility(body) : body
   const url = `${normalizeAnthropicBaseUrl(baseUrl)}/v1/messages`
   const proxyOptions = getNetworkProxyFetchOptions(networkSettings, url)
 
@@ -522,6 +530,11 @@ async function handleAnthropicCompatible(
     if (lower === 'x-api-key' || lower === 'authorization') continue
     if (value) headers[name] = value
   }
+  // Preset-declared headers go last so they win over the pass-through above —
+  // notably the session id, which is internal-client-filtered on the way in and
+  // would otherwise never reach a gateway that requires it. The resolver drops
+  // anything that would shadow the request framing or its credential.
+  applyUpstreamHeaders(headers, upstreamHeaders)
 
   const traceHeaders = Object.fromEntries(
     Object.entries(headers).map(([name, value]) => {
@@ -716,7 +729,7 @@ async function handleOpenaiChat(
   networkSettings: NetworkSettings,
   traceContext: ProxyTraceContext | null,
   requestOptions: RequestCompatibilityOptions = {},
-  extraHeaders: Record<string, string> = {},
+  upstreamHeaders: Record<string, string> = {},
 ): Promise<Response> {
   const knownDeepSeekHost = shouldUseDeepSeekReasoningCompat(baseUrl)
   const reasoningProfile = resolveModelReasoningProfile(body.model, 'openai_chat')
@@ -739,11 +752,12 @@ async function handleOpenaiChat(
       resolveRequestCompatibility(body, { ...requestOptions, protocol: 'openai_chat' }).outputBudget)
   }
   const url = buildOpenaiEndpoint(baseUrl, 'chat/completions')
-  const upstreamRequestHeaders = {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${apiKey}`,
-    ...extraHeaders,
-  }
+  // Preset-declared headers first: `Authorization` is applied last so a preset can
+  // never shadow the credential, and the resolver already drops framing headers.
+  const upstreamRequestHeaders: Record<string, string> = {}
+  applyUpstreamHeaders(upstreamRequestHeaders, upstreamHeaders)
+  upstreamRequestHeaders['Content-Type'] = 'application/json'
+  upstreamRequestHeaders.Authorization = `Bearer ${apiKey}`
   const proxyOptions = getNetworkProxyFetchOptions(networkSettings, url)
   const startedAtMs = Date.now()
   const startedAt = new Date(startedAtMs).toISOString()
@@ -938,7 +952,7 @@ async function handleOpenaiResponses(
   traceContext: ProxyTraceContext | null,
   promptCacheKey?: string,
   requestOptions: RequestCompatibilityOptions = {},
-  extraHeaders: Record<string, string> = {},
+  upstreamHeaders: Record<string, string> = {},
 ): Promise<Response> {
   const transformed = anthropicToOpenaiResponses(body, { ...requestOptions, cacheKey: promptCacheKey })
   relaxForcedToolChoice(transformed as unknown as Record<string, unknown>, baseUrl)
@@ -947,11 +961,12 @@ async function handleOpenaiResponses(
       resolveRequestCompatibility(body, { ...requestOptions, protocol: 'openai_responses' }).outputBudget)
   }
   const url = buildOpenaiEndpoint(baseUrl, 'responses')
-  const upstreamRequestHeaders = {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${apiKey}`,
-    ...extraHeaders,
-  }
+  // Preset-declared headers first: `Authorization` is applied last so a preset can
+  // never shadow the credential, and the resolver already drops framing headers.
+  const upstreamRequestHeaders: Record<string, string> = {}
+  applyUpstreamHeaders(upstreamRequestHeaders, upstreamHeaders)
+  upstreamRequestHeaders['Content-Type'] = 'application/json'
+  upstreamRequestHeaders.Authorization = `Bearer ${apiKey}`
   const proxyOptions = getNetworkProxyFetchOptions(networkSettings, url)
   const startedAtMs = Date.now()
   const startedAt = new Date(startedAtMs).toISOString()

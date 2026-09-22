@@ -13,11 +13,12 @@ import { useSettingsStore } from './settingsStore'
 import { useTabStore } from './tabStore'
 import type { LocalIndexStatus, SessionListItem } from '../types/session'
 import type { PermissionMode } from '../types/settings'
+import type { RuntimeSelection } from '../types/runtime'
 import { isPlaceholderSessionTitle } from '../lib/sessionTitle'
 import { invalidateRecentProjectsCache } from '../lib/recentProjectsCache'
 import { releaseWorkspaceSession } from '../lib/workspace/releaseSession'
+import { SIDEBAR_PROJECT_SESSION_PREVIEW_LIMIT } from '../lib/sessionListPagination'
 
-const SESSION_LIST_LIMIT = 400
 const PROJECT_HISTORY_PAGE_SIZE = 50
 
 export type ProjectHistoryState = {
@@ -51,12 +52,13 @@ type SessionStore = {
   historicalSessionIds: Set<string>
   recentSessionIds: Set<string>
   recentProjectBoundaries: Record<string, RecentProjectBoundary>
+  projectSessionTotals: Record<string, number>
   projectHistory: Record<string, ProjectHistoryState>
 
   fetchSessions: (project?: string) => Promise<void>
   loadMoreProjectSessions: (projectRoot: string) => Promise<void>
   releaseProjectHistory: (projectRoot: string) => void
-  hydrateHistoricalSessions: (sessions: SessionListItem[]) => SessionListItem[]
+  hydrateHistoricalSessions: (sessions: SessionListItem[], runtimeSelections?: Record<string, RuntimeSelection>) => SessionListItem[]
   openHistoricalSession: (session: SessionListItem) => void
   createSession: (workDir?: string, options?: CreateSessionOptions) => Promise<string>
   branchSession: (
@@ -89,6 +91,11 @@ const projectHistoryRequests = new Map<string, {
 // The local index can lag the create response by one refresh. Keep explicit
 // ids from that response until the list has observed them at least once.
 const pendingCreatedSessionIds = new Set<string>()
+// Title notifications and collaboration tool results can arrive before the
+// session-list projection has observed a newly-created transcript. Remember
+// those authoritative names so a later stale `Untitled Session` row cannot
+// erase them while the local index reconciles.
+const pendingSessionTitles = new Map<string, string>()
 
 export const useSessionStore = create<SessionStore>((set, get) => ({
   sessions: [],
@@ -102,17 +109,22 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   historicalSessionIds: new Set(),
   recentSessionIds: new Set(),
   recentProjectBoundaries: {},
+  projectSessionTotals: {},
   projectHistory: {},
 
   fetchSessions: async (project?: string) => {
     const requestId = ++fetchSessionsRequestId
-    set({ isLoading: true, error: null, sessionListRequestId: requestId })
+    const runtimeSelections = useSessionRuntimeStore.getState().selections
+    // A failed refresh must not clear the list or surface a banner. The sidebar
+    // polls this endpoint, so painting the failure and clearing it on the next
+    // attempt makes the whole pane flicker.
+    set({ isLoading: true, sessionListRequestId: requestId })
     try {
       const response = await sessionsApi.list(buildSessionListParams(project))
       if (requestId !== get().sessionListRequestId) return
       const raw = response.sessions
       const indexStatus = response.index ?? null
-      useSessionRuntimeStore.getState().syncFromSessions(raw)
+      useSessionRuntimeStore.getState().syncFromSessions(raw, runtimeSelections)
       let syncedSessions: SessionListItem[] = []
       set((state) => {
         if (requestId !== state.sessionListRequestId) return state
@@ -145,6 +157,9 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
             ...raw.map((session) => session.id),
           ]),
           recentProjectBoundaries: shouldRetainRenderedSessions(indexStatus) ? {} : buildRecentProjectBoundaries(raw),
+          projectSessionTotals: response.projects
+            ? Object.fromEntries(response.projects.map((project) => [project.projectRoot, project.total]))
+            : {},
           indexStatus,
           isLoading: indexStatus?.state === 'building' && sessions.length === 0,
         }
@@ -152,7 +167,8 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       syncOpenSessionTabTitles(syncedSessions)
     } catch (err) {
       if (requestId !== get().sessionListRequestId) return
-      set({ error: (err as Error).message, isLoading: false })
+      console.error('[session-list] refresh failed', err)
+      set({ isLoading: false })
     }
   },
 
@@ -267,13 +283,13 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     })
   },
 
-  hydrateHistoricalSessions: (snapshots) => {
+  hydrateHistoricalSessions: (snapshots, runtimeSelections) => {
     if (snapshots.length === 0) return []
     const selected = reconcileSessionSnapshots(snapshots, get().sessions)
     const selectedIds = new Set(selected.map((session) => session.id))
     // Hydrate before activating the tab: connecting immediately applies its
     // runtime selection and the composer reads workspace/permission metadata.
-    useSessionRuntimeStore.getState().syncFromSessions(selected)
+    useSessionRuntimeStore.getState().syncFromSessions(selected, runtimeSelections)
     set((state) => ({
       sessions: mergeSessionList([
         ...selected,
@@ -368,6 +384,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     await sessionsApi.delete(id)
     releaseWorkspaceSession(id)
     pendingCreatedSessionIds.delete(id)
+    pendingSessionTitles.delete(id)
     invalidateRecentProjectsCache()
     useSessionRuntimeStore.getState().clearSelection(id)
     excludeDeletedProjectSessions([id])
@@ -392,6 +409,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     for (const id of result.successes) {
       releaseWorkspaceSession(id)
       pendingCreatedSessionIds.delete(id)
+      pendingSessionTitles.delete(id)
       useSessionRuntimeStore.getState().clearSelection(id)
     }
     excludeDeletedProjectSessions(result.successes)
@@ -434,6 +452,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
 
   renameSession: async (id: string, title: string) => {
     await sessionsApi.rename(id, title)
+    pendingSessionTitles.set(id, title)
     set((s) => ({
       sessions: s.sessions.map((session) =>
         session.id === id ? { ...session, title } : session,
@@ -442,11 +461,18 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   },
 
   updateSessionTitle: (id, title) => {
-    set((s) => ({
-      sessions: s.sessions.map((session) =>
-        session.id === id ? { ...session, title } : session,
-      ),
-    }))
+    const normalizedTitle = title.trim()
+    if (!normalizedTitle) return
+    pendingSessionTitles.set(id, normalizedTitle)
+    set((s) => {
+      let changed = false
+      const sessions = s.sessions.map((session) => {
+        if (session.id !== id || session.title === normalizedTitle) return session
+        changed = true
+        return { ...session, title: normalizedTitle }
+      })
+      return changed ? { sessions } : s
+    })
   },
 
   updateSessionMessageCount: (id, messageCount) => {
@@ -536,8 +562,8 @@ function removeProjectHistorySessionIds(
 
 function buildSessionListParams(project: string | undefined) {
   return project
-    ? { project, limit: SESSION_LIST_LIMIT }
-    : { limit: SESSION_LIST_LIMIT }
+    ? { project, limit: SIDEBAR_PROJECT_SESSION_PREVIEW_LIMIT }
+    : { view: 'sidebar' as const, perProjectLimit: SIDEBAR_PROJECT_SESSION_PREVIEW_LIMIT }
 }
 
 function getDefaultSessionPermissionMode(): PermissionMode | undefined {
@@ -569,7 +595,7 @@ function mergeSessionList(
 
   for (const item of incoming) {
     const current = currentById.get(item.id)
-    const candidate = preserveLocalTitle(current, item)
+    const candidate = applyPendingSessionTitle(preserveLocalTitle(current, item))
     const existing = byId.get(candidate.id)
     if (!existing || sessionModifiedTime(candidate) > sessionModifiedTime(existing)) {
       byId.set(candidate.id, candidate)
@@ -577,6 +603,16 @@ function mergeSessionList(
   }
 
   return [...byId.values()].sort((a, b) => sessionModifiedTime(b) - sessionModifiedTime(a))
+}
+
+function applyPendingSessionTitle(session: SessionListItem): SessionListItem {
+  const pendingTitle = pendingSessionTitles.get(session.id)
+  if (!pendingTitle) return session
+  if (session.title === pendingTitle) {
+    pendingSessionTitles.delete(session.id)
+    return session
+  }
+  return { ...session, title: pendingTitle }
 }
 
 function reconcilePendingCreatedSessions(

@@ -10,6 +10,7 @@ import {
 import {
   createSearchContentIndex,
   type SearchContentIndex,
+  type SearchContentSuggestions,
   type SearchContentQueryOptions,
   type SearchContentQueryResult,
 } from './searchContentIndex.js'
@@ -47,6 +48,7 @@ export type SearchContentCoordinatorStatus = {
 }
 
 export interface SearchContentCoordinator {
+  suggestSessions(query: string, options?: { limit?: number; signal?: AbortSignal }): SearchContentSuggestions | null
   start(): Promise<void>
   stop(): Promise<void>
   search(
@@ -310,6 +312,7 @@ export function createSearchContentCoordinator(
   let watcher: ReconciliationWatcher | undefined
   let controller: AbortController | undefined
   let writerQueue: Promise<void> = Promise.resolve()
+  let dirtyReadinessWrite: symbol | undefined
   let startPromise: Promise<void> | undefined
   let stopPromise: Promise<void> | undefined
   let corruptionRecoveryToken: symbol | undefined
@@ -345,21 +348,25 @@ export function createSearchContentCoordinator(
     if (!started) return
     dirtyRevision += 1
     status = { ...status, state: 'building', lastErrorCode: null }
-    try {
-      index?.setReadiness({
-        state: 'building',
+    // Watcher notifications run outside the projection queue. A synchronous
+    // write here would wait on the worker's SQLite lock on the UI/API thread.
+    if (dirtyReadinessWrite) return
+    const token = Symbol('dirty-readiness')
+    dirtyReadinessWrite = token
+    const expectedLifecycle = lifecycle
+    void enqueue(expectedLifecycle, async () => {
+      if (dirtyReadinessWrite !== token) return
+      dirtyReadinessWrite = undefined
+      if (!started || expectedLifecycle !== lifecycle || !index) return
+      index.setReadiness({
+        state: status.state,
         generation: dirtyRevision,
         discovered: status.discovered,
         indexed: status.indexed,
         degraded: status.degradedSources,
+        lastErrorCode: status.lastErrorCode,
       })
-    } catch (error) {
-      status = {
-        ...status,
-        state: 'degraded',
-        lastErrorCode: errorCode(error, 'SEARCH_CONTENT_DIRTY_FAILED'),
-      }
-    }
+    })
   }
 
   const refreshStorage = (): boolean => {
@@ -410,9 +417,10 @@ export function createSearchContentCoordinator(
     const lastErrorCode = !storageHealthy
       ? status.lastErrorCode ?? 'SEARCH_CONTENT_STORAGE_LIMIT'
       : projectionFailures.at(-1) ?? (!watcherHealthy ? 'SEARCH_CONTENT_WATCH_FAILED' : null)
-    status = { ...status, state: ready ? 'ready' : 'degraded', lastErrorCode }
+    const state = ready ? 'ready' : processedRevision !== dirtyRevision && !lastErrorCode ? 'building' : 'degraded'
+    status = { ...status, state, lastErrorCode }
     index.setReadiness({
-      state: ready ? 'ready' : 'degraded',
+      state,
       generation: dirtyRevision,
       discovered: status.discovered,
       indexed: status.indexed,
@@ -461,7 +469,7 @@ export function createSearchContentCoordinator(
         discoveryFailureCode = SEARCH_CONTENT_PROJECTS_ROOT_MISSING
       } else if (discovery.complete) {
         for (const stalePath of existing) {
-          if (!seen.has(stalePath)) activeProjector.deleteSource(stalePath)
+          if (!seen.has(stalePath)) await activeProjector.deleteSource(stalePath)
         }
         hasCompleteSweep = true
         failedPaths = sweepFailures
@@ -519,9 +527,9 @@ export function createSearchContentCoordinator(
                 resolve(source.ownerTranscriptPath) === normalizedPath &&
                 resolve(source.path) !== normalizedPath)
             : []
-          result = activeProjector.deleteSource(normalizedPath)
+          result = await activeProjector.deleteSource(normalizedPath)
           for (const dependent of dependentSources) {
-            activeProjector.deleteSource(resolve(dependent.path))
+            await activeProjector.deleteSource(resolve(dependent.path))
             failedPaths.set(resolve(dependent.path), SEARCH_CONTENT_OWNER_MISSING)
           }
         }
@@ -534,7 +542,7 @@ export function createSearchContentCoordinator(
         }
       } catch (error) {
         if (errorCode(error, '') === SEARCH_CONTENT_OWNER_MISSING) {
-          activeProjector.deleteSource(normalizedPath)
+          await activeProjector.deleteSource(normalizedPath)
         }
         failedPaths.set(
           normalizedPath,
@@ -590,6 +598,7 @@ export function createSearchContentCoordinator(
     const activeWriterQueue = writerQueue
 
     started = false
+    dirtyReadinessWrite = undefined
     hasCompleteSweep = false
     activeController?.abort()
     if (controller === activeController) controller = undefined
@@ -757,6 +766,17 @@ export function createSearchContentCoordinator(
         cancelCorruptionRecovery: true,
         resetStatus: true,
       })
+    },
+    suggestSessions(query, options = {}) {
+      if (!started || !hasCompleteSweep || status.state !== 'ready' || !index || options.signal?.aborted) return null
+      try {
+        const result = index.querySessionSuggestions(query, options.limit)
+        return options.signal?.aborted ? null : result
+      } catch {
+        // Suggestions are a disposable projection; never repair or scan
+        // transcript files on the keystroke path when SQLite is unavailable.
+        return null
+      }
     },
     search(query, options = {}) {
       if (
