@@ -43,7 +43,7 @@ import {
   getPresetAuthStrategy,
   getPresetDefaultEnv,
   getPresetModelApiFormats,
-  getPresetUpstreamHeaders,
+  resolveUpstreamHeaderTemplate,
   normalizeImageGeneration,
   normalizeModelMapping,
   normalizeProvidersIndex,
@@ -607,7 +607,7 @@ export class ProviderService {
         supportsNestedToolResultMedia: provider.supportsNestedToolResultMedia ?? true,
         authStrategy: provider.authStrategy ?? getPresetAuthStrategy(provider.presetId),
         modelApiFormats: getPresetModelApiFormats(provider.presetId),
-        upstreamHeaders: getPresetUpstreamHeaders(provider.presetId),
+        upstreamHeaders: resolveUpstreamHeaderTemplate(provider.presetId, provider.baseUrl),
         ...(provider.requestCompatibility !== undefined && { requestCompatibility: provider.requestCompatibility }),
       }
     }
@@ -682,7 +682,7 @@ export class ProviderService {
     const presetId = input.presetId ?? ''
     const modelApiFormats = presetId ? getPresetModelApiFormats(presetId) : []
     const upstreamHeaders = resolveUpstreamHeaders(
-      presetId ? getPresetUpstreamHeaders(presetId) : {},
+      resolveUpstreamHeaderTemplate(presetId, base),
       { sessionId: connectivityProbeSessionId() },
     )
     // Same resolution the proxy performs, so the probe reaches what production

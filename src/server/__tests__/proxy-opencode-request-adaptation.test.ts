@@ -31,10 +31,14 @@ async function teardown() {
 
 const SESSION_ID = 'aaaa1111-bbbb-cccc-dddd-eeee2222ffff'
 
-async function makeProvider(apiFormat: 'openai_chat' | 'openai_responses', baseUrl: string) {
+async function makeProvider(
+  apiFormat: 'openai_chat' | 'openai_responses',
+  baseUrl: string,
+  presetId = 'custom',
+) {
   const svc = new ProviderService()
   return svc.addProvider({
-    presetId: 'custom',
+    presetId,
     name: `opencode-${apiFormat}`,
     baseUrl,
     apiKey: 'sk-test',
@@ -132,11 +136,15 @@ async function waitForTraceCallDone(sessionId: string) {
   }
 }
 
-describe('proxy opencode identity headers', () => {
+describe('proxy opencode request adaptation', () => {
   beforeEach(setup)
   afterEach(teardown)
 
-  test('openai_chat adds x-opencode-session and cc-haha user agent for opencode.ai', async () => {
+  // The preset's own template is what the gateway contract is written against;
+  // providers.test.ts covers it end-to-end. These pin the host fallback that
+  // keeps records saved before that preset from reaching the gateway anonymously
+  // and being answered 400 MissingSessionID.
+  test('a custom record on an opencode host still sends the gateway identity headers', async () => {
     const provider = await makeProvider('openai_chat', 'https://opencode.ai/zen/go/')
     const upstream = mockUpstreamCaptureHeaders(chatCompletionBody())
     try {
@@ -151,7 +159,7 @@ describe('proxy opencode identity headers', () => {
     }
   })
 
-  test('openai_responses adds x-opencode-session and cc-haha user agent for opencode.ai', async () => {
+  test('the fallback also covers the responses lane', async () => {
     const provider = await makeProvider('openai_responses', 'https://opencode.ai/zen/go/')
     const upstream = mockUpstreamCaptureHeaders(responsesBody())
     try {
@@ -188,8 +196,23 @@ describe('proxy opencode identity headers', () => {
       const res = await callProxy(provider.id)
       expect(res.status).toBe(200)
       const headers = upstream.getCapturedHeaders()
+      // An empty session id would be worse than none: the gateway binds it to a
+      // conversation, so omit the field rather than invent an identity.
       expect(headers?.['x-opencode-session']).toBeUndefined()
       expect(headers?.['user-agent']).toStartWith('cc-haha/')
+    } finally {
+      upstream.restore()
+    }
+  })
+
+  test('a preset that declares its own headers wins over the host fallback', async () => {
+    const provider = await makeProvider('openai_chat', 'https://opencode.ai/zen/go/', 'opencode-go')
+    const upstream = mockUpstreamCaptureHeaders(chatCompletionBody())
+    try {
+      const res = await callProxy(provider.id, SESSION_ID)
+      expect(res.status).toBe(200)
+      expect(upstream.getCapturedHeaders()?.['x-opencode-session']).toBe(SESSION_ID)
+      await waitForTraceCallDone(SESSION_ID)
     } finally {
       upstream.restore()
     }
@@ -272,6 +295,38 @@ describe('proxy opencode identity headers', () => {
         type: 'function',
         function: { name: 'classify_result' },
       })
+      await waitForTraceCallDone(SESSION_ID)
+    } finally {
+      upstream.restore()
+    }
+  })
+
+  test('degrades the extended reasoning efforts the MiMo backends reject', async () => {
+    const provider = await makeProvider('openai_chat', 'https://opencode.ai/zen/go/')
+    const upstream = mockUpstreamCaptureHeaders(chatCompletionBody())
+    try {
+      // Claude Code expresses the GLM/thinking profile default as output_config
+      // effort; both extended spellings must reach the wire as a value the
+      // backend takes (live bisect: low/high pass, max answers
+      // `Streaming response failed: [400] Invalid request parameters`).
+      for (const effort of ['max', 'xhigh'] as const) {
+        const res = await callProxy(provider.id, SESSION_ID, { output_config: { effort } })
+        expect(res.status).toBe(200)
+        expect(upstream.getCapturedBody()?.reasoning_effort, effort).toBe('high')
+      }
+      await waitForTraceCallDone(SESSION_ID)
+    } finally {
+      upstream.restore()
+    }
+  })
+
+  test('keeps the reasoning effort a non-opencode provider asked for', async () => {
+    const provider = await makeProvider('openai_chat', 'https://api.example.com')
+    const upstream = mockUpstreamCaptureHeaders(chatCompletionBody())
+    try {
+      const res = await callProxy(provider.id, SESSION_ID, { output_config: { effort: 'max' } })
+      expect(res.status).toBe(200)
+      expect(upstream.getCapturedBody()?.reasoning_effort).toBe('max')
       await waitForTraceCallDone(SESSION_ID)
     } finally {
       upstream.restore()

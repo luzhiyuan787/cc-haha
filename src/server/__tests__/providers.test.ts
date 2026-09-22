@@ -3571,6 +3571,38 @@ describe('OpenCode Go preset request contract', () => {
   })
 
   test('does not leak the gateway client headers onto an unrelated provider', async () => {
+    // Same custom preset and format as the gateway record, only the host differs:
+    // the fallback that covers records saved before the preset is keyed on the
+    // gateway host, so it must not reach any other upstream.
+    const preset = await loadPreset()
+    const { req, url, segments } = makeRequest('POST', '/api/providers', {
+      presetId: 'custom',
+      name: 'unrelated-chat',
+      baseUrl: 'https://api.example.com/v1',
+      apiFormat: 'openai_chat',
+      apiKey,
+      models: preset.defaultModels,
+    })
+    const created = await handleProvidersApi(req, url, segments)
+    expect(created.status).toBe(201)
+    const { provider } = await created.json() as { provider: { id: string } }
+
+    const calls: UpstreamCall[] = []
+    const restore = stubUpstream(calls)
+    try {
+      const response = await proxy(provider.id, {
+        model: 'glm-5.3', max_tokens: 32, messages: [{ role: 'user', content: 'hi' }],
+      })
+      expect(response.status).toBe(200)
+      expect(calls[0].url).toBe('https://api.example.com/v1/chat/completions')
+      expect(calls[0].headers.get('x-opencode-session')).toBeNull()
+      expect(calls[0].headers.get('user-agent') ?? '').not.toMatch(/^cc-haha\//)
+    } finally {
+      restore()
+    }
+  })
+
+  test('a record saved before the preset still identifies itself to the gateway', async () => {
     const { provider } = await createProvider({ presetId: 'custom', apiFormat: 'openai_chat' })
     const calls: UpstreamCall[] = []
     const restore = stubUpstream(calls)
@@ -3579,9 +3611,10 @@ describe('OpenCode Go preset request contract', () => {
         model: 'glm-5.3', max_tokens: 32, messages: [{ role: 'user', content: 'hi' }],
       })
       expect(response.status).toBe(200)
-      expect(calls[0].url).toBe('https://opencode.ai/zen/go/v1/chat/completions')
-      expect(calls[0].headers.get('x-opencode-session')).toBeNull()
-      expect(calls[0].headers.get('user-agent') ?? '').not.toMatch(/^cc-haha\//)
+      // Without this the gateway answers 400 MissingSessionID, so the record would
+      // stop working the moment it stopped being the one the preset describes.
+      expect(calls[0].headers.get('x-opencode-session')).toBe(SESSION_ID)
+      expect(calls[0].headers.get('user-agent')).toMatch(/^cc-haha\//)
     } finally {
       restore()
     }

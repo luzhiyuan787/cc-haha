@@ -364,6 +364,30 @@ export function getPresetUpstreamHeaders(presetId: string): Record<string, strin
   return PROVIDER_PRESETS.find((preset) => preset.id === presetId)?.upstreamHeaders ?? {}
 }
 
+/** The preset describing the gateway `OPENCODE_GATEWAY_HOST_RE` matches. */
+const OPENCODE_GATEWAY_PRESET_ID = 'opencode-go'
+const OPENCODE_GATEWAY_HOST_RE = /(^|[./-])opencode\.ai([:/]|$)/i
+
+/**
+ * The header template to send upstream for this record, with the preset's own
+ * declaration always winning.
+ *
+ * A record that predates the gateway's preset — or that was created from the
+ * custom preset — points at the same upstream but has no preset to declare its
+ * identity headers, so it would be answered `400 MissingSessionID` on every
+ * request. Those records fall back to the preset that does describe that
+ * upstream, matched by host, so the template still has a single source of truth.
+ */
+export function resolveUpstreamHeaderTemplate(
+  presetId: string,
+  baseUrl: string,
+): Record<string, string> {
+  const declared = getPresetUpstreamHeaders(presetId)
+  if (Object.keys(declared).length > 0) return declared
+  if (!OPENCODE_GATEWAY_HOST_RE.test(baseUrl)) return declared
+  return getPresetUpstreamHeaders(OPENCODE_GATEWAY_PRESET_ID)
+}
+
 /**
  * The format this provider's record stands for.
  *

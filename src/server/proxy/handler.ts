@@ -100,6 +100,23 @@ function relaxForcedToolChoice(
   if (forced) request.tool_choice = 'auto'
 }
 
+/**
+ * MiMo backends behind Console Go hard-reject the extended effort levels with
+ * `Streaming response failed: [400] Invalid request parameters` (live bisect:
+ * low/high pass, max fails, everything else in the production payload passes).
+ * Claude Code's GLM/thinking profiles default to effort `max`, so every MiMo
+ * request carrying one would 400. Degrading to `high` keeps the request valid.
+ */
+function clampUnsupportedReasoningEffort(
+  request: Record<string, unknown>,
+  baseUrl: string,
+): void {
+  if (!OPENCODE_HOST_PATTERN.test(baseUrl)) return
+  if (request.reasoning_effort === 'max' || request.reasoning_effort === 'xhigh') {
+    request.reasoning_effort = 'high'
+  }
+}
+
 function markTraceErrorRecorded(error: unknown): void {
   if (error && typeof error === 'object') {
     try {
@@ -747,6 +764,7 @@ async function handleOpenaiChat(
     imageContentMode: shouldUseTextOnlyOpenAIChatContent(baseUrl, body.model) ? 'text_only' : 'vision',
   })
   relaxForcedToolChoice(transformed as unknown as Record<string, unknown>, baseUrl)
+  clampUnsupportedReasoningEffort(transformed as unknown as Record<string, unknown>, baseUrl)
   if (traceContext) {
     traceContext.protocolTrace = new ProtocolTraceObserver('openai_chat', transformed,
       resolveRequestCompatibility(body, { ...requestOptions, protocol: 'openai_chat' }).outputBudget)
@@ -956,6 +974,7 @@ async function handleOpenaiResponses(
 ): Promise<Response> {
   const transformed = anthropicToOpenaiResponses(body, { ...requestOptions, cacheKey: promptCacheKey })
   relaxForcedToolChoice(transformed as unknown as Record<string, unknown>, baseUrl)
+  clampUnsupportedReasoningEffort(transformed as unknown as Record<string, unknown>, baseUrl)
   if (traceContext) {
     traceContext.protocolTrace = new ProtocolTraceObserver('openai_responses', transformed,
       resolveRequestCompatibility(body, { ...requestOptions, protocol: 'openai_responses' }).outputBudget)
