@@ -5265,7 +5265,7 @@ describe('chatStore history mapping', () => {
       id: 'provider-1', presetId: 'custom', name: 'DeepSeek', apiKey: 'fixture',
       baseUrl: 'http://127.0.0.1:1', apiFormat: 'anthropic',
       models: { main: model, haiku: '', sonnet: '', opus: '' },
-      model1mSupport: { main: enabled, haiku: false, sonnet: false, opus: false },
+      model1mSupport: { main: enabled, fable: false, haiku: false, sonnet: false, opus: false },
     }]
     const staleSelection = { providerId: 'provider-1', modelId: `${model}${enabled ? '' : '[1m]'}`, effortLevel: 'high' as const }
     const expectedSelection = { ...staleSelection, modelId: `${model}${enabled ? '[1m]' : ''}` }
@@ -5290,7 +5290,7 @@ describe('chatStore history mapping', () => {
       id: 'provider-1', presetId: 'custom', name: 'DeepSeek', apiKey: 'fixture',
       baseUrl: 'http://127.0.0.1:1', apiFormat: 'anthropic',
       models: { main: 'deepseek-v4.1', haiku: '', sonnet: '', opus: '' },
-      model1mSupport: { main: true, haiku: false, sonnet: false, opus: false },
+      model1mSupport: { main: true, fable: false, haiku: false, sonnet: false, opus: false },
     }]
     useChatStore.getState().sendMessage(TEST_SESSION_ID, 'continue')
     expect(sendMock.mock.calls.slice(0, 2)).toEqual([
