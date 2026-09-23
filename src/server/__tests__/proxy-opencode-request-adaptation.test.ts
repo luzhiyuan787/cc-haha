@@ -4,7 +4,7 @@ import * as os from 'os'
 import * as path from 'path'
 import { handleProxyRequest } from '../proxy/handler.js'
 import { ProviderService } from '../services/providerService.js'
-import { clearTraceCaptureStateForTests, traceCaptureService } from '../services/traceCaptureService.js'
+import { clearTraceCaptureStateForTests, drainTraceCaptureForTests, traceCaptureService } from '../services/traceCaptureService.js'
 import { resetSettingsCache } from '../../utils/settings/settingsCache.js'
 
 let tmpDir: string
@@ -19,6 +19,10 @@ async function setup() {
 }
 
 async function teardown() {
+  // Proxy trace appends are fire-and-forget; without a drain the rm below can
+  // land between an append's mkdir and its write, surfacing as ENOENT between
+  // tests under suite load (it passes standalone because the race is tight).
+  await drainTraceCaptureForTests()
   if (originalConfigDir !== undefined) {
     process.env.CLAUDE_CONFIG_DIR = originalConfigDir
   } else {
@@ -327,6 +331,56 @@ describe('proxy opencode request adaptation', () => {
       const res = await callProxy(provider.id, SESSION_ID, { output_config: { effort: 'max' } })
       expect(res.status).toBe(200)
       expect(upstream.getCapturedBody()?.reasoning_effort).toBe('max')
+      await waitForTraceCallDone(SESSION_ID)
+    } finally {
+      upstream.restore()
+    }
+  })
+
+  // Live probe 2026-09-23: mimo-* answer image_url with 200, glm-5.3 answers
+  // 400 "does not support image inputs" — so the gateway needs a per-family
+  // allowlist, not a blanket vision opt-in.
+  const imageRequest = {
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'What is in this image?' },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'abc123' } },
+      ],
+    }],
+  }
+
+  test('forwards image_url parts for multimodal models the gateway accepts', async () => {
+    const provider = await makeProvider('openai_chat', 'https://opencode.ai/zen/go/')
+    const upstream = mockUpstreamCaptureHeaders(chatCompletionBody())
+    try {
+      const res = await callProxy(provider.id, SESSION_ID, {
+        ...imageRequest,
+        model: 'mimo-v2.6-pro',
+      })
+      expect(res.status).toBe(200)
+      const content = (upstream.getCapturedBody()?.messages as any[])[0].content
+      expect(JSON.stringify(content)).toContain('"image_url"')
+      expect(JSON.stringify(content)).toContain('abc123')
+      expect(JSON.stringify(content)).not.toContain('Image omitted')
+      await waitForTraceCallDone(SESSION_ID)
+    } finally {
+      upstream.restore()
+    }
+  })
+
+  test('still omits images for gateway models that reject image inputs', async () => {
+    const provider = await makeProvider('openai_chat', 'https://opencode.ai/zen/go/')
+    const upstream = mockUpstreamCaptureHeaders(chatCompletionBody())
+    try {
+      const res = await callProxy(provider.id, SESSION_ID, {
+        ...imageRequest,
+        model: 'glm-5.3',
+      })
+      expect(res.status).toBe(200)
+      const serialized = JSON.stringify(upstream.getCapturedBody())
+      expect(serialized).toContain('Image omitted')
+      expect(serialized).not.toContain('abc123')
       await waitForTraceCallDone(SESSION_ID)
     } finally {
       upstream.restore()

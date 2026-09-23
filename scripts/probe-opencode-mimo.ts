@@ -15,7 +15,8 @@ import os from 'node:os'
 import path from 'node:path'
 
 const ENDPOINT = 'https://opencode.ai/zen/go/v1/chat/completions'
-const MODEL = process.argv[2] ?? 'mimo-v2.6-pro'
+const positional = process.argv.slice(2).filter(arg => !arg.startsWith('--'))
+const MODEL = positional[0] ?? 'mimo-v2.6-pro'
 const CONTROL_MODEL = 'mimo-v2.5'
 
 const realDir = path.join(os.homedir(), '.claude', 'cc-haha')
@@ -93,8 +94,33 @@ async function send(model: string, label: string, body: Record<string, unknown>)
   return status
 }
 
+// 1×1 red PNG — the smallest payload that still exercises the image_url path.
+const TINY_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+
+function imageMessages() {
+  return [{
+    role: 'user',
+    content: [
+      { type: 'text', text: 'Describe this image in one word.' },
+      { type: 'image_url', image_url: { url: `data:image/png;base64,${TINY_PNG}` } },
+    ],
+  }]
+}
+
 console.log(`endpoint ${ENDPOINT}`)
 console.log(`credential from ${opencode.name} (not printed)\n`)
+
+if (process.argv.includes('--image')) {
+  console.log('--- image acceptance (does the gateway keep image_url?) ---')
+  const models = positional.length > 0
+    ? positional
+    : [MODEL, CONTROL_MODEL, 'mimo-v2.6-flash', 'glm-5.3', 'deepseek-v4-flash-vision-exp']
+  for (const model of models) {
+    await send(model, 'stream + image_url', { stream: true, messages: imageMessages() })
+  }
+  process.exit(0)
+}
+
 console.log('--- control: a model that is known to work ---')
 await send(CONTROL_MODEL, 'minimal stream', { stream: true })
 await send(CONTROL_MODEL, 'everything (production shape)', variants.at(-1)!.body)
