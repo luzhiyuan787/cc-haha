@@ -6276,21 +6276,25 @@ describe('MessageList nested tool calls', () => {
     await waitForProgrammaticScrollReset()
     scrollArea.scrollTop = 0
     fireEvent.scroll(scrollArea)
-    fireEvent.click(await screen.findByRole('button', { name: 'Show 1 changed files' }))
+    // RTL's default 1s wait is a CPU-starvation bet: the instrumented coverage
+    // run shares this box with several workers and has blown it while the very
+    // same assertions pass solo and in check:desktop. Ten seconds keeps the
+    // assertion and drops only the accidental deadline.
+    fireEvent.click(await screen.findByRole('button', { name: 'Show 1 changed files' }, { timeout: 10_000 }))
     const opener = screen.getByRole('button', { name: 'Open src/virtual.ts in workspace' })
     fireEvent.click(opener)
     await waitFor(() => expect(useWorkspaceStore.getState().getSession(ACTIVE_TAB).origin)
-      .toEqual({ sourceTurnKey: 'assistant-virtual-file', sourceElementId: opener.id }))
+      .toEqual({ sourceTurnKey: 'assistant-virtual-file', sourceElementId: opener.id }), { timeout: 10_000 })
 
     await waitForProgrammaticScrollReset()
     scrollArea.scrollTop = 222 * 112 - 500
     fireEvent.scroll(scrollArea)
-    await waitFor(() => expect(container.querySelector('[data-chat-render-item-key="assistant-virtual-file"]')).toBeNull())
+    await waitFor(() => expect(container.querySelector('[data-chat-render-item-key="assistant-virtual-file"]')).toBeNull(), { timeout: 10_000 })
     act(() => useWorkspaceStore.getState().setLayout(ACTIVE_TAB, 'hidden'))
 
-    const remountedOpener = await screen.findByRole('button', { name: 'Open src/virtual.ts in workspace' })
+    const remountedOpener = await screen.findByRole('button', { name: 'Open src/virtual.ts in workspace' }, { timeout: 10_000 })
     expect(remountedOpener).not.toBe(opener)
-    await waitFor(() => expect(document.activeElement).toBe(remountedOpener))
+    await waitFor(() => expect(document.activeElement).toBe(remountedOpener), { timeout: 10_000 })
     expect(screen.getByRole('button', { name: 'Hide changed files' }).getAttribute('aria-expanded')).toBe('true')
     expect(useWorkspaceStore.getState().getSession(ACTIVE_TAB).origin).toBeNull()
   })

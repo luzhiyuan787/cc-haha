@@ -13,11 +13,17 @@ export default defineConfig({
     environment: 'jsdom',
     globals: true,
     css: true,
-    // Render-heavy chat payload tests take ~5.3s solo on slower machines and
-    // the full suite roughly doubles that under worker contention; the vitest
-    // default of 5s turns them into flaky timeouts in check:desktop. The
-    // coverage gate passes a higher CLI override for its instrumented run.
-    testTimeout: 20_000,
+    // Render-heavy chat payload tests take ~5.3s solo but have needed >20s in
+    // the full suite when the box is busy (27.9s observed at a 20s cap); the
+    // vitest default of 5s was flaky even sooner. 60s matches the coverage
+    // gate's override and still fails a genuinely hung test.
+    testTimeout: 60_000,
+    // Vitest sizes workers from the logical CPU count (16 here, 8 physical),
+    // so the full suite oversubscribes the box — worst under the coverage
+    // instrumenter, where unrelated tests were starving into timeouts and
+    // assertion races. Six keeps every worker a physical core without them
+    // fighting over the last two.
+    maxWorkers: 6,
     setupFiles: ['./src/test/webStorage.ts'],
     coverage: {
       include: ['src/**/*.{ts,tsx}'],

@@ -940,8 +940,11 @@ export async function runCoverageGate(options: {
       // Instrumented full-suite runs on a loaded x64 machine push render-heavy
       // tests past 20s even though they pass alone (observed 10.5s solo, timed
       // out in-suite); 60s keeps a slow-but-correct run green while a hung
-      // test still fails the gate.
+      // test still fails the gate. One retry absorbs a residual starvation
+      // blip in the instrumented run without hiding a genuinely broken test —
+      // a real failure fails both attempts.
       '--testTimeout=60000',
+      '--retry=1',
     ],
     join(rootDir, 'desktop'),
     join(outputDir, 'desktop'),
