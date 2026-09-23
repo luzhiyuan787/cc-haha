@@ -22,7 +22,12 @@ async function makeTempDir(prefix: string): Promise<string> {
 }
 
 function git(cwd: string, ...args: string[]): string {
-  return execFileSync('git', args, { cwd, encoding: 'utf8' })
+  // Mirror the service's own hardening: the retargeting vars under test are set
+  // on process.env, and a verification helper that inherited them would inspect
+  // the decoy repository instead of the repo it was pointed at.
+  const env: NodeJS.ProcessEnv = { ...process.env }
+  for (const name of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE']) delete env[name]
+  return execFileSync('git', args, { cwd, encoding: 'utf8', env })
 }
 
 function tryGit(cwd: string, ...args: string[]): void {

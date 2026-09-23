@@ -151,6 +151,10 @@ describe('background task notification persistence', () => {
     })
     spyOn(fs, 'open').mockImplementation(async (...args) => {
       const handle = await realOpen(...args)
+      // Session discovery streams transcripts with a read-mode open before the
+      // append runs; only the append open (numeric O_WRONLY|O_APPEND flags) is
+      // the write this test needs to hold open.
+      if (typeof args[1] !== 'number') return handle
       appendAttempts++
       if (appendAttempts > 1) return handle
       const realClose = handle.close.bind(handle)

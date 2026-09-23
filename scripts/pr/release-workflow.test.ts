@@ -280,7 +280,7 @@ describe('release desktop workflow', () => {
     )
   })
 
-  test('release workflow requires signed macOS Computer Use and preserves SignPath draft policy', () => {
+  test('release workflow requires signed macOS for non-draft publishes and preserves SignPath draft policy', () => {
     const workflow = readReleaseWorkflow()
     const signingJob = workflow.match(
       /signing-preflight:[\s\S]*?(?:\n {2}[a-zA-Z0-9_-]+:|$)/,
@@ -312,7 +312,7 @@ describe('release desktop workflow', () => {
       expect(signingJob).toContain(setting)
     }
     expect(signingJob).toContain('Missing macOS signing/notarization secrets')
-    expect(signingJob).toContain('refusing to build a macOS release whose Computer Use runtime cannot pass client attestation')
+    expect(signingJob).toContain('refusing to publish a non-draft release whose Computer Use runtime cannot pass client attestation')
     expect(signingJob).toContain("RELEASE_DRAFT: ${{ github.event_name == 'workflow_dispatch' && inputs.draft == true }}")
     expect(signingJob).toContain('macos_signed=false')
     expect(signingJob).toContain('macos_signed=true')
@@ -325,8 +325,12 @@ describe('release desktop workflow', () => {
     const macRequiredBlock = signingJob?.match(
       /missing=\(\)[\s\S]*?# Drafts may remain unsigned/,
     )?.[0]
-    expect(macRequiredBlock).not.toContain('if [ "$RELEASE_DRAFT" != "true" ]; then')
+    // This fork publishes drafts without Apple signing secrets, so the macOS
+    // hard fail is scoped to non-draft publishes and drafts ship an unsigned
+    // lane with install-macos-unsigned.sh instead of failing preflight.
+    expect(macRequiredBlock).toContain('if [ "$RELEASE_DRAFT" != "true" ]; then')
     expect(macRequiredBlock).toContain('exit 1')
+    expect(macRequiredBlock).toContain('Ship install-macos-unsigned.sh with the DMG.')
     expect(signingJob).toContain('if [ "$RELEASE_DRAFT" != "true" ]; then')
     expect(signingJob).toContain('exit 1')
     expect(buildJob).toContain('- signing-preflight')
@@ -353,6 +357,7 @@ describe('release desktop workflow', () => {
       { name: 'explicit skip without SignPath', env: { SKIP_WINDOWS_SIGNING: 'true', SIGNPATH_API_TOKEN: '' }, code: 0, outputs: 'macos_signed=true\nwindows_signed=false\n' },
       { name: 'release missing SignPath without skip', env: { SIGNPATH_API_TOKEN: '' }, code: 1, outputs: 'macos_signed=true\nwindows_signed=false\n' },
       { name: 'draft missing SignPath', env: { RELEASE_DRAFT: 'true', SIGNPATH_API_TOKEN: '' }, code: 0, outputs: 'macos_signed=true\nwindows_signed=false\n' },
+      { name: 'draft missing macOS secrets', env: { RELEASE_DRAFT: 'true', CSC_LINK: '' }, code: 0, outputs: 'macos_signed=false\nwindows_signed=true\n' },
       { name: 'explicit skip still requires macOS credentials', env: { SKIP_WINDOWS_SIGNING: 'true', CSC_LINK: '' }, code: 1, outputs: 'macos_signed=false\n' },
     ]
     try {

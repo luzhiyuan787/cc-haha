@@ -27,12 +27,23 @@ function controller() {
 }
 
 async function until(check: () => boolean) {
-  const deadline = Date.now() + 2_000
+  // Real FSEvents delivery under a loaded suite run has exceeded 2s on this
+  // machine (observed 2021ms); the assertion still fails if the event never
+  // arrives — only the patience for a busy runner changes.
+  const deadline = Date.now() + 10_000
   while (!check()) {
     if (Date.now() > deadline) throw new Error('Timed out waiting for filesystem event')
     await new Promise((resolve) => setTimeout(resolve, 20))
   }
 }
+
+/**
+ * macOS starts the native FSEvents stream asynchronously after `fs.watch`
+ * returns; a mutation landing in that window is never observed. It never
+ * shows up standalone, but the suite runs four processes at once and drops the
+ * first event intermittently. Give the watch a beat before mutating.
+ */
+const watchReady = () => new Promise((resolve) => setTimeout(resolve, 200))
 
 /** Keep real validated directories/handles, but drive native events and the 60ms flush exactly. */
 function controlledWatchCallbacks(canonicalRoot: string) {
@@ -176,21 +187,25 @@ describe('bounded workspace watches', () => {
     const abort = controller()
     let stop = await service.watchDirectories('task', ['', 'src/nested'], (event) => events.push(event), abort.signal)
     try {
+      await watchReady()
       await fs.rm(path.join(root, 'src'), { recursive: true })
       await until(() => events.some((event) => event.paths.includes('src')))
       stop()
       events.length = 0
       stop = await service.watchDirectories('task', ['', 'src/nested'], (event) => events.push(event), abort.signal)
+      await watchReady()
       await fs.mkdir(path.join(root, 'src'))
       await until(() => events.some((event) => event.paths.includes('src')))
       stop()
       events.length = 0
       stop = await service.watchDirectories('task', ['', 'src/nested'], (event) => events.push(event), abort.signal)
+      await watchReady()
       await fs.mkdir(path.join(root, 'src/nested'))
       await until(() => events.some((event) => event.paths.includes('src/nested')))
       stop()
       events.length = 0
       stop = await service.watchDirectories('task', ['', path.join(root, 'src/nested')], (event) => events.push(event), abort.signal)
+      await watchReady()
       await fs.writeFile(filePath, 'after')
       await until(() => events.some((event) => event.paths.includes('src/nested/a.ts')))
       expect(events.some((event) => event.directories.includes('src/nested'))).toBe(true)
@@ -204,6 +219,7 @@ describe('bounded workspace watches', () => {
     const events: WorkspaceWatchChange[] = []
     const abort = controller()
     await service.watchDirectories('task', ['src'], (event) => events.push(event), abort.signal)
+    await watchReady()
     await fs.writeFile(path.join(root, 'src/a.ts'), 'one')
     await fs.writeFile(path.join(root, 'src/a.ts'), 'two')
     await fs.rename(path.join(root, 'src/a.ts'), path.join(root, 'src/b.ts'))

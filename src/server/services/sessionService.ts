@@ -1818,6 +1818,31 @@ export class SessionService {
     })
   }
 
+  /**
+   * Whether a transcript file contains a conversation, streamed rather than
+   * materialized. Session discovery runs on the list/summary path, where a
+   * full read of every candidate transcript stalls every other session; the
+   * callers only need the boolean to order candidates.
+   */
+  private async fileHasConversationTranscript(filePath: string): Promise<boolean> {
+    const controller = new AbortController()
+    let has = false
+    try {
+      await streamBoundedHistory(filePath, (entry) => {
+        if (has) return
+        if (this.hasConversationTranscript([entry as RawEntry])) {
+          has = true
+          controller.abort()
+        }
+      }, controller.signal)
+    } catch (error) {
+      // The abort above is how the stream stops at the first match; every
+      // other failure (ENOENT, truncation) must reach the caller unchanged.
+      if (!has) throw error
+    }
+    return has
+  }
+
   // --------------------------------------------------------------------------
   // Entry → MessageEntry conversion
   // --------------------------------------------------------------------------
@@ -2646,11 +2671,10 @@ export class SessionService {
                 sessionId,
                 projectsRoot!,
               )
-              const entries = await this.readJsonlFile(match.filePath)
               hydratedMatches.push({
                 ...match,
                 mtimeMs: stat.mtimeMs,
-                hasTranscript: this.hasConversationTranscript(entries),
+                hasTranscript: await this.fileHasConversationTranscript(match.filePath),
               })
             } catch (error) {
               if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
@@ -2697,12 +2721,12 @@ export class SessionService {
       const filePath = path.join(projectsDir, dir, `${sessionId}.jsonl`)
       try {
         const stat = await fs.stat(filePath)
-        const entries = await this.readJsonlFile(filePath)
+        const hasTranscript = await this.fileHasConversationTranscript(filePath)
         matches.push({
           filePath,
           projectDir: dir,
           mtimeMs: stat.mtimeMs,
-          hasTranscript: this.hasConversationTranscript(entries),
+          hasTranscript,
         })
       } catch {
         continue

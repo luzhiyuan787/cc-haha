@@ -937,7 +937,11 @@ export async function runCoverageGate(options: {
       '--coverage.reporter=json-summary',
       '--coverage.reporter=lcov',
       `--coverage.reportsDirectory=${join(outputDir, 'desktop')}`,
-      '--testTimeout=20000',
+      // Instrumented full-suite runs on a loaded x64 machine push render-heavy
+      // tests past 20s even though they pass alone (observed 10.5s solo, timed
+      // out in-suite); 60s keeps a slow-but-correct run green while a hung
+      // test still fails the gate.
+      '--testTimeout=60000',
     ],
     join(rootDir, 'desktop'),
     join(outputDir, 'desktop'),

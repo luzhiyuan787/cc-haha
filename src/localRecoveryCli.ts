@@ -248,15 +248,24 @@ async function runInteractive(parsed: {
     prompt: 'you> ',
   })
 
+  // A piped input (test harness, `echo | claude`) ends while a response is in
+  // flight; readline marks itself closed on end, and prompting afterwards is
+  // ERR_USE_AFTER_CLOSE. Skip the prompt and let the loop drain instead.
+  let inputClosed = false
+  rl.on('close', () => { inputClosed = true })
+  const prompt = () => {
+    if (!inputClosed) rl.prompt()
+  }
+
   process.stdout.write(
     `Claude Haha local interactive mode\nmodel: ${model}\ncommands: /exit, /clear\n\n`,
   )
-  rl.prompt()
+  prompt()
 
   for await (const line of rl) {
     const input = line.trim()
     if (!input) {
-      rl.prompt()
+      prompt()
       continue
     }
     if (input === '/exit' || input === '/quit') {
@@ -266,7 +275,7 @@ async function runInteractive(parsed: {
     if (input === '/clear') {
       messages.length = 0
       process.stdout.write('history cleared\n')
-      rl.prompt()
+      prompt()
       continue
     }
 
@@ -289,7 +298,7 @@ async function runInteractive(parsed: {
         error instanceof Error ? error.message : String(error)
       process.stderr.write(`error: ${message}\n`)
     }
-    rl.prompt()
+    prompt()
   }
 }
 

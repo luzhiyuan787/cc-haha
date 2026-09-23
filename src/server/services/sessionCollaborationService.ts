@@ -280,9 +280,16 @@ export class SessionCollaborationService {
       nextEnd = index
     }
     const nextDepth = depth + 1
-    const next = nextDepth >= COLLABORATION_READ_MAX_PAGES ? null : nextEnd > 0
-      ? { version: 1, sessionId, baseCursor, end: nextEnd, sourceVersion: page.page.sourceVersion, fragmentEnd: nextFragmentEnd, depth: nextDepth }
-      : page.page.nextCursor ? { version: 1, sessionId, baseCursor: page.page.nextCursor, depth: nextDepth } : null
+    // Walking `end` back within one already-served storage page is not a new
+    // page: charging it against the depth cap cuts a cursor chain after
+    // COLLABORATION_READ_MAX_PAGES batches even though older turns on that
+    // same page were promised by `end`. Only advancing to another storage
+    // page counts — that is the walk the cap exists to bound.
+    const next = nextEnd > 0
+      ? { version: 1, sessionId, baseCursor, end: nextEnd, sourceVersion: page.page.sourceVersion, fragmentEnd: nextFragmentEnd, depth }
+      : page.page.nextCursor && nextDepth < COLLABORATION_READ_MAX_PAGES
+        ? { version: 1, sessionId, baseCursor: page.page.nextCursor, depth: nextDepth }
+        : null
     return { messages: projectedMessages, turnsIncluded: turns, truncated,
       page: { ...page.page, nextCursor: next ? Buffer.from(JSON.stringify(next)).toString('base64url') : null, hasMore: next !== null },
       historyComplete: next === null && page.page.historyComplete === true && !truncated }
