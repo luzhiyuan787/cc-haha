@@ -964,13 +964,16 @@ function hasExplicitVisionModelMarker(model: string): boolean {
 
 /**
  * Multimodal families on the OpenCode gateway that never spell "vision" in
- * their id. Live probe (2026-09-23): mimo-v2.5 / mimo-v2.6-pro /
- * mimo-v2.6-flash all answer an image_url request with 200, while glm-5.3
- * answers 400 `does not support image inputs` — so this stays a per-family
- * allowlist rather than a blanket opt-in for the gateway.
+ * their id. Live probes (2026-09-23): mimo-v2.5 / mimo-v2.6-pro /
+ * mimo-v2.6-flash and every deepseek id on the catalog (deepseek-flash,
+ * deepseek-v4-flash, deepseek-v4-pro, deepseek-v4.1-flash) answer an
+ * image_url request with 200, while glm-5.3 answers 400
+ * `does not support image inputs` — so this stays a per-family allowlist
+ * rather than a blanket opt-in for the gateway.
  */
 function hasMultimodalGatewayModelMarker(model: string): boolean {
   return /(^|[/:._-])mimo([/:._-]|$)/i.test(model)
+    || /(^|[/:._-])deepseek([/:._-]|$)/i.test(model)
 }
 
 async function handleOpenaiResponses(

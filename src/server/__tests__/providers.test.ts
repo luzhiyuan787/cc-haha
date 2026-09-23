@@ -2239,9 +2239,12 @@ describe('ProviderService', () => {
 
     test.each([
       {
+        // glm is the probed-reject family on this gateway (400 "does not
+        // support image inputs"); every deepseek id on it now accepts images,
+        // so they can no longer stand in for a text-only opencode model.
         name: 'opencode non-vision model',
         baseUrl: 'https://opencode.ai/zen',
-        model: 'deepseek-v4-flash',
+        model: 'glm-5.3',
       },
       {
         name: 'classic DeepSeek text model',

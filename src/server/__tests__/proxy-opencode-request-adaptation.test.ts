@@ -337,9 +337,9 @@ describe('proxy opencode request adaptation', () => {
     }
   })
 
-  // Live probe 2026-09-23: mimo-* answer image_url with 200, glm-5.3 answers
-  // 400 "does not support image inputs" — so the gateway needs a per-family
-  // allowlist, not a blanket vision opt-in.
+  // Live probe 2026-09-23: mimo-* and every deepseek id on the catalog answer
+  // image_url with 200, glm-5.3 answers 400 "does not support image inputs" —
+  // so the gateway needs a per-family allowlist, not a blanket vision opt-in.
   const imageRequest = {
     messages: [{
       role: 'user',
@@ -354,15 +354,17 @@ describe('proxy opencode request adaptation', () => {
     const provider = await makeProvider('openai_chat', 'https://opencode.ai/zen/go/')
     const upstream = mockUpstreamCaptureHeaders(chatCompletionBody())
     try {
-      const res = await callProxy(provider.id, SESSION_ID, {
-        ...imageRequest,
-        model: 'mimo-v2.6-pro',
-      })
-      expect(res.status).toBe(200)
-      const content = (upstream.getCapturedBody()?.messages as any[])[0].content
-      expect(JSON.stringify(content)).toContain('"image_url"')
-      expect(JSON.stringify(content)).toContain('abc123')
-      expect(JSON.stringify(content)).not.toContain('Image omitted')
+      for (const model of ['mimo-v2.6-pro', 'deepseek-v4.1-flash']) {
+        const res = await callProxy(provider.id, SESSION_ID, {
+          ...imageRequest,
+          model,
+        })
+        expect(res.status, model).toBe(200)
+        const content = (upstream.getCapturedBody()?.messages as any[])[0].content
+        expect(JSON.stringify(content), model).toContain('"image_url"')
+        expect(JSON.stringify(content), model).toContain('abc123')
+        expect(JSON.stringify(content), model).not.toContain('Image omitted')
+      }
       await waitForTraceCallDone(SESSION_ID)
     } finally {
       upstream.restore()
