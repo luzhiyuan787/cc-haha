@@ -59,6 +59,7 @@ export function parseSystemProxyRules(rules: string | undefined): SystemProxyRul
 
 export class SystemProxyBridge implements SystemProxyBridgeLike {
   private server: http.Server | null = null
+  private listening = false
   private startPromise: Promise<string> | null = null
   private lifecycleGeneration = 0
   private readonly clientSockets = new Set<net.Socket>()
@@ -79,13 +80,21 @@ export class SystemProxyBridge implements SystemProxyBridgeLike {
     this.startPromise = null
     const server = this.server
     this.server = null
+    const listening = this.listening
+    this.listening = false
     for (const socket of this.clientSockets) socket.destroy()
     for (const socket of this.outboundSockets) socket.destroy()
     // Bun needs the HTTP connection registry drained before close() will
     // finish after an upgraded CONNECT socket. Calling this before listen
     // completes breaks the separate startup/stop race, so guard on listening.
-    if (server?.listening) server.closeAllConnections()
-    const closing = server?.listening
+    //
+    // `server.listening` cannot be that guard: Bun reports it true the instant
+    // listen() returns, while the bind is still pending. Closing in that window
+    // makes Bun drop the pending listen callback, so startOnce() never settles
+    // and this stop() — which awaits it — never returns. `this.listening` is
+    // only set from inside the listen callback, so it means what we need.
+    if (server && listening) server.closeAllConnections()
+    const closing = server && listening
       ? new Promise<void>(resolve => server.close(() => resolve()))
       : Promise.resolve()
     await closing
@@ -113,6 +122,7 @@ export class SystemProxyBridge implements SystemProxyBridgeLike {
         server.once('error', reject)
         server.listen(0, SYSTEM_PROXY_BRIDGE_HOST, () => {
           server.off('error', reject)
+          this.listening = true
           resolve()
         })
       })
@@ -121,12 +131,14 @@ export class SystemProxyBridge implements SystemProxyBridgeLike {
       throw error
     }
     if (generation !== this.lifecycleGeneration || this.server !== server) {
+      this.listening = false
       await closeServer(server)
       throw new Error('System proxy bridge startup was stopped')
     }
     const address = server.address()
     if (!address || typeof address === 'string') {
       if (this.server === server) this.server = null
+      this.listening = false
       await closeServer(server)
       throw new Error('Could not resolve system proxy bridge port')
     }

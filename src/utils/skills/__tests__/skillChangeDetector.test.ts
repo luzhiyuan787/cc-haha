@@ -84,6 +84,11 @@ describe('skill change detector watch paths', () => {
     // chokidar on a non-existent path never fires, and would mask a real
     // directory appearing later; the loader tolerates the miss instead.
     await makeDir(tmpHome, '.claude', 'skills')
+    // The project root is resolved from cwd. This repository ships its own
+    // tracked `.agents/skills`, so staying in it would watch a real directory
+    // and make the assertion below pass or fail for the wrong reason.
+    const project = await makeDir(tmpHome, 'repo')
+    process.chdir(project)
 
     const paths = await getWatchablePaths()
 
