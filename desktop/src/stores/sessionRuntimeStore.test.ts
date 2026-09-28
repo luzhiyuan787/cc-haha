@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SessionListItem } from '../types/session'
 import { useSessionRuntimeStore } from './sessionRuntimeStore'
+import { registerSideChatSession, unregisterSideChatSession } from '../lib/sideChatSessions'
 
 const EXPECTED_GROK_SELECTION = {
   providerId: 'grok-official',
@@ -12,6 +13,19 @@ describe('sessionRuntimeStore runtime cleanup', () => {
   beforeEach(() => {
     localStorage.clear()
     useSessionRuntimeStore.setState({ selections: {} })
+  })
+
+  it('keeps side-chat models in memory without changing the stored parent choice, even after close', () => {
+    const store = useSessionRuntimeStore.getState()
+    const parent = { providerId: 'example', modelId: 'parent-model' }
+    store.setSelection('parent', parent)
+    registerSideChatSession('side-runtime-test', 'parent')
+    store.setSelection('side-runtime-test', { providerId: 'example', modelId: 'side-model' })
+    expect(useSessionRuntimeStore.getState().selections['side-runtime-test']?.modelId).toBe('side-model')
+    expect(JSON.parse(localStorage.getItem('cc-haha-session-runtime')!)).toEqual({ parent })
+    unregisterSideChatSession('side-runtime-test')
+    store.setSelection('side-runtime-test', { providerId: 'example', modelId: 'late-update' })
+    expect(JSON.parse(localStorage.getItem('cc-haha-session-runtime')!)).toEqual({ parent })
   })
 
   it('keeps an explicit model choice through stale, matching, then stale metadata refreshes', () => {

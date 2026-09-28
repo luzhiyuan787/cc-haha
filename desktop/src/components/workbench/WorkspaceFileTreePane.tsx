@@ -12,6 +12,8 @@ import { useRovingTree } from './treeKeyboard'
 import { useWorkspaceChatContextStore } from '@/stores/workspaceChatContextStore'
 import { useDismissable } from '@/hooks/useDismissable'
 import { useAnchoredPosition } from '@/hooks/useAnchoredPosition'
+import { WorkspaceFileOpenWith } from '@/components/workspace/WorkspaceFileOpenWith'
+import { resolveAbsoluteOpenPath } from '@/lib/systemFileOpen'
 import { useMenuKeyboard } from '@/components/workbench/menuKeyboard'
 
 export type WorkspaceFileTreePaneProps = {
@@ -61,6 +63,11 @@ export function WorkspaceFileTreePane({
     offset: 0,
     clampHeight: true,
   })
+  const workDir = useWorkspaceContentStore((state) => state.statusBySession[sessionId]?.workDir)
+  const loadStatus = useWorkspaceContentStore((state) => state.loadStatus)
+  useEffect(() => {
+    if (menu && !workDir) void loadStatus(sessionId)
+  }, [menu, workDir, loadStatus, sessionId])
   const treeView = useWorkspaceContentStore((state) => state.treeViewBySession[sessionId] ?? EMPTY_WORKSPACE_TREE_VIEW)
   const setTreeView = useWorkspaceContentStore((state) => state.setTreeView)
   const { filter } = treeView
@@ -390,6 +397,16 @@ export function WorkspaceFileTreePane({
           }}>
             {t('workspace.addSelectionToChat')}
           </Button>
+          {workDir ? (
+            <WorkspaceFileOpenWith
+              absolutePath={resolveAbsoluteOpenPath(menu.row.path, workDir)}
+              sessionId={sessionId}
+              workspacePath={menu.row.path}
+              isDirectory={menu.row.isDirectory}
+              onPreview={() => onOpen(menu.row.path)}
+              onAfterSelect={closeMenu}
+            />
+          ) : null}
         </div>
       ) : null}
     </div>

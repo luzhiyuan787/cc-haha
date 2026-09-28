@@ -51,6 +51,9 @@ export type TeamMember = {
   name: string
   agentType?: string
   model?: string
+  providerId?: string | null
+  providerName?: string
+  effortLevel?: string
   color?: string
   backendType?: string
   status: 'running' | 'completed' | 'idle' | 'failed'
@@ -1406,6 +1409,9 @@ type TeamFileRaw = {
     name: string
     agentType?: string
     model?: string
+    providerId?: string | null
+    providerName?: string
+    effortLevel?: string
     prompt?: string
     color?: string
     joinedAt: number
@@ -1524,6 +1530,9 @@ export class TeamService {
       name: m.name,
       agentType: m.agentType,
       ...(m.model ? { model: m.model } : {}),
+      ...(m.providerId !== undefined ? { providerId: m.providerId } : {}),
+      ...(m.providerName !== undefined ? { providerName: m.providerName } : {}),
+      ...(m.effortLevel !== undefined ? { effortLevel: m.effortLevel } : {}),
       color: m.color,
       backendType: m.backendType,
       status: this.deriveStatus(m.isActive),

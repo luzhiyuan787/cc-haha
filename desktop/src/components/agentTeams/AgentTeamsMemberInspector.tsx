@@ -419,6 +419,10 @@ export function AgentTeamsMemberInspector({
                   : model.full}
             </dd>
           </div>
+          {(member.providerName || member.providerId !== undefined) && <div className="col-span-3 min-w-0">
+            <dt className="text-[10px] font-semibold text-[var(--color-text-tertiary)]">{t('teamPlan.provider')}</dt>
+            <dd className="mt-0.5 truncate font-extrabold" data-testid="agent-teams-member-provider">{member.providerName || member.providerId || t('teamPlan.official')}</dd>
+          </div>}
         </dl>
       </header>
 

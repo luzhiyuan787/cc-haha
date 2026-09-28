@@ -36,16 +36,29 @@ describe('complete message payloads', () => {
   })
 
   it('renders both sides of a large successful Edit', async () => {
+    // Keep the payload above 64 KiB while limiting DOM rows: diff rendering
+    // thousands of identical lines can exceed Vitest's timeout on CI workers.
+    const oldLine = `old_${'x'.repeat(560)}`
+    const oldString = [
+      'HEAD_SENTINEL',
+      ...Array.from({ length: 128 }, () => oldLine),
+      'TAIL_SENTINEL',
+    ].join('\n')
+    expect(oldString.length).toBeGreaterThan(64 * 1024)
     const message = {
       id: 'edit', type: 'tool_use', toolName: 'Edit', toolUseId: 'edit', timestamp: 1,
-      input: { file_path: '/tmp/example.ts', old_string: 'old line\n'.repeat(5000), new_string: 'fixed' },
+      input: { file_path: '/tmp/example.ts', old_string: oldString, new_string: 'fixed' },
     } as UIMessage
     if (message.type !== 'tool_use') throw new Error('Expected tool message')
     await act(async () => {
       render(<ToolCallBlock toolName="Edit" input={message.input} result={{ content: 'Successfully edited file', isError: false }} defaultExpanded />)
     })
     expect(screen.getByText('+1')).toBeInTheDocument()
-    expect(screen.getByText('-5001')).toBeInTheDocument()
+    expect(screen.getByText('-130')).toBeInTheDocument()
+    expect(screen.getByText('HEAD_SENTINEL')).toBeInTheDocument()
+    expect(screen.getAllByText(oldLine)).toHaveLength(128)
+    expect(screen.getByText('TAIL_SENTINEL')).toBeInTheDocument()
+    expect(screen.getByText('fixed')).toBeInTheDocument()
   })
 
   it('copies the entire retained reply including its beginning and end', async () => {

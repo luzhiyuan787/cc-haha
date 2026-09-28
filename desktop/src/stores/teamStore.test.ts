@@ -1941,3 +1941,17 @@ describe('teamStore workbench timeline', () => {
     ).toMatchObject({ agentId: 'lead@team-workbench' })
   })
 })
+
+describe('teamStore execution provider snapshots', () => {
+  it('preserves the actual provider and model when hydrating team detail', async () => {
+    useTeamStore.getState().clearTeam()
+    getTeamMock.mockResolvedValue({
+      name: 'provider-snapshot-team',
+      members: [{ agentId: 'worker@provider-snapshot-team', name: 'worker', role: 'engineer', status: 'running', model: 'same-model-id', providerId: 'second-provider', providerName: 'Execution provider' }],
+    })
+    await useTeamStore.getState().fetchTeamDetail('provider-snapshot-team')
+    expect(useTeamStore.getState().activeTeam?.members[0]).toMatchObject({
+      model: 'same-model-id', providerId: 'second-provider', providerName: 'Execution provider',
+    })
+  })
+})

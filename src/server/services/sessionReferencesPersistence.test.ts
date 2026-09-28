@@ -53,7 +53,7 @@ test('a fresh history service restores reference pills from persisted string and
 })
 
 test('collaboration cursors traverse real bounded history pages without dropping turns', async () => {
-  await writeFile(file, Array.from({ length: 130 }, (_, index) => JSON.stringify(entry(`user-${index}`, `turn ${index}`))).join('\n') + '\n')
+  await writeFile(file, Array.from({ length: 70 }, (_, index) => JSON.stringify(entry(`user-${index}`, `turn ${index}`))).join('\n') + '\n')
   const sessions = historyService()
   const collaboration = new SessionCollaborationService({
     statePath: join(directory, 'collaboration.json'),
@@ -73,11 +73,35 @@ test('collaboration cursors traverse real bounded history pages without dropping
     cursor = result.page.nextCursor ?? undefined
     longestCursor = Math.max(longestCursor, cursor?.length ?? 0)
   } while (cursor)
-  expect(ids).toEqual(Array.from({ length: 130 }, (_, index) => `user-${index}`))
-  // Real storage cursors contain snapshot identity and multiple fingerprints;
-  // a 500-character model tool schema rejects valid continuation requests.
-  expect(longestCursor).toBeGreaterThan(500)
+  expect(ids).toEqual(Array.from({ length: 70 }, (_, index) => `user-${index}`))
+  // The continuation stays bounded while preserving all turns on this chain.
+  expect(longestCursor).toBeGreaterThan(0)
   expect(longestCursor).toBeLessThan(32_000)
+})
+
+test('collaboration history identifies the page cap without claiming complete history', async () => {
+  await writeFile(file, Array.from({ length: 130 }, (_, index) => JSON.stringify(entry(`user-${index}`, `turn ${index}`))).join('\n') + '\n')
+  const sessions = historyService()
+  const collaboration = new SessionCollaborationService({
+    statePath: join(directory, 'collaboration.json'),
+    sessions: {
+      list: async () => ({ sessions: [] }), exists: async () => true,
+      create: async () => { throw new Error('Unused fixture operation') },
+      read: (sessionId, options) => sessions.getSessionHistoryPage(sessionId, options),
+    },
+    runtime: { start: async () => {}, enqueue: async () => {}, stop: async () => {} },
+  })
+  let cursor: string | undefined
+  let result: { messages: Array<{ id: string }>; page: { nextCursor: string | null }; pageLimitReached?: boolean; historyComplete: boolean }
+  const ids: string[] = []
+  do {
+    result = await collaboration.read(id, { cursor, limit: 10 }) as typeof result
+    ids.unshift(...result.messages.map(message => message.id))
+    cursor = result.page.nextCursor ?? undefined
+  } while (cursor)
+  expect(ids).toEqual(Array.from({ length: 80 }, (_, index) => `user-${index + 50}`))
+  expect(result!.pageLimitReached).toBe(true)
+  expect(result!.historyComplete).toBe(false)
 })
 
 

@@ -511,6 +511,18 @@ describe('EmptySession', () => {
     })
   })
 
+  it('finds /clear without recommending it in an empty session', async () => {
+    render(<EmptySession />)
+
+    setComposerText('/', 1)
+    expect(await screen.findByRole('listbox', { name: 'Slash commands' })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: '/clear' })).not.toBeInTheDocument()
+
+    setComposerText('/clear', 6)
+    expect(await screen.findByRole('option', { name: '/clear' })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: '/goal' })).not.toBeInTheDocument()
+  })
+
   it('prioritizes enabled plugin slash commands by command name when filtering', async () => {
     mocks.listSkills.mockResolvedValueOnce({
       skills: [

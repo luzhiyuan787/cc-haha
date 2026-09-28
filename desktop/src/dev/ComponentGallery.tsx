@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
 
+import { AgentTeamsPlanCard } from '@/components/agentTeams/AgentTeamsPlanCard'
+import { installTeamPlanGalleryFixture, TEAM_PLAN_GALLERY_SESSION } from './teamPlanGalleryFixture'
 import { AgentTeamsWorkbench } from '@/components/agentTeams/AgentTeamsWorkbench'
 import { SessionChatHeader, SessionChatSurface } from '@/components/chat/SessionChatSurface'
 import { Badge, StatusDot, type Tone } from '@/components/ui/Badge'
@@ -390,6 +392,12 @@ function SessionSurfacePreview({ kind }: { kind: 'main' | 'agent' }) {
 }
 
 export function ComponentGallery() {
+  const [planFixture, setPlanFixture] = useState<ReturnType<typeof installTeamPlanGalleryFixture> | null>(null)
+  useEffect(() => {
+    const fixture = installTeamPlanGalleryFixture()
+    setPlanFixture(fixture)
+    return () => fixture.dispose()
+  }, [])
   const [theme, setTheme] = useState<(typeof THEMES)[number]>('white')
   const [agentTeamsSnapshots] = useState(createAgentTeamsGallerySnapshots)
   const [modalOpen, setModalOpen] = useState(false)
@@ -458,6 +466,15 @@ export function ComponentGallery() {
           />
         </div>
       </header>
+
+      <Section title="Team plan review" note="In-memory providers and plan API only. No credentials, model calls or real team launches.">
+        <div id="team-plan-review" className="flex flex-wrap gap-2">
+          <Button variant="secondary" onClick={() => planFixture?.reset()}>Reset plan fixture</Button>
+          <Button variant="secondary" onClick={() => planFixture?.conflict()}>Simulate remote revision</Button>
+          <Button variant="secondary" onClick={() => planFixture?.interrupt()}>Simulate interruption</Button>
+        </div>
+        {planFixture && <AgentTeamsPlanCard sessionId={TEAM_PLAN_GALLERY_SESSION} />}
+      </Section>
 
       <Section
         title="AgentTeamsWorkbench"

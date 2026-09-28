@@ -102,6 +102,14 @@ describe('AgentTeamsMemberInspector', () => {
     useSettingsStore.setState({ locale: 'en' })
   })
 
+  it('points members with no team messages to their execution progress', () => {
+    const onOpenExecution = vi.fn()
+    renderInspector({ onOpenExecution })
+    expect(screen.getByText(/Approved tasks are delivered directly; use the execution button below/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /execution/i }))
+    expect(onOpenExecution).toHaveBeenCalledOnce()
+  })
+
   it('derives the first start and elapsed duration from task state transitions', () => {
     const snapshots = [
       snapshot('2026-08-08T07:00:00.000Z', 'pending'),
@@ -210,6 +218,17 @@ describe('AgentTeamsMemberInspector', () => {
     const inheritedCell = screen.getByTestId('agent-teams-member-model')
     expect(inheritedCell.textContent).toBe('Inherit from lead · claude-opus-4-8')
     expect(inheritedCell.getAttribute('data-model-inherited')).toBe('true')
+  })
+
+  it('shows the actual provider snapshot alongside its model', () => {
+    const frame = snapshot('2026-08-08T07:00:00.000Z', 'pending')
+    render(<AgentTeamsMemberInspector
+      snapshots={[frame]} selectedIndex={0} snapshot={frame}
+      member={{ ...builder, model: 'same-model-id', providerId: 'saved-provider', providerName: 'Execution provider' }}
+      isLead={false} leadIsStreaming={false} onBack={vi.fn()} onClose={vi.fn()} onOpenExecution={vi.fn()}
+    />)
+    expect(screen.getByTestId('agent-teams-member-provider').textContent).toBe('Execution provider')
+    expect(screen.getByTestId('agent-teams-member-model').textContent).toBe('same-model-id')
   })
 
   it('never leaves the model cell blank when nothing is known', () => {

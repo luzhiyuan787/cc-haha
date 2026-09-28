@@ -96,7 +96,7 @@ export function ThinkingBlock({
             variant="compact"
             cache={!isActive}
             streaming={isActive}
-            className="thinking-markdown text-[var(--color-text-secondary)]"
+            className="thinking-markdown chat-reading-markdown text-[var(--color-text-secondary)]"
           />
           {isActive && <span className="thinking-cursor" />}
         </div>

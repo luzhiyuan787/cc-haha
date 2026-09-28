@@ -145,6 +145,8 @@ function toTeamMember(raw: Record<string, unknown>): TeamMember {
     color: raw.color as AgentColor | undefined,
     sessionId: raw.sessionId as string | undefined,
     model: typeof raw.model === 'string' ? raw.model : undefined,
+    providerId: raw.providerId === null || typeof raw.providerId === 'string' ? raw.providerId : undefined,
+    providerName: typeof raw.providerName === 'string' ? raw.providerName : undefined,
   }
 }
 

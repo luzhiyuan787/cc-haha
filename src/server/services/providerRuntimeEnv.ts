@@ -27,6 +27,8 @@ import type {
 } from '../types/provider.js'
 import {
   BUILT_IN_PROVIDER_IDS,
+  GROK_OFFICIAL_PROVIDER_ID,
+  OPENAI_OFFICIAL_PROVIDER_ID,
   PROVIDER_TOOL_SEARCH_OPT_IN_SCHEMA_VERSION,
 } from '../types/provider.js'
 import {
@@ -302,6 +304,7 @@ export function normalizeProvidersIndex(value: unknown): ProvidersIndex | null {
   const {
     activeProviderId: legacyActiveProviderId,
     providerOrder: rawProviderOrder,
+    officialProviderModels: rawOfficialProviderModels,
     ...rest
   } = value
   const schemaVersion = typeof value.schemaVersion === 'number' ? value.schemaVersion : 1
@@ -324,6 +327,16 @@ export function normalizeProvidersIndex(value: unknown): ProvidersIndex | null {
   )
     ? rawActiveId
     : null
+  const officialProviderModels: Record<string, unknown> = isRecord(rawOfficialProviderModels)
+    ? { ...rawOfficialProviderModels }
+    : {}
+  for (const id of BUILT_IN_PROVIDER_IDS) {
+    if (isProviderModels(officialProviderModels[id])) {
+      officialProviderModels[id] = normalizeModelMapping(officialProviderModels[id])
+    } else {
+      delete officialProviderModels[id]
+    }
+  }
 
   return {
     ...rest,
@@ -331,6 +344,7 @@ export function normalizeProvidersIndex(value: unknown): ProvidersIndex | null {
     activeId,
     providers,
     providerOrder: normalizeProviderOrder(rawProviderOrder, providers),
+    officialProviderModels,
   }
 }
 
@@ -504,10 +518,10 @@ export function buildProviderManagedEnv(
   options?: { proxyPath?: string; serverPort?: number },
 ): Record<string, string> {
   if (provider.runtimeKind === 'openai_oauth') {
-    return buildOpenAIOfficialRuntimeEnv()
+    return buildOpenAIOfficialRuntimeEnv(provider.models)
   }
   if (provider.runtimeKind === 'grok_oauth') {
-    return buildGrokOfficialRuntimeEnv()
+    return buildGrokOfficialRuntimeEnv(provider.models)
   }
 
   const apiFormat: ApiFormat = resolveProviderApiFormat(provider)
@@ -576,10 +590,10 @@ export function readActiveProviderManagedEnv(
     if (!index?.activeId) return null
 
     if (isOpenAIOfficialProviderId(index.activeId)) {
-      return buildOpenAIOfficialRuntimeEnv()
+      return buildOpenAIOfficialRuntimeEnv(index.officialProviderModels[OPENAI_OFFICIAL_PROVIDER_ID])
     }
     if (isGrokOfficialProviderId(index.activeId)) {
-      return buildGrokOfficialRuntimeEnv()
+      return buildGrokOfficialRuntimeEnv(index.officialProviderModels[GROK_OFFICIAL_PROVIDER_ID])
     }
 
     const provider = index.providers.find((entry) => entry.id === index.activeId)

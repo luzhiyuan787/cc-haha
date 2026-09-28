@@ -290,6 +290,7 @@ export async function handleProxyRequest(req: Request, url: URL): Promise<Respon
     requestCompatibility: config.requestCompatibility,
     budgetSource: req.headers.get(OUTPUT_BUDGET_SOURCE_HEADER) === 'default' ? 'default' : 'explicit',
   }
+
   // Gateways that bind the wire format to the URL path announce their exceptions
   // on the preset; a model matching no rule keeps the provider's own format.
   // Resolved per request because one provider record can serve several formats.
@@ -948,7 +949,8 @@ function shouldUseTextOnlyOpenAIChatContent(baseUrl: string, model: string): boo
   // image_url inside a tool message is a gateway extension, not a universal
   // Chat Completions contract. Only opt opencode models in when their id
   // explicitly advertises vision capability or the family is known multimodal;
-  // unknown gateway models stay safe.
+  // unknown gateway models stay safe. Context-window suffixes have already
+  // been stripped.
   if (/(^|[./-])opencode\.ai([:/]|$)/i.test(baseUrl)) {
     return !hasExplicitVisionModelMarker(model) && !hasMultimodalGatewayModelMarker(model)
   }
@@ -963,15 +965,17 @@ function hasExplicitVisionModelMarker(model: string): boolean {
 }
 
 /**
- * Multimodal families on the OpenCode gateway that never spell "vision" in
- * their id. Live probes (2026-09-23): mimo-v2.5 / mimo-v2.6-pro /
- * mimo-v2.6-flash and every deepseek id on the catalog (deepseek-flash,
- * deepseek-v4-flash, deepseek-v4-pro, deepseek-v4.1-flash) answer an
- * image_url request with 200, while glm-5.3 answers 400
+ * Multimodal models and families on the OpenCode gateway that never spell
+ * "vision" in their id. Live probes: kimi-k3 and space-bunny-free (upstream
+ * 700f7b9d), plus mimo-v2.5 / mimo-v2.6-pro / mimo-v2.6-flash and every
+ * deepseek id on the catalog (deepseek-flash, deepseek-v4-flash,
+ * deepseek-v4-pro, deepseek-v4.1-flash) from the 2026-09-23 local probes all
+ * answer an image_url request with 200, while glm-5.3 answers 400
  * `does not support image inputs` — so this stays a per-family allowlist
  * rather than a blanket opt-in for the gateway.
  */
 function hasMultimodalGatewayModelMarker(model: string): boolean {
+  if (['kimi-k3', 'space-bunny-free'].includes(model.toLowerCase())) return true
   return /(^|[/:._-])mimo([/:._-]|$)/i.test(model)
     || /(^|[/:._-])deepseek([/:._-]|$)/i.test(model)
 }

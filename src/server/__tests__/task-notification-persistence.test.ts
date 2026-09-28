@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test'
 import * as fs from 'node:fs/promises'
+import { constants } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {
@@ -91,6 +92,7 @@ describe('background task notification persistence', () => {
     })
     spyOn(fs, 'open').mockImplementation(async (...args) => {
       const handle = await realOpen(...args)
+      if (typeof args[1] !== 'number' || (args[1] & constants.O_APPEND) === 0) return handle
       const realClose = handle.close.bind(handle)
       spyOn(handle, 'close').mockImplementation(async () => {
         await realClose()
@@ -151,10 +153,7 @@ describe('background task notification persistence', () => {
     })
     spyOn(fs, 'open').mockImplementation(async (...args) => {
       const handle = await realOpen(...args)
-      // Session discovery streams transcripts with a read-mode open before the
-      // append runs; only the append open (numeric O_WRONLY|O_APPEND flags) is
-      // the write this test needs to hold open.
-      if (typeof args[1] !== 'number') return handle
+      if (typeof args[1] !== 'number' || (args[1] & constants.O_APPEND) === 0) return handle
       appendAttempts++
       if (appendAttempts > 1) return handle
       const realClose = handle.close.bind(handle)

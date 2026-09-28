@@ -26,6 +26,8 @@ export type TeamMember = {
   color?: AgentColor
   sessionId?: string
   model?: string
+  providerId?: string | null
+  providerName?: string
 }
 
 export type TeamDetail = {

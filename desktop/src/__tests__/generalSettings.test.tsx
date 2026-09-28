@@ -115,6 +115,10 @@ vi.mock('../components/settings/GrokOfficialLogin', () => ({
   GrokOfficialLogin: () => <div data-testid="grok-official-login" />,
 }))
 
+vi.mock('../components/settings/OfficialProviderModelSettings', () => ({
+  OfficialProviderModelSettings: () => <div data-testid="official-provider-model-settings" />,
+}))
+
 vi.mock('../pages/AdapterSettings', () => ({
   AdapterSettings: () => <div>Adapter Settings Mock</div>,
 }))
