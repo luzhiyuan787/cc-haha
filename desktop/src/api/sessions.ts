@@ -1,4 +1,4 @@
-import { api, type ApiRequestOptions } from './client'
+import { api, apiGetBlob, type ApiRequestOptions } from './client'
 import type { SlashCommandOption } from '../types/slashCommand'
 import type { AgentTaskNotification } from '../types/chat'
 import type { LocalIndexStatus, SessionListItem, MessageEntry } from '../types/session'
@@ -325,10 +325,18 @@ export type WorkspaceStatusResult = {
   error?: string
 }
 
+/** Formats the workspace renders itself from bytes fetched with {@link sessionsApi.getWorkspaceRaw}. */
+export type WorkspaceDocumentPreviewType = 'pdf' | 'docx' | 'xlsx'
+
 export type WorkspaceReadFileResult = {
   state: 'ok' | 'binary' | 'too_large' | 'missing' | 'error'
   path: string
-  previewType?: 'text' | 'image'
+  /**
+   * `text` and `image` carry their payload in this response. A document type is
+   * metadata only — its bytes are fetched separately, so a watcher reload never
+   * re-downloads a large file as JSON.
+   */
+  previewType?: 'text' | 'image' | WorkspaceDocumentPreviewType
   content?: string
   dataUrl?: string
   mimeType?: string
@@ -336,6 +344,8 @@ export type WorkspaceReadFileResult = {
   size: number
   truncated?: boolean
   readBytes?: number
+  /** Document types only: changes whenever the bytes may have changed. */
+  version?: string
   error?: string
 }
 
@@ -400,9 +410,15 @@ function getSessionGitInfo(sessionId: string) {
   return trackedRequest
 }
 
+/**
+ * A whole document is fetched in one request and can be large and slow to
+ * cross a remote link; the default request timeout is sized for JSON.
+ */
+const WORKSPACE_RAW_TIMEOUT_MS = 10 * 60_000
+
 function buildWorkspacePath(
   sessionId: string,
-  resource: 'status' | 'tree' | 'file' | 'diff',
+  resource: 'status' | 'tree' | 'file' | 'diff' | 'raw',
   workspacePath?: string,
 ) {
   const query = new URLSearchParams()
@@ -604,6 +620,18 @@ export const sessionsApi = {
 
   getWorkspaceFile(sessionId: string, workspacePath: string, signal?: AbortSignal) {
     return api.get<WorkspaceReadFileResult>(buildWorkspacePath(sessionId, 'file', workspacePath), { signal })
+  },
+
+  /**
+   * The bytes of a document the workspace previews, as a Blob. Fetched with the
+   * bearer credential, the one form that works in the desktop shell, a LAN
+   * browser and remote access alike — an `<img>`/`<iframe>` cannot send it.
+   */
+  getWorkspaceRaw(sessionId: string, workspacePath: string, signal?: AbortSignal) {
+    return apiGetBlob(buildWorkspacePath(sessionId, 'raw', workspacePath), {
+      signal,
+      timeout: WORKSPACE_RAW_TIMEOUT_MS,
+    })
   },
 
   getWorkspaceDiff(sessionId: string, workspacePath: string) {

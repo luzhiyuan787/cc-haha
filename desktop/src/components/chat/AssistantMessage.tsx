@@ -8,13 +8,15 @@ import type { OpenWithItem } from '../../lib/openWithItems'
 import { MessageActionBar, type MessageBranchAction } from './MessageActionBar'
 import { TurnCompletionStamp } from './TurnCompletionStamp'
 import type { TurnCompletion } from '../../lib/turnCompletion'
+import { ImageGalleryModal } from './ImageGalleryModal'
 import { InlineImageGallery } from './InlineImageGallery'
 import { InlineVideoGallery } from './InlineVideoGallery'
 import { AssistantOutputTargetCard } from './AssistantOutputTargetCard'
 import { openPreviewLink } from '../../lib/openPreviewLink'
 import { extractAssistantOutputTargets } from '../../lib/assistantOutputTargets'
 import { resolveAssistantFileHref } from '@/lib/assistantFileContext'
-import { createAssistantMarkdownImageResolver } from '../../lib/markdownImages'
+import { createAssistantMarkdownImageResolver, localPathFromMarkdownImageUrl } from '../../lib/markdownImages'
+import type { MarkdownImageClick } from '../markdown/MarkdownRenderer'
 import { getServerBaseUrl } from '../../lib/desktopRuntime'
 import { isManagedGeneratedImagePath } from '../../lib/attachmentImages'
 import { useWorkspaceContentStore } from '../../stores/workspaceContentStore'
@@ -49,6 +51,7 @@ export const AssistantMessage = memo(function AssistantMessage({
   const workDir = useWorkspaceContentStore((s) => (sessionId ? s.statusBySession[sessionId]?.workDir : undefined))
 
   const [openWith, setOpenWith] = useState<{ items: OpenWithItem[]; anchor: DOMRect } | null>(null)
+  const [viewer, setViewer] = useState<{ images: Array<{ src: string; name: string; path?: string }>; index: number } | null>(null)
 
   const handleLinkClick = useCallback(
     (href: string, event: ReactMouseEvent<HTMLDivElement>): boolean => {
@@ -107,12 +110,31 @@ export const AssistantMessage = memo(function AssistantMessage({
       const resolveLocalImage = createAssistantMarkdownImageResolver({
         baseUrl: getServerBaseUrl(),
         sessionId,
+        workDir,
       })
       return (src: string) => isManagedGeneratedImagePath(src)
         ? null
         : resolveLocalImage(src)
     },
-    [isStreaming, sessionId],
+    [isStreaming, sessionId, workDir],
+  )
+
+  // A click on a picture in the prose opens it, and its neighbours in the reply, in
+  // the viewer. Each one that is a file on disk carries its path, which is read back
+  // from the URL it was served under rather than from anything on the element.
+  const handleImageClick = useCallback(
+    ({ images, index }: MarkdownImageClick) => {
+      const baseUrl = getServerBaseUrl()
+      setViewer({
+        index,
+        images: images.map((image) => {
+          const path = localPathFromMarkdownImageUrl(image.src, { baseUrl, workDir }) ?? undefined
+          const name = image.alt.trim() || path?.split(/[\\/]/).filter(Boolean).pop() || t('assistantOutputs.kind.image')
+          return { src: image.src, name, ...(path ? { path } : {}) }
+        }),
+      })
+    },
+    [t, workDir],
   )
 
   if (!content.trim()) return null
@@ -142,12 +164,14 @@ export const AssistantMessage = memo(function AssistantMessage({
           className="w-full text-[var(--color-text-primary)]"
         >
           <MarkdownRenderer
+            key={`${sessionId ?? ''}|${workDir ?? ''}`}
             className="chat-reading-markdown"
             content={content}
             variant={documentLayout ? 'document' : 'default'}
             streaming={isStreaming}
             onLinkClick={sessionId ? handleLinkClick : undefined}
             resolveImageSrc={resolveAssistantImageSrc}
+            onImageClick={resolveAssistantImageSrc ? handleImageClick : undefined}
           />
           {!isStreaming && (
             <InlineImageGallery
@@ -189,6 +213,16 @@ export const AssistantMessage = memo(function AssistantMessage({
             items={openWith.items}
             anchor={openWith.anchor}
             onClose={() => setOpenWith(null)}
+          />
+        )}
+
+        {viewer && (
+          <ImageGalleryModal
+            open
+            images={viewer.images}
+            activeIndex={viewer.index}
+            onClose={() => setViewer(null)}
+            onSelect={(index) => setViewer((current) => (current ? { ...current, index } : current))}
           />
         )}
 

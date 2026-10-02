@@ -1,4 +1,7 @@
 import { useMemo, useState } from 'react'
+import { ErrorState } from '@/components/ui/ErrorState'
+import { useTranslation } from '@/i18n'
+import { AuthedImage } from './AuthedImage'
 import { ImageGalleryModal } from './ImageGalleryModal'
 import { isManagedGeneratedImagePath, localImageFileUrl } from '../../lib/attachmentImages'
 import {
@@ -7,6 +10,7 @@ import {
 } from '../../lib/assistantOutputTargets'
 import { isAbsoluteLocalPath, previewFsUrl } from '../../lib/handlePreviewLink'
 import { getServerBaseUrl } from '../../lib/desktopRuntime'
+import { resolveAbsoluteOpenPath } from '../../lib/systemFileOpen'
 
 const IMAGE_EXTENSIONS = /\.(png|jpe?g|gif|webp|svg|bmp|avif|ico)$/i
 
@@ -51,6 +55,8 @@ function normalizeImageReference(value: string): string {
 type GalleryImage = {
   src: string
   name: string
+  /** Where the file is, for "open in system app". Relative until the workdir is known. */
+  path: string
 }
 
 type Props = {
@@ -68,7 +74,14 @@ type Props = {
 }
 
 export function InlineImageGallery({ text, sessionId, workDir, changedFiles, suppressManagedGeneratedImages = false }: Props) {
+  const t = useTranslation()
   const [activeIndex, setActiveIndex] = useState<number | null>(null)
+  const [failureState, setFailureState] = useState(() => ({ sessionId, workDir, sources: new Set<string>() }))
+  // The same absolute URL can become readable in a different workspace/session.
+  if (failureState.sessionId !== sessionId || failureState.workDir !== workDir) {
+    setFailureState({ sessionId, workDir, sources: new Set() })
+  }
+  const failedSources = failureState.sources
 
   const markdownImageSources = useMemo(
     () => new Set(extractMarkdownImageSources(text).map(normalizeImageReference)),
@@ -97,7 +110,7 @@ export function InlineImageGallery({ text, sessionId, workDir, changedFiles, sup
 
   const images = useMemo<GalleryImage[]>(() => {
     // 1. Absolute paths (legacy behavior) — served via /api/filesystem/file.
-    const absolute: GalleryImage[] = imagePaths.map((p) => ({ src: localImageFileUrl(p), name: fileName(p) }))
+    const absolute: GalleryImage[] = imagePaths.map((p) => ({ src: localImageFileUrl(p), name: fileName(p), path: p }))
 
     if (!sessionId) {
       return absolute
@@ -136,7 +149,7 @@ export function InlineImageGallery({ text, sessionId, workDir, changedFiles, sup
         continue
       }
       seenSrc.add(src)
-      relative.push({ src, name })
+      relative.push({ src, name, path: resolveAbsoluteOpenPath(relPath, workDir ?? undefined) })
     }
 
     return [...absolute, ...relative]
@@ -152,23 +165,40 @@ export function InlineImageGallery({ text, sessionId, workDir, changedFiles, sup
           {images.length === 1 ? '1 image' : `${images.length} images`}
         </div>
         <div className={`grid gap-2 ${images.length === 1 ? 'grid-cols-1' : 'grid-cols-2'}`}>
-          {images.map((img, i) => (
-            <button
+          {images.map((img, i) => failedSources.has(img.src) ? (
+            <ErrorState
               key={img.src}
+              size="sm"
+              title={t('chat.imageLoadFailed')}
+              retryLabel={t('common.retry')}
+              onRetry={() => setFailureState((previous) => {
+                const sources = new Set(previous.sources)
+                sources.delete(img.src)
+                return { ...previous, sources }
+              })}
+              detail={(
+                <>
+                  <span className="block break-all">{img.name}</span>
+                  {t('chat.imageLoadFailedHint')}
+                </>
+              )}
+            />
+          ) : (
+            <button
+              key={`${sessionId ?? ''}|${workDir ?? ''}|${img.src}`}
               type="button"
               onClick={() => setActiveIndex(i)}
               className="group/image relative overflow-hidden rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface-container-low)] text-left shadow-[var(--shadow-card)] transition-[border-color,box-shadow] duration-150 hover:shadow-[var(--shadow-composer)] hover:border-[var(--color-primary-fixed-dim)]"
             >
-              <img
+              <AuthedImage
                 src={img.src}
                 alt={img.name}
                 loading="lazy"
                 className="w-full object-cover"
                 style={{ maxHeight: images.length === 1 ? 400 : 240 }}
-                onError={(e) => {
-                  // Hide broken images
-                  (e.target as HTMLImageElement).closest('button')!.style.display = 'none'
-                }}
+                // img errors expose no HTTP status: a denied, missing or invalid
+                // image needs visible feedback without claiming a specific cause.
+                onFailure={() => setFailureState((previous) => ({ ...previous, sources: new Set(previous.sources).add(img.src) }))}
               />
               <div className="absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition-all group-hover/image:bg-black/20 group-hover/image:opacity-100">
                 <span className="material-symbols-outlined rounded-full bg-white/90 p-2 text-[20px] text-[var(--color-text-primary)] shadow-lg">

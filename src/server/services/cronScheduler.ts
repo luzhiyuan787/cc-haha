@@ -12,11 +12,13 @@ import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import * as path from 'path'
 import * as os from 'os'
 import * as crypto from 'crypto'
+import { isBlankFileContent } from './blankFileContent.js'
 import { CronService, type CronTask } from './cronService.js'
 import { SessionService } from './sessionService.js'
 import { sendTaskNotification } from './notificationService.js'
 import { ProviderService } from './providerService.js'
 import { SettingsService } from './settingsService.js'
+import { stripBOM } from '../../utils/jsonRead.js'
 import { isProviderManagedEnvVar } from '../../utils/managedEnvConstants.js'
 import {
   buildClaudeCliArgs,
@@ -254,8 +256,14 @@ function captureRunsFileMutationTarget(): RunsFileMutationTarget {
   }
 }
 
+/**
+ * Same tolerance as the task file (CronService.readTasksFile): a BOM is stripped and
+ * a blank file — empty, whitespace or NUL padding — means no runs. Content that has
+ * data but will not parse still throws, so a later write cannot replace it unseen.
+ */
 function parseRunsFile(raw: string): RunsFile {
-  const parsed = JSON.parse(raw) as RunsFile
+  if (isBlankFileContent(raw)) return { runs: [] }
+  const parsed = JSON.parse(stripBOM(raw)) as RunsFile
   return Array.isArray(parsed.runs) ? parsed : { runs: [] }
 }
 

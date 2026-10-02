@@ -122,6 +122,15 @@ vi.mock('./ContentRouter', () => ({
   ContentRouter: () => <section>content loaded</section>,
 }))
 
+// The real one subscribes to the chat store, which this file replaces with a
+// `{ getState }` stub. Its behaviour has its own test; here only the wiring —
+// which session it is told is on screen, and where it sits — is checked.
+vi.mock('./MobileAttentionDot', () => ({
+  MobileAttentionDot: ({ activeSessionId }: { activeSessionId: string | null }) => (
+    <span data-testid="mobile-attention-dot-stub" data-active-session={activeSessionId ?? ''} />
+  ),
+}))
+
 vi.mock('./TabBar', () => ({
   TabBar: () => <nav>tabs loaded</nav>,
 }))
@@ -666,6 +675,22 @@ describe('AppShell boot flow', () => {
     // platform minimum for primary touch targets is 44, not the 40 it shipped
     // at (IconButton's own size doc had the two tiers reversed).
     expect(screen.getByTestId('mobile-sidebar-toggle')).toHaveClass('h-11', 'w-11')
+
+    // The hamburger's corner is where the drawer's waiting marks get announced
+    // from, and the dot is told which session is on screen so it can leave that
+    // one out. It shares a wrapper with the button so it can sit on its corner.
+    const dot = screen.getByTestId('mobile-attention-dot-stub')
+    expect(dot).toHaveAttribute('data-active-session', 'session-mobile')
+    expect(screen.getByTestId('mobile-sidebar-toggle').parentElement).toContainElement(dot)
+  })
+
+  it('does not put the waiting dot on a desktop window, which has the tab strip instead', async () => {
+    mocks.isMobile = false
+
+    render(<AppShell />)
+
+    await screen.findByText('content loaded')
+    expect(screen.queryByTestId('mobile-attention-dot-stub')).not.toBeInTheDocument()
   })
 
   it('keeps browser H5 settings active alongside existing chat tabs', async () => {

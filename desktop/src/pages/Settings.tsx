@@ -22,6 +22,7 @@ import { useUIStore } from '../stores/uiStore'
 import { AgentManager } from '../components/settings/AgentManager'
 import { H5AccessSettings } from './settings/H5AccessSettings'
 import { GeneralSettings } from './settings/GeneralSettings'
+import { VoiceInputSettings } from './settings/VoiceInputSettings'
 import { AboutSettings } from './settings/AboutSettings'
 import { ProviderSettings } from './settings/ProviderSettings'
 
@@ -68,6 +69,7 @@ export function DesktopSettings() {
           <div className="flex-1 flex flex-col gap-0.5">
             <TabButton icon="dns" label={t('settings.tab.providers')} active={activeTab === 'providers'} onClick={() => setActiveTab('providers')} />
             <TabButton icon="tune" label={t('settings.tab.general')} active={activeTab === 'general'} onClick={() => setActiveTab('general')} />
+            <TabButton icon="mic" label={t('settings.tab.voice')} active={activeTab === 'voice'} onClick={() => setActiveTab('voice')} />
             <TabButton icon="qr_code_2" label={t('settings.tab.h5Access')} active={activeTab === 'h5Access'} onClick={() => setActiveTab('h5Access')} />
             <TabButton icon="chat" label={t('settings.tab.adapters')} active={activeTab === 'adapters'} onClick={() => setActiveTab('adapters')} />
             <TabButton icon="terminal" label={t('settings.tab.terminal')} active={activeTab === 'terminal'} onClick={() => setActiveTab('terminal')} />
@@ -92,6 +94,7 @@ export function DesktopSettings() {
           {activeTab === 'providers' && <ProviderSettings />}
           {activeTab === 'activity' && <ActivitySettings />}
           {activeTab === 'general' && <GeneralSettings />}
+          {activeTab === 'voice' && <VoiceInputSettings />}
           {activeTab === 'h5Access' && <H5AccessSettings />}
           {activeTab === 'adapters' && <AdapterSettings />}
           {activeTab === 'terminal' && <TerminalSettings showPreferences />}

@@ -2223,7 +2223,7 @@ describe('SessionService', () => {
     ])
   })
 
-  it('should hide task-notification turns and their automatic responses from history', async () => {
+  it('should hide the task-notification turn itself but keep everything the assistant does after it', async () => {
     const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
     const firstUserId = crypto.randomUUID()
     const firstAssistantId = crypto.randomUUID()
@@ -2253,7 +2253,7 @@ describe('SessionService', () => {
         parentUuid: firstAssistantId,
       },
       {
-        ...makeAssistantEntry('旧后台任务通知，无需处理', taskNotificationId),
+        ...makeAssistantEntry('后台命令跑完了，我来重启服务', taskNotificationId),
         uuid: taskAssistantId,
       },
       {
@@ -2279,7 +2279,7 @@ describe('SessionService', () => {
         timestamp: '2026-01-01T00:03:00.000Z',
       },
       {
-        ...makeAssistantEntry('后台任务触发的工具调用完成', taskToolResultId),
+        ...makeAssistantEntry('服务已重启', taskToolResultId),
         uuid: taskAfterToolId,
       },
       {
@@ -2298,13 +2298,17 @@ describe('SessionService', () => {
     expect(messages.map((message) => message.id)).toEqual([
       firstUserId,
       firstAssistantId,
+      taskAssistantId,
+      taskToolUseMessageId,
+      taskToolResultId,
+      taskAfterToolId,
       realFollowUpId,
       realAssistantId,
     ])
     expect(JSON.stringify(messages)).not.toContain('<task-notification>')
-    expect(JSON.stringify(messages)).not.toContain('旧后台任务通知')
-    expect(JSON.stringify(messages)).not.toContain('server restarted')
-    expect(JSON.stringify(messages)).not.toContain('后台任务触发的工具调用完成')
+    expect(JSON.stringify(messages)).toContain('后台命令跑完了，我来重启服务')
+    expect(JSON.stringify(messages)).toContain('server restarted')
+    expect(JSON.stringify(messages)).toContain('服务已重启')
     expect(taskNotifications).toEqual([
       {
         taskId: 'bg-1',
@@ -2314,6 +2318,77 @@ describe('SessionService', () => {
         timestamp: '2026-01-01T00:01:00.000Z',
       },
     ])
+  })
+
+  it('keeps the model reply to a background-task notification and hides only the notification itself (#1389)', async () => {
+    // Shapes copied from a real desktop session: a background shell finished, the CLI queued a
+    // <task-notification> user turn, and DeepSeek answered it with an (empty) thinking block plus text.
+    const sessionId = 'bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+    const userId = crypto.randomUUID()
+    const dispatchedId = crypto.randomUUID()
+    const notificationId = crypto.randomUUID()
+    const thinkingId = crypto.randomUUID()
+    const replyId = crypto.randomUUID()
+    const secondNotificationId = crypto.randomUUID()
+    const secondReplyId = crypto.randomUUID()
+    const notification = (taskId: string) => [
+      '<task-notification>',
+      `<task-id>${taskId}</task-id>`,
+      `<tool-use-id>call_${taskId}</tool-use-id>`,
+      `<output-file>/tmp/${taskId}.output</output-file>`,
+      '<status>completed</status>',
+      `<summary>Background command "sleep then write ${taskId}" completed (exit code 0)</summary>`,
+      '</task-notification>',
+    ].join('\n')
+
+    await writeSessionFile('-tmp-notification-reply', sessionId, [
+      makeSnapshotEntry(),
+      { ...makeUserEntry('start two background commands', userId), parentUuid: null },
+      { ...makeAssistantEntry('dispatched', userId), uuid: dispatchedId },
+      {
+        type: 'cc-haha-task-notification',
+        isMeta: true,
+        taskNotification: {
+          taskId: 'alpha',
+          toolUseId: 'call_alpha',
+          status: 'completed',
+          summary: 'Background command "sleep then write alpha" completed (exit code 0)',
+          timestamp: '2026-01-01T00:03:00.000Z',
+        },
+        timestamp: '2026-01-01T00:03:00.000Z',
+      },
+      { ...makeUserEntry(notification('alpha'), notificationId), parentUuid: dispatchedId },
+      {
+        ...makeAssistantEntry('', notificationId),
+        uuid: thinkingId,
+        message: {
+          role: 'assistant',
+          model: 'deepseek-flash',
+          id: 'msg_thinking_alpha',
+          content: [{ type: 'thinking', thinking: '', signature: 'sig' }],
+        },
+      },
+      { ...makeAssistantEntry('alpha finished: ALPHA_DONE', thinkingId), uuid: replyId },
+      { ...makeUserEntry(notification('bravo'), secondNotificationId), parentUuid: replyId },
+      { ...makeAssistantEntry('bravo finished: BRAVO_DONE', secondNotificationId), uuid: secondReplyId },
+    ])
+
+    const messages = await service.getSessionMessages(sessionId)
+    const rendered = JSON.stringify(messages)
+
+    expect(rendered).not.toContain('<task-notification>')
+    expect(rendered).toContain('alpha finished: ALPHA_DONE')
+    expect(rendered).toContain('bravo finished: BRAVO_DONE')
+    expect(messages.map((message) => message.id)).toEqual(expect.arrayContaining([
+      userId,
+      dispatchedId,
+      replyId,
+      secondReplyId,
+    ]))
+    // The cards for the finished tasks still come from the notification data, not from the hidden message.
+    expect((await service.getSessionTaskNotifications(sessionId)).map((item) => item.taskId)).toEqual(
+      expect.arrayContaining(['alpha', 'bravo']),
+    )
   })
 
   it('uses bounded locators for snapshots and task notifications with safe fallback', async () => {
@@ -2416,7 +2491,7 @@ describe('SessionService', () => {
       serveWrongEmptyFingerprint = false
 
       const callsBeforeFullHistory = locatorCalls
-      expect(await indexedService.getSessionMessages(sessionId)).toHaveLength(0)
+      expect(await indexedService.getSessionMessages(sessionId)).toHaveLength(1)
       expect(locatorCalls).toBe(callsBeforeFullHistory)
 
       mode = 'shadow'
@@ -4304,7 +4379,7 @@ describe('Sessions API', () => {
         '<task-notification>\n<task-id>bg-1</task-id>\n<tool-use-id>toolu_bg</tool-use-id>\n<status>failed</status>\n<summary>Background command failed &amp; stopped</summary>\n<result>Stack trace &amp; failed assertion</result>\n<output-file>C:\\Temp\\bg.output</output-file>\n</task-notification>',
         crypto.randomUUID(),
       ),
-      makeAssistantEntry('internal task response'),
+      makeAssistantEntry('the background command failed, investigating'),
     ])
 
     const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/messages`)
@@ -4314,10 +4389,14 @@ describe('Sessions API', () => {
       messages: unknown[]
       taskNotifications: unknown[]
     }
-    expect(body.messages).toHaveLength(2)
+    expect(body.messages).toHaveLength(3)
     expect(body.messages[1]).toMatchObject({
       type: 'assistant',
       usage: { input_tokens: 1234, output_tokens: 56 },
+    })
+    expect(body.messages[2]).toMatchObject({
+      type: 'assistant',
+      content: [{ type: 'text', text: 'the background command failed, investigating' }],
     })
     expect(JSON.stringify(body.messages)).not.toContain('<task-notification>')
     expect(body.taskNotifications).toEqual([
@@ -4403,7 +4482,7 @@ describe('Sessions API', () => {
       },
       {
         type: 'assistant',
-        message: { role: 'assistant', content: 'Internal notification response' },
+        message: { role: 'assistant', content: 'Child shell stopped, continuing the review' },
         uuid: crypto.randomUUID(),
         timestamp: '2026-01-01T00:00:07.000Z',
       },
@@ -4430,9 +4509,9 @@ describe('Sessions API', () => {
       prompt: 'Read session routes',
       source: 'subagent-jsonl',
     })
-    expect(body.messages).toHaveLength(2)
+    expect(body.messages).toHaveLength(3)
     expect(JSON.stringify(body.messages)).not.toContain('<task-notification>')
-    expect(JSON.stringify(body.messages)).not.toContain('Internal notification response')
+    expect(JSON.stringify(body.messages)).toContain('Child shell stopped, continuing the review')
     expect(body.taskNotifications).toEqual([{
       taskId: 'child-shell-task',
       toolUseId: 'child-shell.call',
