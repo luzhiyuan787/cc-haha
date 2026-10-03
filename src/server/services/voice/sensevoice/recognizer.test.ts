@@ -265,8 +265,13 @@ describe('default worker launch', () => {
 
   it('detects compiled executables by their virtual module URLs', () => {
     expect(isBundledWorkerHost('file:///$bunfs/root/claude-sidecar', false)).toBe(true)
+    expect(isBundledWorkerHost('file:///%24bunfs/root/claude-sidecar', false)).toBe(true)
     expect(isBundledWorkerHost('file:///B:/~BUN/root/claude-sidecar.exe', false)).toBe(true)
+    // Bun 1.3.x on Windows percent-encodes `~` in import.meta.url.
+    expect(isBundledWorkerHost('file:///B:/%7EBUN/root/claude-sidecar', false)).toBe(true)
+    expect(isBundledWorkerHost('file:///B:/%7eBUN/root/claude-sidecar', false)).toBe(true)
     expect(isBundledWorkerHost('file:///repo/src/server/services/voice/sensevoice/recognizer.ts', false)).toBe(false)
+    expect(isBundledWorkerHost('file:///D:/project/~BUN-tools/recognizer.ts', false)).toBe(false)
     expect(isBundledWorkerHost('file:///repo/src/x.ts', true)).toBe(true)
   })
 })

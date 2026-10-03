@@ -8,7 +8,7 @@ import { randomBytes } from 'node:crypto'
 import { realpath } from 'node:fs/promises'
 import { request as httpRequest } from 'node:http'
 import { fileURLToPath } from 'node:url'
-import { isInBundledMode } from '../../../../utils/bundledMode.js'
+import { isBunVirtualModuleUrl, isInBundledMode } from '../../../../utils/bundledMode.js'
 import { VoiceServiceError } from '../errors.js'
 import type { VoiceTranscript } from '../types.js'
 import {
@@ -58,7 +58,7 @@ const RESPONSE_LIMIT_BYTES = 128 * 1024
  * file system (`/$bunfs/...` on POSIX, `B:/~BUN/...` on Windows).
  */
 export function isBundledWorkerHost(moduleUrl: string = import.meta.url, bundledMode: boolean = isInBundledMode()): boolean {
-  return bundledMode || moduleUrl.startsWith('file:///$bunfs/') || /^file:\/\/\/[A-Za-z]:\/~BUN\//.test(moduleUrl)
+  return bundledMode || isBunVirtualModuleUrl(moduleUrl)
 }
 
 /**
