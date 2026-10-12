@@ -1,6 +1,6 @@
 // @vitest-environment node
-import { strToU8, unzipSync, zipSync } from 'fflate'
-import { describe, expect, it } from 'vitest'
+import { Inflate, strToU8, unzipSync, zipSync } from 'fflate'
+import { describe, expect, it, vi } from 'vitest'
 import {
   DEFAULT_OFFICE_ZIP_LIMITS,
   OfficeZipError,
@@ -164,23 +164,22 @@ describe('inspectOfficeZip', () => {
     })
 
     it('is stopped at the limit, not after inflating everything it holds', () => {
-      // 256 MiB of zeros deflates to a ~256 KiB archive. The guard inflates in
-      // 16 KiB *compressed* steps, and deflate reaches a thousandfold, so it
-      // trips inside the very first step no matter how small the limit is:
-      // measured at 193-287ms on an idle 8-core box regardless of the fixture.
-      // Inflating the whole thing is linear in the archive — 443ms at 32 MiB,
-      // 1817ms at 128 MiB, 3591ms at 256 MiB. A 32 MiB fixture therefore put
-      // the two cases only 1.5x apart with the deadline sitting on top of the
-      // fast case, which turned this into a coin flip under six vitest workers.
-      // 256 MiB keeps the intent and gives the deadline room to mean something:
-      // ~6x headroom below, ~2.4x above.
-      const lying = declaring(zipOf({ 'a.bin': zeros(256 * MIB) }), 100)
+      const lying = declaring(zipOf({ 'a.bin': zeros(32 * MIB) }), 100)
       const limits: OfficeZipLimits = { ...DEFAULT_OFFICE_ZIP_LIMITS, maxEntryBytes: 256 * KIB }
 
-      const started = performance.now()
-      expect(rejection(lying, limits).reason).toBe('entry-too-large')
+      // Count what is fed to the inflater rather than timing it: wall-clock bounds
+      // fail under coverage instrumentation on a shared runner.
+      const push = vi.spyOn(Inflate.prototype, 'push')
+      try {
+        expect(rejection(lying, limits).reason).toBe('entry-too-large')
 
-      expect(performance.now() - started).toBeLessThan(1500)
+        const fed = push.mock.calls.reduce((sum, [chunk]) => sum + chunk.length, 0)
+        expect(push).toHaveBeenCalled()
+        expect(push.mock.calls.some(([, final]) => final === true)).toBe(false)
+        expect(fed).toBeLessThan(lying.length / 2)
+      } finally {
+        push.mockRestore()
+      }
     })
 
     it('does not trouble an honest archive, whatever it holds or how it is stored', () => {

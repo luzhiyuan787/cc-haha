@@ -35,7 +35,7 @@ describe('evaluateChangePolicy', () => {
       'docs/index.md',
       'site/src/App.tsx',
       'README.md',
-      'README.zh-CN.md',
+      'README.en.md',
     ])
 
     expect(result.blocked).toBe(false)
@@ -407,6 +407,28 @@ describe('evaluateChangePolicy dependent-file widening', () => {
       'adapters/telegram/formatting.ts',
       'adapters/telegram/__tests__/formatting.test.ts',
     ]).checks.agentFlow).toBe(false)
+  })
+
+  test('selects the mock-LLM agent lane for any runtime source change', () => {
+    // The lane runs the real CLI agent loop, so a change anywhere in the runtime can
+    // break it — not only the server/WebSocket paths the mock-CLI lane watches.
+    const toolChange = evaluateChangePolicy(['src/tools/BashTool/BashTool.tsx', 'src/tools/BashTool/BashTool.test.ts'])
+    expect(toolChange.checks.agentE2e).toBe(true)
+    expect(toolChange.checks.agentFlow).toBe(false)
+
+    for (const harness of [
+      'scripts/quality-gate/mock-llm/scriptedModel.ts',
+      'scripts/quality-gate/agent-flow/live.ts',
+      'scripts/quality-gate/sandbox.ts',
+      'bun.lock',
+    ]) {
+      expect(evaluateChangePolicy([harness]).checks.agentE2e, harness).toBe(true)
+    }
+
+    // Desktop-only, docs-only, and agent instruction edits stay out of it.
+    expect(evaluateChangePolicy(['desktop/src/pages/Settings.tsx', 'desktop/src/pages/Settings.test.tsx']).checks.agentE2e).toBe(false)
+    expect(evaluateChangePolicy(['docs/guide/install.md']).checks.agentE2e).toBe(false)
+    expect(evaluateChangePolicy(['src/AGENTS.md']).checks.agentE2e).toBe(false)
   })
 
   test('ignores dependents that are already part of the diff', () => {

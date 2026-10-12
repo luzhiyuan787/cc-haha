@@ -729,7 +729,10 @@ describe('ModelSelector', () => {
       .getAllByRole('button', { name: /deepseek-v4-pro/i })
       .find((button) => button.textContent?.includes('Sonnet Model'))
     expect(configuredOption).toBeDefined()
-    expect(configuredOption?.className).toContain('border-[var(--color-model-option-selected-border)]')
+    // 「素」 menu selection: the hover fill at rest plus the terracotta check.
+    expect(configuredOption).toHaveAttribute('aria-current', 'true')
+    expect(configuredOption?.className).toContain('bg-[var(--color-surface-hover)]')
+    expect(configuredOption?.querySelector('svg.lucide-check')).toHaveClass('text-[var(--color-brand)]')
   })
 
   it('closes the focus ring on both halves of the segmented control', () => {
@@ -757,8 +760,8 @@ describe('ModelSelector', () => {
     // The ring traces `border-radius`. Each half is rounded on one side only,
     // so without this the focused half drew a box that was round down one edge
     // and square down the other.
-    expect(modelHalf).toHaveClass('rounded-l-[var(--radius-md)]', 'focus-visible:rounded-[var(--radius-md)]')
-    expect(effortHalf).toHaveClass('rounded-r-[var(--radius-md)]', 'focus-visible:rounded-[var(--radius-md)]')
+    expect(modelHalf).toHaveClass('rounded-l-[var(--radius-sm)]', 'focus-visible:rounded-[var(--radius-sm)]')
+    expect(effortHalf).toHaveClass('rounded-r-[var(--radius-sm)]', 'focus-visible:rounded-[var(--radius-sm)]')
   })
 
   // On the phone composer this control sits between two 44px buttons and opens
@@ -1069,6 +1072,7 @@ describe('ModelSelector', () => {
     })
     useSettingsStore.setState({
       locale: 'en',
+      effortLevel: 'max',
       availableModels: openAIModels,
       currentModel: openAIModels[0],
       activeProviderName: 'ChatGPT Official',
@@ -1180,7 +1184,52 @@ describe('ModelSelector', () => {
     })
   })
 
-  it('keeps xhigh when switching from GPT-5.6-Sol to a compatible Kimi provider', async () => {
+  it('toggles Fast only for ChatGPT Official OAuth and keeps it across effort and model changes', async () => {
+    const setSessionRuntime = vi.fn()
+    useHahaOpenAIOAuthStore.setState({
+      status: { loggedIn: true, expiresAt: null, email: null, accountId: null },
+      fetchStatus: async () => {},
+    })
+    useSettingsStore.setState({ locale: 'zh', effortLevel: 'high' })
+    useProviderStore.setState({ providers: [], activeId: OPENAI_OFFICIAL_PROVIDER_ID, hasLoadedProviders: true })
+    useChatStore.setState({ setSessionRuntime } as Partial<ReturnType<typeof useChatStore.getState>>)
+    useSessionRuntimeStore.getState().setSelection('fast-session', {
+      providerId: OPENAI_OFFICIAL_PROVIDER_ID, modelId: 'gpt-6-sol', effortLevel: 'high',
+    })
+
+    render(<ModelSelector runtimeKey="fast-session" />)
+    await clickByRole('推理强度: 高')
+    const fast = screen.getByRole('switch', { name: 'Fast 模式' })
+    expect(fast).not.toBeChecked()
+    expect(screen.getByText(/1.5/)).toBeInTheDocument()
+    fireEvent.click(fast)
+    expect(fast).toBeChecked()
+    expect(setSessionRuntime).toHaveBeenLastCalledWith('fast-session', {
+      providerId: OPENAI_OFFICIAL_PROVIDER_ID, modelId: 'gpt-6-sol', effortLevel: 'high', openAIFastMode: true,
+    })
+    fireEvent.keyDown(screen.getByRole('slider', { name: '推理强度' }), { key: 'ArrowLeft' })
+    expect(useSessionRuntimeStore.getState().selections['fast-session']).toMatchObject({ effortLevel: 'medium', openAIFastMode: true })
+    await clickByRole(/GPT-6-Sol/i)
+    await clickByRole(/GPT-6-Luna/i)
+    expect(useSessionRuntimeStore.getState().selections['fast-session']).toMatchObject({ modelId: 'gpt-6-luna', openAIFastMode: true })
+    await clickByRole('推理强度: 中 · Fast 模式')
+    fireEvent.click(screen.getByRole('switch', { name: 'Fast 模式' }))
+    expect(useSessionRuntimeStore.getState().selections['fast-session']).toMatchObject({ openAIFastMode: false })
+    expect(setSessionRuntime).toHaveBeenLastCalledWith('fast-session', expect.objectContaining({ openAIFastMode: false }))
+  })
+
+  it('never offers the OAuth Fast switch for Claude Official or API-key providers', async () => {
+    useSettingsStore.setState({ locale: 'en', effortLevel: 'high' })
+    useProviderStore.setState({ providers: [], activeId: null, hasLoadedProviders: true })
+    useSessionRuntimeStore.getState().setSelection('claude-session', {
+      providerId: null, modelId: 'claude-opus-4-8', effortLevel: 'high',
+    })
+    render(<ModelSelector runtimeKey="claude-session" />)
+    await clickByRole('Effort: High')
+    expect(screen.queryByRole('switch', { name: 'Fast mode' })).not.toBeInTheDocument()
+  })
+
+  it('keeps xhigh but drops OAuth Fast when switching from GPT-5.6-Sol to Kimi', async () => {
     const solModel: ModelInfo = {
       id: 'gpt-5.6-sol',
       name: 'GPT-5.6-Sol',
@@ -1224,6 +1273,7 @@ describe('ModelSelector', () => {
       providerId: OPENAI_OFFICIAL_PROVIDER_ID,
       modelId: 'gpt-5.6-sol',
       effortLevel: 'xhigh',
+      openAIFastMode: true,
     })
     useChatStore.setState({
       setSessionRuntime,

@@ -14,14 +14,17 @@ export function isRunningWithBun(): boolean {
  * (`/$bunfs/...` on POSIX, `X:/~BUN/...` on Windows).
  *
  * Windows `import.meta.url` percent-encodes `~` as `%7E` (and `$` as `%24`),
- * so the raw string must be decoded before matching.
+ * so the raw string must be decoded before matching. Only `file:` URLs can be
+ * virtual module URLs, and a malformed percent-escape is simply not one.
  */
 export function isBunVirtualModuleUrl(moduleUrl: string): boolean {
   let modulePath: string
   try {
-    modulePath = decodeURIComponent(new URL(moduleUrl).pathname)
+    const parsed = new URL(moduleUrl)
+    if (parsed.protocol !== 'file:') return false
+    modulePath = decodeURIComponent(parsed.pathname)
   } catch {
-    modulePath = decodeURIComponent(moduleUrl)
+    return false
   }
   return modulePath.includes('/$bunfs/') || modulePath.includes('/~BUN/')
 }

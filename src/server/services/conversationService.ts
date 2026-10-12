@@ -1,4 +1,5 @@
 import { closeSideChatsForParent, getSideChat, isSideChatId, SIDE_CHAT_BOUNDARY } from './sideChatRegistry.js'
+import { migrationMaintenance, waitForMigrationExit } from '../migrationMaintenance.js'
 /**
  * ConversationService — CLI subprocess manager
  *
@@ -53,6 +54,7 @@ import {
   REJECT_MESSAGE_WITH_REASON_PREFIX,
 } from '../../constants/messages.js'
 import { getClaudeConfigHomeDir } from '../../utils/envUtils.js'
+import { resolveRelocatedAttachmentPath } from '../../utils/storageRelocations.js'
 import { findCanonicalGitRoot } from '../../utils/git.js'
 import { sanitizePath } from '../../utils/path.js'
 import { getProcessEnvWithTerminalShellEnvironment } from '../../utils/terminalShellEnvironment.js'
@@ -65,6 +67,10 @@ import {
   type NetworkSettings,
 } from './networkSettings.js'
 import { readTraceCaptureSettings } from './traceCaptureService.js'
+import {
+  killWindowsProcessTree,
+  type WindowsTaskkillSpawn,
+} from '../../utils/windowsProcessTree.js'
 import { logError } from '../../utils/log.js'
 import { normalizeAutoQuestionSettings } from '../../shared/autoQuestionSettings.js'
 import { decideAutoQuestionAnswers, type AutoQuestion } from './autoQuestionDecisionService.js'
@@ -320,6 +326,23 @@ export type TeamWorkerStart = {
   systemPrompt: string
   tools?: string[]
   agentDefinition?: Record<string, unknown>
+  /**
+   * Restart a worker whose process stopped by resuming its own transcript.
+   * A worker never inherits the parent's launch metadata, so resume is opt-in.
+   */
+  resume?: boolean
+}
+
+/**
+ * Hooks for the server-owned Agent Teams runtime. Workers are independent
+ * processes, so the lead's process lifecycle must not decide their fate on its
+ * own: a lead restart keeps them, and Stop lets the runtime pause them first.
+ */
+export type TeamRuntimeListener = {
+  /** Synchronously before Stop kills a lead's workers; true when it paused a running team. */
+  leadInterrupted?: (parentSessionId: string) => boolean | void
+  /** After any CLI session finished starting. */
+  sessionStarted?: (sessionId: string, info: { isTeamWorker: boolean }) => void
 }
 
 export type SessionStartOptions = {
@@ -327,6 +350,7 @@ export type SessionStartOptions = {
   permissionMode?: string
   model?: string
   effort?: string
+  openAIFastMode?: boolean
   thinking?: 'enabled' | 'adaptive' | 'disabled'
   providerId?: string | null
   resumeInterruptedTurn?: boolean
@@ -349,12 +373,28 @@ export class ConversationStartupError extends Error {
   }
 }
 
+/**
+ * How a CLI's process tree is stopped. Production uses the real platform,
+ * environment and Bun.spawn; tests inject them.
+ */
+export type ConversationServiceProcessDeps = {
+  platform?: NodeJS.Platform
+  env?: NodeJS.ProcessEnv
+  spawnTaskkill?: WindowsTaskkillSpawn
+}
+
 export class ConversationService {
   private sessions = new Map<string, SessionProcess>()
   private teamStopOperations = new Map<string, Promise<void>>()
+  private teamRuntimeListeners = new Set<TeamRuntimeListener>()
   private deletedSessions = new Set<string>()
   private providerService = new ProviderService()
   private pendingPermissionModeChanges = new Map<string, Map<string, number>>()
+  private readonly processDeps: ConversationServiceProcessDeps
+
+  constructor(processDeps: ConversationServiceProcessDeps = {}) {
+    this.processDeps = processDeps
+  }
 
   private clearAutoAnswerWait(request: TrackedPermissionRequest | undefined): void {
     if (request?.autoAnswerTimer) clearTimeout(request.autoAnswerTimer)
@@ -588,6 +628,7 @@ export class ConversationService {
     sdkUrl: string,
     options?: SessionStartOptions,
   ): Promise<void> {
+    migrationMaintenance.assertAvailable()
     if (this.deletedSessions.has(sessionId)) {
       throw new ConversationStartupError(
         `Session was deleted before startup completed: ${sessionId}`,
@@ -601,7 +642,9 @@ export class ConversationService {
       throw new ConversationStartupError('This temporary side chat has expired. Open a new side chat.', 'SESSION_DELETED')
     }
     const launchInfo = options?.teamWorker ? null : await sessionService.getSessionLaunchInfo(sessionId)
-    const shouldResume = !!launchInfo && launchInfo.transcriptMessageCount > 0
+    const shouldResume = options?.teamWorker
+      ? options.teamWorker.resume === true && !!await sessionService.findSessionFile(sessionId)
+      : !!launchInfo && launchInfo.transcriptMessageCount > 0
     const shouldReplacePlaceholder =
       !side && !!launchInfo && launchInfo.transcriptMessageCount === 0
     const shouldCreateWorktree =
@@ -634,6 +677,17 @@ export class ConversationService {
         undefined,
         launchInfo.customTitle,
       )
+      // Replacing the empty placeholder must not erase the session's runtime
+      // choice before its first turn writes a real transcript.
+      if (launchInfo.runtimeModelId) {
+        await sessionService.appendSessionMetadata(sessionId, {
+          workDir,
+          runtimeProviderId: launchInfo.runtimeProviderId,
+          runtimeModelId: launchInfo.runtimeModelId,
+          ...(launchInfo.effortLevel ? { effortLevel: launchInfo.effortLevel } : {}),
+          ...(launchInfo.openAIFastMode !== undefined ? { openAIFastMode: launchInfo.openAIFastMode } : {}),
+        })
+      }
     }
 
     let launchWorkDir = workDir
@@ -719,9 +773,30 @@ export class ConversationService {
       delete childEnv.CLAUDE_CODE_DIAGNOSTICS_FILE
     }
     if (side?.closed) throw new ConversationStartupError('This temporary side chat has expired. Open a new side chat.', 'SESSION_DELETED')
+    // A delete can land during any await above (transcript reset, workspace,
+    // network settings, child env); spawning now would start a CLI for a
+    // session that no longer exists.
+    if (this.deletedSessions.has(sessionId)) {
+      throw new ConversationStartupError(
+        `Session was deleted before startup completed: ${sessionId}`,
+        'SESSION_DELETED',
+      )
+    }
     const usesOfficialOAuth = this.shouldMarkManagedOAuth(options?.providerId)
 
     let proc: ReturnType<typeof Bun.spawn>
+    migrationMaintenance.assertAvailable()
+    // Another start registered a CLI for this session while this one was
+    // awaiting. Overwriting the entry would leave that process running with
+    // no owner, so retire it the way a runtime restart does (approved team
+    // members keep running) and continue with this newer start.
+    const registered = this.sessions.get(sessionId)
+    if (registered) {
+      console.warn(
+        `[ConversationService] Replacing CLI pid ${registered.proc.pid} for ${sessionId}: a newer start reached spawn`,
+      )
+      this.stopSession(sessionId, { keepTeamWorkers: true })
+    }
     try {
       proc = Bun.spawn(args, buildConversationCliSpawnOptions(launchWorkDir, childEnv))
       if (side) side.started = true
@@ -804,6 +879,15 @@ export class ConversationService {
     ])
     if (startupGraceTimer) clearTimeout(startupGraceTimer)
 
+    const currentSession = this.sessions.get(sessionId)
+    if (currentSession && currentSession !== session) {
+      // A newer start retired this process while it was still starting and
+      // now owns the session. Its exit is not a startup failure: tearing down,
+      // retrying or writing metadata here would act on the newer CLI.
+      console.log(`[ConversationService] CLI startup for ${sessionId} was superseded by a newer start`)
+      return
+    }
+
     const startupExitCode = earlyExitCode ?? session.startupExitCode
     if (startupExitCode !== null) {
       await this.waitForProcessOutputDrain(session)
@@ -866,6 +950,18 @@ export class ConversationService {
     }
 
     console.log(`[ConversationService] CLI started successfully for ${sessionId}`)
+    for (const listener of this.teamRuntimeListeners) {
+      try {
+        listener.sessionStarted?.(sessionId, { isTeamWorker: Boolean(options?.teamWorker) })
+      } catch (error) {
+        console.error('[ConversationService] Team runtime start hook failed', error)
+      }
+    }
+  }
+
+  addTeamRuntimeListener(listener: TeamRuntimeListener): () => void {
+    this.teamRuntimeListeners.add(listener)
+    return () => this.teamRuntimeListeners.delete(listener)
   }
 
   onOutput(sessionId: string, callback: (msg: any) => void): void {
@@ -902,6 +998,7 @@ export class ConversationService {
     attachments?: AttachmentRef[],
     options?: SendMessageOptions,
   ): Promise<boolean> {
+    if (migrationMaintenance.isActive) return false
     const userContent = await this.buildUserContent(content, sessionId, attachments)
     let session = this.sessions.get(sessionId)
     if (session && !await this.refreshNetworkEnvironmentBeforeTurn(sessionId, session)) {
@@ -915,7 +1012,7 @@ export class ConversationService {
     // can all suspend this call. Stop may revoke the owning desktop turn while
     // one of those awaits is pending, so check ownership at the last possible
     // point before writing the user message to the SDK socket.
-    if (options?.canSend && !options.canSend()) return false
+    if (migrationMaintenance.isActive || (options?.canSend && !options.canSend())) return false
     const sent = this.sendSdkMessage(sessionId, {
       type: 'user',
       ...(options?.messageUuid ? { uuid: options.messageUuid } : {}),
@@ -1151,22 +1248,37 @@ export class ConversationService {
   }
 
   sendInterrupt(sessionId: string): boolean {
+    // Stop ends all team activity immediately, but an approved team that is
+    // already working is paused rather than destroyed: the runtime marks its
+    // members as user-stopped before their processes die, and a later message
+    // from the lead or the user resumes each member from its own transcript.
+    let pausedTeam = false
+    for (const listener of this.teamRuntimeListeners) {
+      try {
+        if (listener.leadInterrupted?.(sessionId) === true) pausedTeam = true
+      } catch (error) {
+        console.error('[ConversationService] Team runtime interrupt hook failed', error)
+      }
+    }
     for (const [childId, child] of this.sessions) {
       if (child.teamWorker?.parentSessionId === sessionId) this.stopSession(childId)
     }
     const stop = (this.teamStopOperations.get(sessionId) ?? Promise.resolve()).then(async () => {
       const runtime = await import('./teamPlanRuntime.js')
-      await runtime.stopTeamPlanRuntimesForParent(sessionId)
+      await runtime.stopTeamPlanRuntimesForParent(sessionId, { pauseReleased: true })
     }).catch(error => {
       console.error('[ConversationService] Failed to revoke interrupted team launch', error)
     }).finally(() => {
       if (this.teamStopOperations.get(sessionId) === stop) this.teamStopOperations.delete(sessionId)
     })
     this.teamStopOperations.set(sessionId, stop)
+    // A paused team's lead also holds the mail its members sent before the
+    // Stop until the user speaks again; acting on it would start lead turns,
+    // and restart members, that the user just stopped.
     return this.sendSdkMessage(sessionId, {
       type: 'control_request',
       request_id: crypto.randomUUID(),
-      request: { subtype: 'interrupt' },
+      request: { subtype: pausedTeam ? 'team_plan_pause' : 'interrupt' },
     })
   }
 
@@ -1289,6 +1401,11 @@ export class ConversationService {
 
   hasSession(sessionId: string): boolean {
     return this.sessions.has(sessionId)
+  }
+
+  /** Team workers report through their lead: their requests already count there. */
+  isTeamWorkerSession(sessionId: string): boolean {
+    return Boolean(this.sessions.get(sessionId)?.teamWorker)
   }
 
   getSessionWorkDir(sessionId: string): string {
@@ -1633,9 +1750,16 @@ export class ConversationService {
     pending.clear()
   }
 
-  stopSession(sessionId: string): void {
-    for (const [childId, child] of this.sessions) {
-      if (child.teamWorker?.parentSessionId === sessionId) this.stopSession(childId)
+  /**
+   * `keepTeamWorkers` is for restarting a lead's process (runtime or
+   * permission change): approved team members are independent processes and
+   * keep working while the lead's process is replaced.
+   */
+  stopSession(sessionId: string, options?: { keepTeamWorkers?: boolean }): void {
+    if (!options?.keepTeamWorkers) {
+      for (const [childId, child] of this.sessions) {
+        if (child.teamWorker?.parentSessionId === sessionId) this.stopSession(childId)
+      }
     }
     const session = this.sessions.get(sessionId)
     if (!session) return
@@ -1649,9 +1773,12 @@ export class ConversationService {
   async stopSessionAndWait(
     sessionId: string,
     timeoutMs = DESKTOP_CLI_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
+    options?: { keepTeamWorkers?: boolean },
   ): Promise<void> {
-    for (const [childId, child] of this.sessions) {
-      if (child.teamWorker?.parentSessionId === sessionId) await this.stopSessionAndWait(childId, timeoutMs)
+    if (!options?.keepTeamWorkers) {
+      for (const [childId, child] of this.sessions) {
+        if (child.teamWorker?.parentSessionId === sessionId) await this.stopSessionAndWait(childId, timeoutMs)
+      }
     }
     const session = this.sessions.get(sessionId)
     if (!session) return
@@ -1711,6 +1838,33 @@ export class ConversationService {
     session: SessionProcess,
     signal?: NodeJS.Signals,
   ): void {
+    const platform = this.processDeps.platform ?? process.platform
+    const pid = session.proc.pid
+    if (platform === 'win32' && pid > 0 && session.proc.exitCode == null) {
+      // Windows has no signals: proc.kill() is TerminateProcess on the CLI
+      // alone. Its MCP servers (`cmd /c npx …` → node), shells and their
+      // children survive it and lose the parent link that `taskkill /T`
+      // follows, so the tree must be stopped while the CLI still anchors it.
+      void killWindowsProcessTree(pid, {
+        env: this.processDeps.env,
+        spawn: this.processDeps.spawnTaskkill,
+      }).then((stopped) => {
+        if (stopped) return
+        console.warn(
+          `[ConversationService] taskkill could not stop the CLI process tree for ${sessionId}; terminating the CLI only`,
+        )
+        this.signalProcess(sessionId, session, signal)
+      })
+      return
+    }
+    this.signalProcess(sessionId, session, signal)
+  }
+
+  private signalProcess(
+    sessionId: string,
+    session: SessionProcess,
+    signal?: NodeJS.Signals,
+  ): void {
     try {
       session.proc.kill(signal)
     } catch (error) {
@@ -1746,6 +1900,24 @@ export class ConversationService {
 
   getActiveSessions(): string[] {
     return Array.from(this.sessions.keys())
+  }
+
+  getProcessIds(): number[] {
+    return [...this.sessions.values()].map(session => session.proc.pid).filter(pid => pid > 0)
+  }
+
+  async stopForMigration(): Promise<void> {
+    const sessions = [...this.sessions.entries()]
+    await Promise.all(sessions.map(async ([sessionId, session]) => {
+      if (session.proc.exitCode == null) {
+        await this.requestControl(sessionId, { subtype: 'end_session', reason: 'data_migration' }, 10_000)
+      }
+      const exited = await waitForMigrationExit(session.proc.exited)
+      if (!exited) throw new Error(`CLI process did not exit: ${sessionId}`)
+      await session.outputDrain
+      this.sessions.delete(sessionId)
+    }))
+    await Promise.all([...this.teamStopOperations.values()])
   }
 
   private async readProcessOutputStream(
@@ -1831,9 +2003,11 @@ export class ConversationService {
 
     const activeSession = this.sessions.get(sessionId)
     if (activeSession?.proc === proc) {
-      for (const [childId, child] of this.sessions) {
-        if (child.teamWorker?.parentSessionId === sessionId) this.stopSession(childId)
-      }
+      // A lead process that dies on its own (crash, OOM, provider SDK fault)
+      // must not take its approved team with it: members are independent
+      // processes, their messages queue in the lead's mailbox, and the next
+      // lead start receives the team snapshot again. Explicit stops (close,
+      // delete, /clear) still stop workers through stopSession.
       this.cancelPendingControlRequests(
         activeSession,
         new Error('CLI session exited before the control request completed'),
@@ -1952,6 +2126,7 @@ export class ConversationService {
       OPENAI_OAUTH_PROVIDER_ENV_KEY,
       OPENAI_CODEX_OAUTH_FILE_ENV_KEY,
       OPENAI_CODEX_REASONING_EFFORT_ENV_KEY,
+      'CC_HAHA_OPENAI_FAST_MODE',
       GROK_OAUTH_PROVIDER_ENV_KEY,
       GROK_OAUTH_FILE_ENV_KEY,
       IMAGE_GENERATION_PROVIDER_KIND_ENV_KEY,
@@ -1971,6 +2146,7 @@ export class ConversationService {
     delete cleanEnv.CC_HAHA_SESSION_COLLABORATION_TOKEN
     delete cleanEnv.CC_HAHA_SESSION_ID
     delete cleanEnv.CLAUDE_CODE_OAUTH_TOKEN
+    delete cleanEnv.CC_HAHA_OPENAI_FAST_MODE
     if (options?.resumeInterruptedTurn === false) {
       delete cleanEnv.CLAUDE_CODE_RESUME_INTERRUPTED_TURN
     }
@@ -2003,6 +2179,7 @@ export class ConversationService {
     const explicitProviderEnv = explicitProvider
       ? await this.providerService.getProviderRuntimeEnv(explicitProvider.id)
       : null
+    if (explicitProviderEnv) delete explicitProviderEnv.CC_HAHA_OPENAI_FAST_MODE
     const networkEnv = buildNetworkEnvironment(
       networkSettingsOverride ?? await loadNetworkSettings(),
       cleanEnv,
@@ -2147,6 +2324,8 @@ export class ConversationService {
           ? { [OPENAI_CODEX_REASONING_EFFORT_ENV_KEY]: options.effort }
           : {}
       ),
+      ...(isOpenAIOfficialProviderId(options?.providerId) && options?.openAIFastMode === true
+        ? { CC_HAHA_OPENAI_FAST_MODE: '1' } : {}),
       ...networkEnv,
       ...(this.shouldMarkManagedOAuth(options?.providerId)
         ? await this.buildOfficialOAuthEnv()
@@ -2258,7 +2437,7 @@ export class ConversationService {
       }
     })()
 
-    session.officialOAuthRefreshPromise = recovery
+    session.officialOAuthRefreshPromise = migrationMaintenance.track(recovery)
     void recovery.finally(() => {
       if (session.officialOAuthRefreshPromise === recovery) {
         session.officialOAuthRefreshPromise = undefined
@@ -2446,6 +2625,17 @@ export class ConversationService {
     }
 
     const normalizedDetail = detail.trim()
+    // A Windows Bun that crashes before running any code almost always failed
+    // to commit memory for JavaScriptCore: the machine's commit limit (RAM +
+    // page file) is used up, which every extra CLI process (e.g. each team
+    // member) brings closer. The raw crash report alone points at Bun instead.
+    if (/Bun has crashed/i.test(normalizedDetail) && /\bWindows\b/.test(normalizedDetail)) {
+      return new ConversationStartupError(
+        `CLI runtime crashed during startup (code ${exitCode}). On Windows this usually means the system has run out of commit memory (RAM + page file). Close other programs, set the page file (virtual memory) to system managed, or start fewer team members, then retry. Crash output: ${normalizedDetail}`,
+        'CLI_START_FAILED',
+        true,
+      )
+    }
     return new ConversationStartupError(
       normalizedDetail
         ? `CLI exited during startup (code ${exitCode}): ${normalizedDetail}`
@@ -2676,7 +2866,10 @@ export class ConversationService {
     const savedPaths: string[] = []
     const imageBlocks: UserContentBlock[] = []
     const imageMetadataTexts: string[] = []
-    for (const attachment of attachments) {
+    for (const originalAttachment of attachments) {
+      const attachment = originalAttachment.path
+        ? { ...originalAttachment, path: resolveRelocatedAttachmentPath(originalAttachment.path) }
+        : originalAttachment
       if (this.shouldInlineImageAttachment(attachment)) {
         const image = await this.materializeImageAttachment(attachment, uploadDir)
         if (image) {

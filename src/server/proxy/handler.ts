@@ -15,9 +15,15 @@ import { normalizeAnthropicBaseUrl } from '../../services/api/anthropicBaseUrl.j
 import { createGunzip, createInflate } from 'node:zlib'
 
 import { ProviderService } from '../services/providerService.js'
+import { diagnosticsService } from '../services/diagnosticsService.js'
 import type { ProviderAuthStrategy } from '../types/provider.js'
 import { resolvePromptCacheKey } from './promptCacheKey.js'
-import { anthropicToOpenaiChat } from './transform/anthropicToOpenaiChat.js'
+import {
+  getOpenAIChatImageContentMode,
+  isOpenAIChatImageRejection,
+  rememberOpenAIChatTextOnlyModel,
+} from './openaiChatImageSupport.js'
+import { anthropicToOpenaiChat, type OpenAIChatImageContentMode } from './transform/anthropicToOpenaiChat.js'
 import { anthropicToOpenaiResponses } from './transform/anthropicToOpenaiResponses.js'
 import { RequestCompatibilityError, resolveRequestCompatibility, type RequestCompatibilityOptions } from './transform/requestCompatibility.js'
 import { ProtocolTraceObserver, observeProtocolStream, type ProtocolTraceTransport } from './protocolTrace.js'
@@ -748,9 +754,11 @@ async function handleOpenaiChat(
   traceContext: ProxyTraceContext | null,
   requestOptions: RequestCompatibilityOptions = {},
   upstreamHeaders: Record<string, string> = {},
+  imageContentModeOverride?: OpenAIChatImageContentMode,
 ): Promise<Response> {
   const knownDeepSeekHost = shouldUseDeepSeekReasoningCompat(baseUrl)
   const reasoningProfile = resolveModelReasoningProfile(body.model, 'openai_chat')
+  const url = buildOpenaiEndpoint(baseUrl, 'chat/completions')
   // Console Go's upstream pool for OpenCode Zen is heterogeneous: some Chat
   // Completions backends strict-decode the request body and randomly reject
   // the non-standard `thinking` toggle with
@@ -758,11 +766,19 @@ async function handleOpenaiChat(
   // session-sticky). OpenCode's reasoning models return `reasoning_content`
   // without the toggle, so keep it for real DeepSeek hosts only.
   const passThinkingToggle = knownDeepSeekHost && !OPENCODE_HOST_PATTERN.test(baseUrl)
+  // The local per-family allowlist below sets the static default for the
+  // OpenCode gateway (mimo / deepseek families are multimodal, glm is not);
+  // every other host starts on vision, and the endpoint-probed learning then
+  // still drops images for a model this host actually rejects.
+  const imageContentMode = imageContentModeOverride
+    ?? (shouldUseTextOnlyOpenCodeGatewayContent(baseUrl, body.model)
+      ? 'text_only'
+      : getOpenAIChatImageContentMode(url, body.model))
   const transformed = anthropicToOpenaiChat(body, {
     ...requestOptions,
     roundTripReasoningContent: knownDeepSeekHost || reasoningProfile?.family === 'deepseek-v4',
     passThinkingToggle,
-    imageContentMode: shouldUseTextOnlyOpenAIChatContent(baseUrl, body.model) ? 'text_only' : 'vision',
+    imageContentMode,
   })
   relaxForcedToolChoice(transformed as unknown as Record<string, unknown>, baseUrl)
   clampUnsupportedReasoningEffort(transformed as unknown as Record<string, unknown>, baseUrl)
@@ -770,7 +786,6 @@ async function handleOpenaiChat(
     traceContext.protocolTrace = new ProtocolTraceObserver('openai_chat', transformed,
       resolveRequestCompatibility(body, { ...requestOptions, protocol: 'openai_chat' }).outputBudget)
   }
-  const url = buildOpenaiEndpoint(baseUrl, 'chat/completions')
   // Preset-declared headers first: `Authorization` is applied last so a preset can
   // never shadow the credential, and the resolver already drops framing headers.
   const upstreamRequestHeaders: Record<string, string> = {}
@@ -819,6 +834,40 @@ async function handleOpenaiChat(
 
   if (!upstream.ok) {
     const errText = await upstream.text().catch(() => '')
+    if (imageContentMode === 'vision' && isOpenAIChatImageRejection(upstream.status, errText, transformed)) {
+      // The upstream refused the request before generating anything, so the
+      // client has seen no output and resending is safe. The model is only
+      // remembered once the same request succeeds without images, so an
+      // unrelated failure of the resend cannot disable images for good.
+      if (traceContext) {
+        recordProxyTraceInBackground({
+          context: traceContext,
+          callId: traceCallId,
+          model: body.model,
+          upstreamUrl: url,
+          upstreamRequest: transformed,
+          requestHeaders: upstreamRequestHeaders,
+          startedAt,
+          startedAtMs,
+          responseStatus: upstream.status,
+          upstreamResponseBody: errText,
+          responseHeaders: upstream.headers,
+        })
+      }
+      const resent = await handleOpenaiChat(
+        body, baseUrl, apiKey, isStream, networkSettings, traceContext, requestOptions, upstreamHeaders, 'text_only',
+      )
+      if (resent.ok) {
+        rememberOpenAIChatTextOnlyModel(url, body.model)
+        void diagnosticsService.recordEvent({
+          type: 'openai_chat_image_input_disabled',
+          severity: 'info',
+          summary: `Upstream rejected image input for ${body.model}; images are omitted for this model for 30 minutes`,
+          details: { model: body.model, upstreamUrl: url, httpStatus: upstream.status, upstreamError: errText.slice(0, 500) },
+        })
+      }
+      return resent
+    }
     let policyError = null
     try {
       policyError = getOpenAIPolicyError(JSON.parse(errText))
@@ -939,25 +988,23 @@ function shouldUseDeepSeekReasoningCompat(baseUrl: string): boolean {
   )
 }
 
-function shouldUseTextOnlyOpenAIChatContent(baseUrl: string, model: string): boolean {
-  // Keep classic DeepSeek text models compatible without dropping images for
-  // explicitly vision-capable models served by the same Chat endpoint.
-  if (/(^|[./-])deepseek([./-]|$)/i.test(baseUrl)) {
-    return !hasExplicitVisionModelMarker(model)
-  }
-
-  // image_url inside a tool message is a gateway extension, not a universal
-  // Chat Completions contract. Only opt opencode models in when their id
-  // explicitly advertises vision capability or the family is known multimodal;
-  // unknown gateway models stay safe. Context-window suffixes have already
-  // been stripped.
-  if (/(^|[./-])opencode\.ai([:/]|$)/i.test(baseUrl)) {
-    return !hasExplicitVisionModelMarker(model) && !hasMultimodalGatewayModelMarker(model)
-  }
-
-  // Preserve the existing behavior for generic compatible providers whose
-  // capabilities are not controlled by either compatibility policy above.
-  return false
+/**
+ * Whether images must be dropped for a model on the OpenCode gateway before
+ * anything is sent.
+ *
+ * `image_url` inside a tool message is a gateway extension, not a universal
+ * Chat Completions contract, and Console Go's pool answers it per family:
+ * live probes (2026-09-23) show mimo-v2.5 / v2.6-pro / v2.6-flash, every
+ * deepseek id on the catalog, kimi-k3 and space-bunny-free all answer an
+ * image_url request with 200 while glm-5.3 answers 400 "does not support
+ * image inputs". So the gateway keeps a per-family opt-in — an unknown id
+ * stays text-only until a probe says otherwise — while every other host takes
+ * the vision-first path and learns from an actual rejection.
+ * Context-window suffixes have already been stripped.
+ */
+function shouldUseTextOnlyOpenCodeGatewayContent(baseUrl: string, model: string): boolean {
+  if (!/(^|[./-])opencode\.ai([:/]|$)/i.test(baseUrl)) return false
+  return !hasExplicitVisionModelMarker(model) && !hasMultimodalGatewayModelMarker(model)
 }
 
 function hasExplicitVisionModelMarker(model: string): boolean {

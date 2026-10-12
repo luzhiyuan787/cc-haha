@@ -58,6 +58,8 @@ const RESPONSE_LIMIT_BYTES = 128 * 1024
  * file system (`/$bunfs/...` on POSIX, `B:/~BUN/...` on Windows).
  */
 export function isBundledWorkerHost(moduleUrl: string = import.meta.url, bundledMode: boolean = isInBundledMode()): boolean {
+  // Delegates to the shared helper so the Windows `%7EBUN` decoding also fixes
+  // `isInBundledMode()` itself, not just this worker-host check.
   return bundledMode || isBunVirtualModuleUrl(moduleUrl)
 }
 

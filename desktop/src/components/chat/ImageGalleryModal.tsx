@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import { ExternalLink, X } from 'lucide-react'
+import { ChevronLeft, ChevronRight, ExternalLink, X } from 'lucide-react'
 import { IconButton } from '@/components/ui/IconButton'
 import { Modal } from '@/components/ui/Modal'
 import { ZoomableImage, type ZoomableImageProps } from '@/components/ui/ZoomableImage'
@@ -8,7 +8,6 @@ import { AuthedImage } from './AuthedImage'
 import { getDesktopHost } from '@/lib/desktopHost'
 import { isRootedLocalPath } from '@/lib/handlePreviewLink'
 import { openLocalFileWithSystem, reportOpenFailure } from '@/lib/systemFileOpen'
-import { useOverlayStore } from '../../stores/overlayStore'
 import { useTranslation } from '../../i18n'
 
 type GalleryImage = {
@@ -38,16 +37,6 @@ function AuthedZoomableImage({ src, onError, ...props }: ZoomableImageProps) {
 export function ImageGalleryModal({ open, images, activeIndex, onClose, onSelect }: Props) {
   const t = useTranslation()
   const activeImage = images[activeIndex]
-
-  // Native child webviews (e.g. the in-app browser preview) always render
-  // ABOVE the DOM, so this fullscreen overlay would be partially covered.
-  // Bump the overlay count while open so BrowserSurface can hide the webview.
-  useEffect(() => {
-    if (!open) return
-    const { push, pop } = useOverlayStore.getState()
-    push()
-    return () => pop()
-  }, [open])
 
   useEffect(() => {
     if (!open || images.length <= 1) return
@@ -123,7 +112,7 @@ export function ImageGalleryModal({ open, images, activeIndex, onClose, onSelect
             <>
               <div className="absolute left-3 top-1/2 -translate-y-1/2">
                 <IconButton
-                  icon="chevron_left"
+                  icon={<ChevronLeft size={20} strokeWidth={1.75} aria-hidden="true" />}
                   label={t('attachments.previousImage')}
                   size="xl"
                   tone="secondary"
@@ -135,7 +124,7 @@ export function ImageGalleryModal({ open, images, activeIndex, onClose, onSelect
               </div>
               <div className="absolute right-3 top-1/2 -translate-y-1/2">
                 <IconButton
-                  icon="chevron_right"
+                  icon={<ChevronRight size={20} strokeWidth={1.75} aria-hidden="true" />}
                   label={t('attachments.nextImage')}
                   size="xl"
                   tone="secondary"

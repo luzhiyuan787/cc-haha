@@ -60,6 +60,7 @@ import {
 } from './utils/messages.js'
 import { generateToolUseSummary } from './services/toolUseSummary/toolUseSummaryGenerator.js'
 import { prependUserContext, appendSystemContext } from './utils/api.js'
+import { recordUserContextSnapshot } from './services/api/promptSnapshot.js'
 import {
   createAttachmentMessage,
   filterDuplicateMemoryAttachments,
@@ -663,6 +664,10 @@ async function* queryLoop(
 
     let attemptWithFallback = true
 
+    // Desktop-only prompt snapshot of the user context prepended below
+    // (CLAUDE.md, currentDate, ...). Fire-and-forget; deduped per scope.
+    recordUserContextSnapshot({ userContext, agentId: toolUseContext.agentId })
+
     queryCheckpoint('query_api_loop_start')
     try {
       while (attemptWithFallback) {
@@ -711,6 +716,7 @@ async function* queryLoop(
                 toolUseContext.options.effortValueOverridesEnv,
               advisorModel: appState.advisorModel,
               skipCacheWrite,
+              apiAttemptBudget: toolUseContext.apiAttemptBudget,
               agentId: toolUseContext.agentId,
               addNotification: toolUseContext.addNotification,
               ...(params.taskBudget && {

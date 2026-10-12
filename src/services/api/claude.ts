@@ -227,7 +227,11 @@ import {
   stopSessionActivity,
 } from "../../utils/sessionActivity.js";
 import { isOpenAIPolicyError } from "../openaiAuth/policyError.js"
-import { shouldTriggerNonStreamingFallbackForEmptyStream } from "./streamFallback.js";
+import {
+  shouldTriggerNonStreamingFallbackForEmptyStream,
+  StreamEndedEarlyError,
+  type StreamEndedEarlyEvidence,
+} from "./streamFallback.js";
 import { StreamAssistantCommitBuffer } from "./streamAssistantCommitBuffer.js";
 import {
   commitOutputLimitResponse,
@@ -280,15 +284,17 @@ import {
   checkResponseForCacheBreak,
   recordPromptState,
 } from "./promptCacheBreakDetection.js";
+import { recordPromptSnapshot } from "./promptSnapshot.js";
 import { withStreamRetry } from "./streamRetry.js";
 import {
+  type ApiAttemptBudget,
   CannotRetryError,
   FallbackTriggeredError,
+  getStreamRetryKind,
   is529Error,
-  isRetryableStreamError,
+  isRetryableStreamTransportError,
   RetriableStreamError,
   type RetryContext,
-  shouldRetryStreamAfterTransportDisconnect,
   withRetry,
 } from "./withRetry.js";
 
@@ -790,6 +796,8 @@ export type Options = {
   // so the model can pace itself. `remaining` is computed by the caller
   // (query.ts decrements across the agentic loop).
   taskBudget?: { total: number; remaining?: number };
+  /** Shared across every retry layer of this request (see ApiAttemptBudget). */
+  apiAttemptBudget?: ApiAttemptBudget;
 };
 
 export async function queryModelWithoutStreaming({
@@ -825,6 +833,7 @@ export async function queryModelWithoutStreaming({
         ),
       options.model,
       messages,
+      { signal, apiAttemptBudget: options.apiAttemptBudget },
     );
   })) {
     if (message.type === "assistant") {
@@ -875,6 +884,7 @@ export async function* queryModelWithStreaming({
         ),
       options.model,
       messages,
+      { signal, apiAttemptBudget: options.apiAttemptBudget },
     );
   });
 }
@@ -931,6 +941,7 @@ export async function* executeNonStreamingRequest(
     signal: AbortSignal;
     initialConsecutive529Errors?: number;
     querySource?: QuerySource;
+    apiAttemptBudget?: ApiAttemptBudget;
   },
   paramsFromContext: (context: RetryContext) => BetaMessageStreamParams,
   onAttempt: (attempt: number, start: number, maxOutputTokens: number) => void,
@@ -1007,6 +1018,7 @@ export async function* executeNonStreamingRequest(
       signal: retryOptions.signal,
       initialConsecutive529Errors: retryOptions.initialConsecutive529Errors,
       querySource: retryOptions.querySource,
+      apiAttemptBudget: retryOptions.apiAttemptBudget,
     },
   );
 
@@ -1641,6 +1653,16 @@ async function* queryModel(
     });
   }
 
+  // Desktop-only prompt snapshot sidecar for the trajectory view. Gated and
+  // fire-and-forget internally: never awaited, never throws.
+  recordPromptSnapshot({
+    systemPrompt,
+    tools: allTools,
+    model: options.model,
+    querySource: options.querySource,
+    agentId: options.agentId,
+  });
+
   const newContext: LLMRequestNewContext | undefined = isBetaTracingEnabled()
     ? {
         systemPrompt: systemPrompt.join("\n\n"),
@@ -1986,10 +2008,14 @@ async function* queryModel(
   let costUSD = 0;
   let hasStreamingUsage = false;
   let stopReason: BetaStopReason | null = null;
+  // True while the last content-bearing event was a message_delta carrying a
+  // stop_reason. Gateways that omit the blank line after their final SSE event
+  // lose message_stop inside the SDK decoder (#1481); like the official CLI, a
+  // reply whose stop_reason was not followed by more content is complete.
+  let stopReasonIsTerminal = false;
   const completedBlockIndexes = new Set<number>();
   const completedToolUseIds = new Set<string>();
   const handledStopReasons = new Set<BetaStopReason>();
-  let incompleteStream = false;
   let didFallBackToNonStreaming = false;
   let fallbackMessage: AssistantMessage | undefined;
   let maxOutputTokens = 0;
@@ -2087,6 +2113,7 @@ async function* queryModel(
         ...(isFastModeEnabled() ? { fastMode: isFastMode } : false),
         signal,
         querySource: options.querySource,
+        apiAttemptBudget: options.apiAttemptBudget,
       },
     );
 
@@ -2109,6 +2136,7 @@ async function* queryModel(
     contentBlocks.length = 0;
     usage = EMPTY_USAGE;
     stopReason = null;
+    stopReasonIsTerminal = false;
     isAdvisorInProgress = false;
 
     // Streaming idle timeout watchdog: abort the stream if no chunks arrive
@@ -2377,6 +2405,7 @@ async function* queryModel(
             break;
           }
           case "content_block_start":
+            stopReasonIsTerminal = false;
             switch (part.content_block.type) {
               case "tool_use":
                 contentBlocks[part.index] = {
@@ -2436,6 +2465,7 @@ async function* queryModel(
             }
             break;
           case "content_block_delta": {
+            stopReasonIsTerminal = false;
             const contentBlock = contentBlocks[part.index];
             const delta = part.delta as typeof part.delta | ConnectorTextDelta;
             if (!contentBlock) {
@@ -2558,6 +2588,7 @@ async function* queryModel(
           }
           case "content_block_stop": {
             if (completedBlockIndexes.has(part.index)) continue;
+            stopReasonIsTerminal = false;
             completedBlockIndexes.add(part.index);
             toolInputDurationGuard.stop(part.index);
             const contentBlock = contentBlocks[part.index];
@@ -2646,6 +2677,7 @@ async function* queryModel(
             const isNewStopReason = hasStopReason && !handledStopReasons.has(part.delta.stop_reason);
             if (hasStopReason) {
               stopReason = part.delta.stop_reason;
+              stopReasonIsTerminal = true;
               handledStopReasons.add(stopReason);
             }
 
@@ -2769,6 +2801,24 @@ async function* queryModel(
           );
       }
 
+      // Recorded on an early-EOF error so the surfaced message shows whether
+      // the provider cut the reply mid-block or only dropped message_stop.
+      // Count open blocks before preservePartialText closes partial text.
+      const openBlockCountAtEof = contentBlocks.filter(
+        (block, index) => block && !completedBlockIndexes.has(index),
+      ).length;
+      const streamEndEvidence = (): StreamEndedEarlyEvidence => {
+        const snapshot = streamWatchdogState.snapshot();
+        return {
+          eventCount: snapshot.eventCount,
+          lastEventType: snapshot.lastEventType ?? null,
+          stopReason,
+          messageStopReceived: snapshot.messageStopReceived,
+          openBlockCount: openBlockCountAtEof,
+          elapsedMs: Date.now() - start,
+        };
+      };
+
       // Preserve visible text when the socket closes before its block_stop.
       // Never synthesize a completed tool or unsigned thinking block from EOF.
       preservePartialText();
@@ -2794,7 +2844,8 @@ async function* queryModel(
       // That's a legitimate empty response, not an incomplete stream. However,
       // stop_reason=tool_use with no completed tool block is incomplete: some
       // OpenAI-compatible streams send only finish_reason=tool_calls, and we
-      // need the non-streaming fallback to recover the full tool call.
+      // need the non-streaming fallback (or, without it, a re-sent stream) to
+      // recover the full tool call.
       if (
         shouldTriggerNonStreamingFallbackForEmptyStream({
           hasMessageStart: partialMessage !== undefined,
@@ -2804,10 +2855,10 @@ async function* queryModel(
       ) {
         logForDebugging(
           !partialMessage
-            ? "Stream completed without receiving message_start event - triggering non-streaming fallback"
+            ? "Stream completed without receiving message_start event"
             : stopReason === "tool_use"
-              ? "Stream completed with tool_use stop but no completed tool block - triggering non-streaming fallback"
-            : "Stream completed with message_start but no content blocks completed - triggering non-streaming fallback",
+              ? "Stream completed with tool_use stop but no completed tool block"
+            : "Stream completed with message_start but no content blocks completed",
           { level: "error" },
         );
         logEvent("tengu_stream_no_events", {
@@ -2816,19 +2867,21 @@ async function* queryModel(
           request_id: (streamRequestId ??
             "unknown") as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
         });
-        throw new Error("Stream ended without receiving any events");
+        throw new StreamEndedEarlyError("no_events", streamEndEvidence());
       }
 
       // A clean socket EOF is not a successful Anthropic response. Explicit
       // output limits already have a recovery message and may omit message_stop.
+      // A missing message_stop alone is tolerated once the stop_reason was the
+      // last content event (see stopReasonIsTerminal).
       if (
         stopReason !== "max_tokens" &&
         stopReason !== "model_context_window_exceeded" &&
-        (!streamWatchdogState.snapshot().messageStopReceived || stopReason === null ||
+        ((!streamWatchdogState.snapshot().messageStopReceived && !stopReasonIsTerminal) ||
+          stopReason === null ||
           contentBlocks.some((block, index) => block && !completedBlockIndexes.has(index)))
       ) {
-        incompleteStream = true;
-        throw new Error("Provider stream ended before completing the response");
+        throw new StreamEndedEarlyError("incomplete", streamEndEvidence());
       }
 
       // No tool boundary was crossed, so completed thinking/text blocks were
@@ -2899,12 +2952,58 @@ async function* queryModel(
       // A safety rejection is terminal, including for non-streaming fallback.
       if (isOpenAIPolicyError(streamingError)) throw streamingError
 
-      // Never replay a response after server-side work began or a local tool
-      // completed. Keep displayable blocks, but discard uncommitted local tools.
-      // Completed partial text on a clean EOF is also surfaced with an error,
-      // rather than silently accepted or replaced by a second response.
-      if (incompleteStream || assistantCommitBuffer.hasCrossedSideEffectBoundary() ||
-          streamWatchdogState.snapshot().serverToolUseStarted) {
+      // When the flag is enabled, skip the non-streaming fallback and let the
+      // error propagate to withRetry. The mid-stream fallback causes double tool
+      // execution when streaming tool execution is active: the partial stream
+      // starts a tool, then the non-streaming retry produces the same tool_use
+      // and runs it again. See inc-4258.
+      const disableFallback =
+        isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK) ||
+        getFeatureValue_CACHED_MAY_BE_STALE(
+          "tengu_disable_streaming_to_non_streaming_fallback",
+          false,
+        );
+
+      // The attempt can be discarded and re-sent as a new stream only while
+      // nothing from it reached the consumer and no server-side tool work
+      // began. A completed local tool_use does not close that window: the
+      // commit buffer holds it until the response completes, and query.ts only
+      // executes tools from yielded assistant messages, so it has not run.
+      const canReplay =
+        !assistantCommitBuffer.hasCommitted() &&
+        !streamWatchdogState.snapshot().serverToolUseStarted;
+      const streamEndedIncomplete =
+        streamingError instanceof StreamEndedEarlyError &&
+        streamingError.reason === "incomplete";
+      const retryKind = getStreamRetryKind({
+        error: streamingError,
+        canReplay,
+        streamIdleAborted,
+        signalAborted: signal.aborted,
+        // The fallback below never replays an attempt that completed a tool
+        // block, so such a truncation can only recover as a new stream.
+        nonStreamingFallbackAvailable:
+          !disableFallback &&
+          !assistantCommitBuffer.hasCrossedSideEffectBoundary(),
+        transientRetryAllowed:
+          newMessages.length === 0 ||
+          canRetryOpenAICodexStreamWithBufferedContent(
+            streamResponse as Response | undefined,
+            !canReplay,
+          ),
+      });
+
+      // Never replay a response through the non-streaming fallback after it
+      // committed output, server-side work began or a local tool completed.
+      // Keep displayable blocks, but discard uncommitted local tools. Partial
+      // text from a clean EOF that cannot be re-streamed is also surfaced with
+      // an error, rather than silently accepted or replaced by a second response.
+      if (
+        retryKind === null &&
+        (!canReplay ||
+          streamEndedIncomplete ||
+          assistantCommitBuffer.hasCrossedSideEffectBoundary())
+      ) {
         for (const committedMessage of assistantCommitBuffer.flushWithoutToolUse()) {
           yield committedMessage;
         }
@@ -2967,89 +3066,36 @@ async function* queryModel(
         }
       }
 
-      // A watchdog stall is recoverable while the failed attempt is still
-      // side-effect-free. Completed thinking/text and partial local tool JSON
-      // stay buffered, so re-establishing the stream cannot duplicate a tool.
-      // A completed local tool block or any server-side tool activity closes
-      // this retry boundary permanently for the attempt.
-      if (
-        streamIdleAborted &&
-        streamingError instanceof StreamWatchdogTimeoutError &&
-        streamingError.safeToRetryStream() &&
-        !assistantCommitBuffer.hasCrossedSideEffectBoundary() &&
-        !signal.aborted
-      ) {
-        logForDebugging(
-          `Watchdog timeout before content/tool output, will retry stream: ${errorMessage(
-            streamingError,
-          )}`,
-          { level: "warn" },
-        );
-        throw new RetriableStreamError(streamingError, assistantCommitBuffer.flush());
-      }
-
-      // The socket under the stream died mid-response (stale pooled keep-alive
-      // connection, proxy/NAT dropping a reused one, upstream edge reset). It
-      // arrives as a bare transport error inside the SSE body, so withRetry
-      // (stream creation only) and isRetryableStreamError (SSE error payloads)
-      // both miss it, and with the non-streaming fallback disabled the turn
-      // would die on a fault a plain re-send clears. Recover on the same
-      // side-effect boundary the watchdog retry uses.
-      if (
-        shouldRetryStreamAfterTransportDisconnect({
-          error: streamingError,
-          hasCrossedSideEffectBoundary:
-            assistantCommitBuffer.hasCrossedSideEffectBoundary(),
-          streamIdleAborted,
-          signalAborted: signal.aborted,
-        })
-      ) {
+      // A recoverable failure — an idle stall, a dead socket, a truncated or
+      // cleanly closed stream, an upstream api_error/overloaded_error — arrives
+      // inside the SSE body, so withRetry (stream creation only) misses it, and
+      // with the non-streaming fallback disabled the turn would die on a fault
+      // a plain re-send clears. withStreamRetry re-sends it with backoff.
+      if (retryKind !== null) {
         // Nothing arrived at all, so the connection was already dead when the
         // request went out — the pool is serving closed sockets. Stop reusing
         // it so the retry opens a fresh one. A disconnect after message_start
         // is a live connection that broke later; that pool stays trusted.
-        if (partialMessage === undefined) {
+        if (
+          partialMessage === undefined &&
+          isRetryableStreamTransportError(streamingError)
+        ) {
           disableKeepAlive();
         }
         logForDebugging(
-          `Mid-stream transport disconnect before any tool output, will retry stream: ${errorMessage(
+          `Mid-stream ${retryKind} failure before any output was committed, will retry stream: ${errorMessage(
             streamingError,
           )}`,
           { level: "warn" },
         );
-        throw new RetriableStreamError(streamingError, assistantCommitBuffer.flush());
-      }
-
-      if (
-        (newMessages.length === 0 ||
-          canRetryOpenAICodexStreamWithBufferedContent(
-            streamResponse as Response | undefined,
-            assistantCommitBuffer.hasCrossedSideEffectBoundary(),
-          )) &&
-        !streamIdleAborted &&
-        !signal.aborted &&
-        isRetryableStreamError(streamingError)
-      ) {
-        logForDebugging(
-          `Transient mid-stream error before any output, will retry stream: ${errorMessage(
-            streamingError,
-          )}`,
-          { level: "warn" },
+        // Completed text/thinking ride along for a retries-exhausted error; an
+        // uncommitted local tool_use is dropped with the attempt.
+        throw new RetriableStreamError(
+          streamingError,
+          assistantCommitBuffer.flushWithoutToolUse(),
+          retryKind,
         );
-        throw new RetriableStreamError(streamingError, assistantCommitBuffer.flush());
       }
-
-      // When the flag is enabled, skip the non-streaming fallback and let the
-      // error propagate to withRetry. The mid-stream fallback causes double tool
-      // execution when streaming tool execution is active: the partial stream
-      // starts a tool, then the non-streaming retry produces the same tool_use
-      // and runs it again. See inc-4258.
-      const disableFallback =
-        isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK) ||
-        getFeatureValue_CACHED_MAY_BE_STALE(
-          "tengu_disable_streaming_to_non_streaming_fallback",
-          false,
-        );
 
       if (disableFallback) {
         logForDebugging(
@@ -3143,6 +3189,7 @@ async function* queryModel(
           signal,
           initialConsecutive529Errors: is529Error(streamingError) ? 1 : 0,
           querySource: options.querySource,
+          apiAttemptBudget: options.apiAttemptBudget,
         },
         paramsFromContext,
         (attempt, _startTime, tokens) => {

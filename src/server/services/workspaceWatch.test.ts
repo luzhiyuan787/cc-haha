@@ -56,7 +56,9 @@ function controlledWatchCallbacks(canonicalRoot: string) {
   const closeSpies: ReturnType<typeof spyOn<nativeFs.FSWatcher, 'close'>>[] = []
   let sequence = 0
   const watchSpy = spyOn(nativeFs, 'watch').mockImplementation(((filename, options, listener) => {
-    const watcher = nativeWatch(filename, options, listener)
+    // Only explicitly emitted callbacks belong to this deterministic batch.
+    // FSEvents can replay fixture creation after registration on its CF thread.
+    const watcher = nativeWatch(filename, options, () => {})
     listeners.set(path.relative(canonicalRoot, String(filename)).replace(/\\/g, '/'), listener as Listener)
     closeSpies.push(spyOn(watcher, 'close'))
     return watcher
@@ -222,9 +224,17 @@ describe('bounded workspace watches', () => {
     await watchReady()
     await fs.writeFile(path.join(root, 'src/a.ts'), 'one')
     await fs.writeFile(path.join(root, 'src/a.ts'), 'two')
+    // Observe both persistent states. Reconciliation can recover final state
+    // after a native callback gap, but cannot reconstruct an already vanished
+    // intermediate filename. The separate rapid-rename test covers that gap.
+    await until(() => events.some((event) => event.paths.includes('src/a.ts')))
     await fs.rename(path.join(root, 'src/a.ts'), path.join(root, 'src/b.ts'))
     await until(() => events.some((event) => event.paths.includes('src/b.ts')))
-    expect(events.flatMap((event) => event.paths)).toContain('src/a.ts')
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    const named = events.flatMap((event) => event.paths)
+    expect(named.every((changed) => changed === 'src/a.ts' || changed === 'src/b.ts')).toBe(true)
+    expect(named).toContain('src/a.ts')
+    expect(named).toContain('src/b.ts')
     expect(events.every((event) => new Set(event.paths).size === event.paths.length)).toBe(true)
     expect(events.every((event) => event.directories.includes('src'))).toBe(true)
 
@@ -233,6 +243,20 @@ describe('bounded workspace watches', () => {
     await fs.writeFile(path.join(root, 'src/after-close.ts'), 'closed')
     await new Promise((resolve) => setTimeout(resolve, 100))
     expect(events).toHaveLength(count)
+  })
+
+  it('invalidates the final state of rapid real write/write/rename even across native callback gaps', async () => {
+    const events: WorkspaceWatchChange[] = []
+    await service.watchDirectories('task', ['src'], event => events.push(event), controller().signal)
+    await fs.writeFile(path.join(root, 'src/a.ts'), 'one')
+    await fs.writeFile(path.join(root, 'src/a.ts'), 'two')
+    await fs.rename(path.join(root, 'src/a.ts'), path.join(root, 'src/b.ts'))
+    await until(() => events.some(event => event.paths.includes('src/b.ts')))
+    expect(events.every(event => event.directories.includes('src'))).toBe(true)
+    expect(events.every(event => new Set(event.paths).size === event.paths.length)).toBe(true)
+    const tree = await service.readTree('task', 'src')
+    expect(tree.entries.map(entry => entry.path)).toEqual(['src/b.ts'])
+    expect((await service.readFile('task', 'src/b.ts')).content).toBe('two')
   })
 
   it('does not recursively watch unopened descendants', async () => {

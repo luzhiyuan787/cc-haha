@@ -59,6 +59,7 @@ import { createUserMessage } from '../../utils/messages.js'
 import { getAgentModel } from '../../utils/model/agent.js'
 import type { ModelAlias } from '../../utils/model/aliases.js'
 import {
+  isChainParticipant,
   recordSidechainTranscript,
   writeAgentMetadata,
   type AgentMetadata,
@@ -80,7 +81,8 @@ import type { ContentReplacementState } from '../../utils/toolResultStorage.js'
 import { createAgentId } from '../../utils/uuid.js'
 import { emitAgentRunMessage } from '../../utils/sdkEventQueue.js'
 import { getTeammateContext } from '../../utils/teammateContext.js'
-import { resolveAgentTools } from './agentToolUtils.js'
+import { filterToolsForAgent, resolveAgentTools } from './agentToolUtils.js'
+import { createDenialTrackingState } from '../../utils/permissions/denialTracking.js'
 import { type AgentDefinition, isBuiltInAgent } from './loadAgentsDir.js'
 
 export function resolveSubagentThinkingConfig(
@@ -123,6 +125,35 @@ export function selectInitialTranscriptMessages(
     startingParentUuid: boundary > 0
       ? messages[boundary - 1]?.uuid ?? null
       : undefined,
+  }
+}
+
+/**
+ * The initial messages an agent run still has to append to a transcript that
+ * already holds `recordedUuids`: everything after the last recorded message,
+ * chained to the last recorded message that can be a parent.
+ */
+export function selectUnrecordedTranscriptMessages(
+  messages: Message[],
+  recordedUuids: ReadonlySet<UUID>,
+): {
+  messages: Message[]
+  startingParentUuid: UUID | null | undefined
+} {
+  const lastRecorded = messages.findLastIndex(message =>
+    recordedUuids.has(message.uuid),
+  )
+  if (lastRecorded === -1) {
+    return { messages, startingParentUuid: undefined }
+  }
+  const parent = messages
+    .slice(0, lastRecorded + 1)
+    .findLast(
+      message => recordedUuids.has(message.uuid) && isChainParticipant(message),
+    )
+  return {
+    messages: messages.slice(lastRecorded + 1),
+    startingParentUuid: parent?.uuid ?? null,
   }
 }
 
@@ -295,6 +326,7 @@ export async function* runAgent({
   toolUseContext,
   canUseTool,
   isAsync,
+  isBackgrounded,
   canShowPermissionPrompts,
   forkContextMessages,
   querySource,
@@ -314,6 +346,8 @@ export async function* runAgent({
   streamTargetAgentId,
   persistedAgentType,
   alreadyPersistedMessageCount,
+  recordedUuids,
+  extraMetadata,
   workflow,
   onQueryProgress,
 }: {
@@ -322,6 +356,8 @@ export async function* runAgent({
   toolUseContext: ToolUseContext
   canUseTool: CanUseToolFn
   isAsync: boolean
+  /** 前台转后台时切换交互边界，但不重建查询或重放已执行的工具。 */
+  isBackgrounded?: () => boolean
   /** Whether this agent can show permission prompts. Defaults to !isAsync.
    * Set to true for in-process teammates that run async but share the terminal. */
   canShowPermissionPrompts?: boolean
@@ -384,6 +420,14 @@ export async function* runAgent({
    * transcript. Resume sends them to the model for context but must only
    * append the new continuation messages to disk. */
   alreadyPersistedMessageCount?: number
+  /** Uuids of the messages already in this agent's transcript, for an agent
+   * that keeps one transcript across many runs (an in-process teammate).
+   * Only messages after the last recorded one are appended, and every message
+   * this run records is added. Takes precedence over
+   * alreadyPersistedMessageCount. */
+  recordedUuids?: Set<UUID>
+  /** Additional fields for this run's metadata sidecar. */
+  extraMetadata?: Partial<AgentMetadata>
   /** Optional subdirectory under subagents/ to group this agent's transcript
    * with related ones (e.g. workflows/<runId> for workflow subagents). */
   /** Set when this agent is one step of a dynamic workflow run. */
@@ -502,6 +546,7 @@ export async function* runAgent({
     isRepositoryAgent && requestedAgentPermissionMode === 'bypassPermissions'
       ? undefined
       : requestedAgentPermissionMode
+  const runsInBackground = () => isAsync || (isBackgrounded?.() ?? false)
   const agentGetAppState = () => {
     const state = toolUseContext.getAppState()
     let toolPermissionContext = state.toolPermissionContext
@@ -531,7 +576,7 @@ export async function* runAgent({
         ? !canShowPermissionPrompts
         : agentPermissionMode === 'bubble'
           ? false
-          : isAsync
+          : runsInBackground()
     if (shouldAvoidPrompts) {
       toolPermissionContext = {
         ...toolPermissionContext,
@@ -544,7 +589,7 @@ export async function* runAgent({
     // Since these are background agents, waiting is fine — the user should
     // only be interrupted when automated checks can't resolve the permission.
     // This applies to bubble mode (always) and explicit canShowPermissionPrompts.
-    if (isAsync && !shouldAvoidPrompts) {
+    if (runsInBackground() && !shouldAvoidPrompts) {
       toolPermissionContext = {
         ...toolPermissionContext,
         awaitAutomatedChecksBeforeDialog: true,
@@ -752,15 +797,19 @@ export async function* runAgent({
       ? uniqBy([...resolvedTools, ...agentMcpTools], 'name')
       : resolvedTools
 
+  const backgroundTools = isBackgrounded && !useExactTools
+    ? filterToolsForAgent({ tools: allTools, isBuiltIn: isBuiltInAgent(agentDefinition), isAsync: true, permissionMode: agentDefinition.permissionMode })
+    : allTools
+
   // Build agent-specific options
   const agentOptions: ToolUseContext['options'] = {
-    isNonInteractiveSession: useExactTools
-      ? toolUseContext.options.isNonInteractiveSession
-      : isAsync
-        ? true
-        : (toolUseContext.options.isNonInteractiveSession ?? false),
+    get isNonInteractiveSession() {
+      return useExactTools
+        ? toolUseContext.options.isNonInteractiveSession
+        : runsInBackground() || (toolUseContext.options.isNonInteractiveSession ?? false)
+    },
     appendSystemPrompt: toolUseContext.options.appendSystemPrompt,
-    tools: allTools,
+    get tools() { return runsInBackground() ? backgroundTools : allTools },
     commands: [],
     debug: toolUseContext.options.debug,
     verbose: toolUseContext.options.verbose,
@@ -808,6 +857,15 @@ export async function* runAgent({
     contentReplacementState,
   })
 
+  if (isBackgrounded) {
+    const foregroundSetAppState = agentToolUseContext.setAppState
+    agentToolUseContext.setAppState = updater => {
+      if (!runsInBackground()) foregroundSetAppState(updater)
+    }
+    // query 会复制上下文，计数对象必须从启动起稳定，转后台不能丢失或污染父回合。
+    agentToolUseContext.localDenialTracking = createDenialTrackingState()
+  }
+
   // Preserve tool use results for subagents with viewable transcripts (in-process teammates)
   if (preserveToolUseResults) {
     agentToolUseContext.preserveToolUseResults = true
@@ -827,10 +885,12 @@ export async function* runAgent({
   // Record initial messages before the query loop starts, plus the agentType
   // so resume can route correctly when subagent_type is omitted. Both writes
   // are fire-and-forget — persistence failure shouldn't block the agent.
-  const initialTranscriptWrite = selectInitialTranscriptMessages(
-    initialMessages,
-    alreadyPersistedMessageCount,
-  )
+  const initialTranscriptWrite = recordedUuids
+    ? selectUnrecordedTranscriptMessages(initialMessages, recordedUuids)
+    : selectInitialTranscriptMessages(
+        initialMessages,
+        alreadyPersistedMessageCount,
+      )
   void recordSidechainTranscript(
     initialTranscriptWrite.messages,
     agentId,
@@ -838,6 +898,9 @@ export async function* runAgent({
   ).catch(_err =>
     logForDebugging(`Failed to record sidechain transcript: ${_err}`),
   )
+  for (const message of initialTranscriptWrite.messages) {
+    recordedUuids?.add(message.uuid)
+  }
   void writeAgentMetadata(agentId, {
     agentType: resolvePersistedAgentType(
       persistedAgentType,
@@ -849,6 +912,7 @@ export async function* runAgent({
     ...(spawningToolUseId && { toolUseId: spawningToolUseId }),
     ...(ownerAgentId && { ownerAgentId }),
     ...(workflow && { workflow }),
+    ...extraMetadata,
   }).catch(_err => logForDebugging(`Failed to write agent metadata: ${_err}`))
 
   // Track the last recorded message UUID for parent chain continuity
@@ -920,6 +984,7 @@ export async function* runAgent({
         ).catch(err =>
           logForDebugging(`Failed to record sidechain transcript: ${err}`),
         )
+        recordedUuids?.add(message.uuid)
         if (message.type !== 'progress') {
           lastRecordedUuid = message.uuid
         }

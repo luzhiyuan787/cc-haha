@@ -14,6 +14,7 @@ import {
   prepareSessionWorkspace,
 } from '../services/repositoryLaunchService.js'
 import { conversationService } from '../services/conversationService.js'
+import * as boundedSessionHistory from '../services/boundedSessionHistory.js'
 import { clearCommandsCache } from '../../commands.js'
 import { parseJSONL } from '../../utils/json.js'
 import { formatSessionCollaborationPrompt } from '../../utils/sessionCollaborationEnvelope.js'
@@ -576,6 +577,39 @@ describe('SessionService', () => {
     await expect(fs.access(collaborationTranscript)).resolves.toBeNull()
   })
 
+  it('keeps the live transcript when another project directory name reaches the same file', async () => {
+    // At system/init the CLI has not flushed the turn yet, so its own file is
+    // still metadata-only. Reaching it through a second directory name must not
+    // make it look like a stray placeholder.
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const transcript = await writeSessionFile('-tmp-worktree', sessionId, [
+      makeSnapshotEntry(),
+      { type: 'session-meta', isMeta: true, workDir: '/tmp/worktree', timestamp: '2026-01-01T00:00:00.000Z' },
+    ])
+    const aliasDir = path.join(tmpDir, 'projects', '-tmp-alias')
+    await fs.mkdir(aliasDir, { recursive: true })
+    await fs.link(transcript, path.join(aliasDir, `${sessionId}.jsonl`))
+
+    expect(await service.deletePlaceholderSessionFiles(sessionId, '/tmp/worktree')).toBe(0)
+    await expect(fs.access(transcript)).resolves.toBeNull()
+  })
+
+  it('keeps the live transcript when the project directory differs only by case on a case-insensitive file system', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    // Windows and default macOS volumes resolve both spellings to one folder;
+    // readdir reports the spelling it was created with.
+    const transcript = await writeSessionFile('-tmp-Worktree', sessionId, [
+      makeSnapshotEntry(),
+      { type: 'session-meta', isMeta: true, workDir: '/tmp/Worktree', timestamp: '2026-01-01T00:00:00.000Z' },
+    ])
+    const caseInsensitive = await fs.access(path.join(tmpDir, 'projects', '-tmp-worktree', `${sessionId}.jsonl`))
+      .then(() => true, () => false)
+    if (!caseInsensitive) return
+
+    expect(await service.deletePlaceholderSessionFiles(sessionId, '/tmp/worktree')).toBe(0)
+    await expect(fs.access(transcript)).resolves.toBeNull()
+  })
+
   it('prefers a transcript with an oversized turn over a newer metadata-only placeholder', async () => {
     const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
     const transcript = await writeSessionFile('-tmp-large-transcript', sessionId, [
@@ -584,6 +618,64 @@ describe('SessionService', () => {
     await writeSessionFile('-tmp-large-placeholder', sessionId, [makeSnapshotEntry()])
 
     expect((await service.findSessionFile(sessionId))?.filePath).toBe(transcript)
+  })
+
+  // Every session route resolves its file first. Reading the whole transcript
+  // here made each history page of a long session cost a full parse, so a
+  // 2,500-message session reopened in quadratic time.
+  describe('session file lookup cost', () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+
+    function countDeliveredRecords() {
+      const delivered = new Map<string, number>()
+      const original = boundedSessionHistory.streamBoundedHistory
+      const spy = spyOn(boundedSessionHistory, 'streamBoundedHistory').mockImplementation(
+        (filePath, onEntry, signal, options) => original(filePath, (...args) => {
+          delivered.set(filePath, (delivered.get(filePath) ?? 0) + 1)
+          onEntry(...args)
+        }, signal, options),
+      )
+      return { delivered, spy }
+    }
+
+    it('resolves a lone transcript without reading its records', async () => {
+      const transcript = await writeSessionFile('-tmp-lone', sessionId, [
+        makeSnapshotEntry(),
+        ...Array.from({ length: 50 }, (_, n) => makeUserEntry(`turn ${n}`)),
+      ])
+      const { delivered, spy } = countDeliveredRecords()
+      try {
+        expect((await service.findSessionFile(sessionId))?.filePath).toBe(transcript)
+        expect(delivered.size).toBe(0)
+      } finally { spy.mockRestore() }
+    })
+
+    it('stops reading a candidate at its first conversation record', async () => {
+      const transcript = await writeSessionFile('-tmp-long-worktree', sessionId, [
+        makeSnapshotEntry(),
+        makeUserEntry('first turn'),
+        ...Array.from({ length: 200 }, (_, n) => makeAssistantEntry(`reply ${n}`)),
+      ])
+      const placeholder = await writeSessionFile('-tmp-newer-placeholder', sessionId, [makeSnapshotEntry()])
+      const later = new Date(Date.now() + 60_000)
+      await fs.utimes(placeholder, later, later)
+      const { delivered, spy } = countDeliveredRecords()
+      try {
+        expect((await service.findSessionFile(sessionId))?.filePath).toBe(transcript)
+        expect(delivered.get(transcript)).toBe(2)
+        expect(delivered.get(placeholder)).toBe(1)
+      } finally { spy.mockRestore() }
+    })
+
+    it('still recognizes a conversation on a final line without a newline', async () => {
+      const transcript = await writeSessionFile('-tmp-unterminated', sessionId, [makeSnapshotEntry()])
+      await fs.appendFile(transcript, JSON.stringify(makeUserEntry('last turn')))
+      const placeholder = await writeSessionFile('-tmp-unterminated-placeholder', sessionId, [makeSnapshotEntry()])
+      const later = new Date(Date.now() + 60_000)
+      await fs.utimes(placeholder, later, later)
+
+      expect((await service.findSessionFile(sessionId))?.filePath).toBe(transcript)
+    })
   })
 
   it('should return empty list when no sessions exist', async () => {
@@ -5632,6 +5724,22 @@ describe('Sessions API', () => {
       content: 'export const answer = 2\n',
     })
 
+    const statQuery = new URLSearchParams()
+    for (const statPath of ['src/app.ts', 'out/missing.docx', '../escape.docx']) statQuery.append('path', statPath)
+    const statRes = await fetch(`${baseUrl}/api/sessions/${sessionId}/workspace/stat?${statQuery}`)
+    expect(statRes.status).toBe(200)
+    expect(await statRes.json()).toEqual({
+      files: [
+        { path: 'src/app.ts', state: 'file', mtimeMs: expect.any(Number) },
+        { path: 'out/missing.docx', state: 'missing' },
+        { path: '../escape.docx', state: 'unavailable' },
+      ],
+    })
+    expect((await fetch(`${baseUrl}/api/sessions/${sessionId}/workspace/stat`)).status).toBe(400)
+    const tooMany = new URLSearchParams()
+    for (let index = 0; index < 21; index += 1) tooMany.append('path', `out/${index}.docx`)
+    expect((await fetch(`${baseUrl}/api/sessions/${sessionId}/workspace/stat?${tooMany}`)).status).toBe(400)
+
     const imageRes = await fetch(
       `${baseUrl}/api/sessions/${sessionId}/workspace/file?path=${encodeURIComponent('assets/pixel.png')}`,
     )
@@ -6814,6 +6922,8 @@ describe('Sessions API', () => {
     }
 
     expect(body.checkpoints).toHaveLength(3)
+    // When each prompt was recorded: the client asks the disk for files written since.
+    const PROMPT_RECORDED_AT = Date.parse('2026-01-01T00:01:00.000Z')
     expect(body.checkpoints).toEqual([
       {
         target: {
@@ -6831,6 +6941,7 @@ describe('Sessions API', () => {
         workDir: fixture.workDir,
         restoreAvailable: true,
         unverifiedChangeSources: [],
+        startedAt: PROMPT_RECORDED_AT,
       },
       {
         target: {
@@ -6848,6 +6959,7 @@ describe('Sessions API', () => {
         workDir: fixture.workDir,
         restoreAvailable: true,
         unverifiedChangeSources: [],
+        startedAt: PROMPT_RECORDED_AT,
       },
       {
         target: {
@@ -6865,6 +6977,7 @@ describe('Sessions API', () => {
         workDir: fixture.workDir,
         restoreAvailable: true,
         unverifiedChangeSources: [],
+        startedAt: PROMPT_RECORDED_AT,
       },
     ])
   })

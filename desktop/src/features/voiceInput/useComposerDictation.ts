@@ -4,6 +4,7 @@ import { voiceApi } from '@/api/voice'
 import { useVoiceInputStore } from '@/stores/voiceInputStore'
 import type { MentionComposerHandle } from '@/components/chat/MentionComposer'
 import { getPreferredMicrophoneId } from './devicePreference'
+import { registerDictationTarget } from './shortcutController'
 import {
   normalizeDictationText,
   placeDictationResult,
@@ -39,6 +40,10 @@ type Run = {
   revisionAtStart: number
   point: InsertionPoint
   stopping: boolean
+  /** Send the draft once the text is written. Can be asked for until recognition ends. */
+  send: boolean
+  /** Asked to stop while the microphone was still opening (a short hold). */
+  stopWhenReady: boolean
 }
 
 type ComposerDictationOptions = {
@@ -49,6 +54,11 @@ type ComposerDictationOptions = {
   blocked: boolean
   /** Identifies what the composer is editing; a change abandons any dictation. */
   contextKey: string | null | undefined
+  /**
+   * Sends the draft through the composer's own submit path. Called after the
+   * render that carries the dictated text, so it reads the draft with it.
+   */
+  onSubmit?: () => void
 }
 
 /** Recordings shorter than this are a mis-tap, not speech. */
@@ -90,7 +100,7 @@ function issueFromError(error: unknown): DictationIssue {
  * Shared by both composers (ChatInput and EmptySession) so the write-back rules
  * cannot drift between them.
  */
-export function useComposerDictation({ composerRef, draft, blocked, contextKey }: ComposerDictationOptions) {
+export function useComposerDictation({ composerRef, draft, blocked, contextKey, onSubmit }: ComposerDictationOptions) {
   const providerId = useVoiceInputStore(state => state.catalog?.preferences.providerId)
   const language = useVoiceInputStore(state => state.catalog?.preferences.language)
   const maxSeconds = useVoiceInputStore(state => state.catalog?.limits.maxAudioSeconds)
@@ -99,6 +109,8 @@ export function useComposerDictation({ composerRef, draft, blocked, contextKey }
   const [issue, setIssue] = useState<DictationIssue | null>(null)
   const [pendingText, setPendingText] = useState<string | null>(null)
   const [startedAt, setStartedAt] = useState(0)
+  const [limitSeconds, setLimitSeconds] = useState(0)
+  const [sendRequested, setSendRequested] = useState(false)
 
   const activeRef = useRef<Run | null>(null)
   const draftRef = useRef(draft)
@@ -108,15 +120,24 @@ export function useComposerDictation({ composerRef, draft, blocked, contextKey }
   const composingRef = useRef(false)
   const pendingRef = useRef<string | null>(null)
   const previousContextRef = useRef(contextKey)
+  const onSubmitRef = useRef(onSubmit)
+  /** Dictated text was written for a send; submit once the draft carries it. */
+  const submitAfterWriteRef = useRef(false)
 
   blockedRef.current = blocked
   settingsRef.current = { providerId, language, maxSeconds }
+  onSubmitRef.current = onSubmit
 
   useEffect(() => {
     if (draftRef.current !== draft) {
       draftRef.current = draft
       revisionRef.current += 1
     }
+    // Submitting from `deliver` itself would send the draft as the parent last
+    // rendered it — without the text that was just written.
+    if (!submitAfterWriteRef.current) return
+    submitAfterWriteRef.current = false
+    onSubmitRef.current?.()
   }, [draft])
 
   const setPending = useCallback((text: string | null) => {
@@ -134,14 +155,25 @@ export function useComposerDictation({ composerRef, draft, blocked, contextKey }
     return { start: length, end: length }
   }, [composerRef])
 
-  const writeText = useCallback((text: string, point: InsertionPoint) => {
+  const writeText = useCallback((text: string, point: InsertionPoint): boolean => {
     const composer = composerRef.current
-    if (!composer) return
+    if (!composer) return false
     const current = draftRef.current
     const start = Math.min(point.start, current.length)
     const end = Math.min(Math.max(point.end, start), current.length)
-    composer.insertTextAtOffsets(start, end, withDictationSpacing(current.slice(0, start), text, current.slice(end)))
+    composer.insertTextAtOffsets(
+      start,
+      end,
+      withDictationSpacing(current.slice(0, start), text, current.slice(end)),
+      { flash: true },
+    )
+    return true
   }, [composerRef])
+
+  const settle = useCallback(() => {
+    setPhase('idle')
+    setSendRequested(false)
+  }, [])
 
   const cancel = useCallback(() => {
     const run = activeRef.current
@@ -150,8 +182,9 @@ export function useComposerDictation({ composerRef, draft, blocked, contextKey }
       run.controller.abort()
       run.recording?.cancel()
     }
-    setPhase('idle')
-  }, [])
+    submitAfterWriteRef.current = false
+    settle()
+  }, [settle])
 
   const abandon = useCallback(() => {
     cancel()
@@ -172,9 +205,11 @@ export function useComposerDictation({ composerRef, draft, blocked, contextKey }
       composing: composingRef.current,
     })
     if (placement === 'insert') {
-      writeText(text, run.point)
+      if (writeText(text, run.point) && run.send) submitAfterWriteRef.current = true
       return
     }
+    // Held text is never sent on its own: the draft changed, or cannot take
+    // text, so the user has to look at it first.
     setPending(text)
   }, [setPending, writeText])
 
@@ -184,7 +219,7 @@ export function useComposerDictation({ composerRef, draft, blocked, contextKey }
     setPhase('transcribing')
     const fail = (next: DictationIssue) => {
       activeRef.current = null
-      setPhase('idle')
+      settle()
       setIssue(next)
     }
     try {
@@ -206,7 +241,7 @@ export function useComposerDictation({ composerRef, draft, blocked, contextKey }
       })
       if (activeRef.current !== run) return
       activeRef.current = null
-      setPhase('idle')
+      settle()
       deliver(run, transcript.text)
     } catch (error) {
       if (activeRef.current !== run) return
@@ -216,7 +251,7 @@ export function useComposerDictation({ composerRef, draft, blocked, contextKey }
       if (next === 'notReady') void useVoiceInputStore.getState().loadCatalog({ force: true })
       fail(next)
     }
-  }, [deliver])
+  }, [deliver, settle])
 
   const start = useCallback(async () => {
     const settings = settingsRef.current
@@ -227,11 +262,15 @@ export function useComposerDictation({ composerRef, draft, blocked, contextKey }
       revisionAtStart: revisionRef.current,
       point: capturePoint(),
       stopping: false,
+      send: false,
+      stopWhenReady: false,
     }
     activeRef.current = run
+    submitAfterWriteRef.current = false
     // Starting over is a deliberate choice; the previous held text goes.
     setPending(null)
     setIssue(null)
+    setSendRequested(false)
     setPhase('starting')
 
     let recording: ActiveRecording
@@ -244,14 +283,14 @@ export function useComposerDictation({ composerRef, draft, blocked, contextKey }
         onInterrupted: (error) => {
           if (activeRef.current !== run) return
           activeRef.current = null
-          setPhase('idle')
+          settle()
           setIssue(issueFromRecorder(error.code))
         },
       })
     } catch (error) {
       if (activeRef.current !== run) return
       activeRef.current = null
-      setPhase('idle')
+      settle()
       setIssue(issueFromError(error))
       return
     }
@@ -262,8 +301,10 @@ export function useComposerDictation({ composerRef, draft, blocked, contextKey }
     }
     run.recording = recording
     setStartedAt(Date.now())
+    setLimitSeconds(settings.maxSeconds)
     setPhase('recording')
-  }, [capturePoint, finish, setPending])
+    if (run.stopWhenReady) void finish(run)
+  }, [capturePoint, finish, setPending, settle])
 
   const toggle = useCallback(() => {
     const run = activeRef.current
@@ -276,6 +317,26 @@ export function useComposerDictation({ composerRef, draft, blocked, contextKey }
     }
   }, [cancel, finish, start])
 
+  /** Ends the recording and transcribes it, as soon as there is one to end. */
+  const stop = useCallback(() => {
+    const run = activeRef.current
+    if (!run) return
+    if (run.recording) void finish(run)
+    else run.stopWhenReady = true
+  }, [finish])
+
+  /**
+   * Ends the recording and sends the draft once the text is in it. Also works
+   * while recognition is running, for a user who decides late.
+   */
+  const stopAndSend = useCallback(() => {
+    const run = activeRef.current
+    if (!run?.recording || run.send) return
+    run.send = true
+    setSendRequested(true)
+    void finish(run)
+  }, [finish])
+
   const insertPending = useCallback(() => {
     const text = pendingRef.current
     if (text === null || blockedRef.current) return
@@ -287,6 +348,8 @@ export function useComposerDictation({ composerRef, draft, blocked, contextKey }
   const dismissPending = useCallback(() => setPending(null), [setPending])
 
   const dismissIssue = useCallback(() => setIssue(null), [])
+
+  const focusComposer = useCallback(() => composerRef.current?.focus(), [composerRef])
 
   const onCompositionStart = useCallback(() => {
     composingRef.current = true
@@ -326,6 +389,22 @@ export function useComposerDictation({ composerRef, draft, blocked, contextKey }
 
   useEffect(() => abandon, [abandon])
 
+  // The keyboard shortcut records into a composer the user can see; a hidden
+  // one (contextKey null) is not a target.
+  const shortcutHandlersRef = useRef({ start, stop, cancel })
+  shortcutHandlersRef.current = { start, stop, cancel }
+  const listening = contextKey !== null && contextKey !== undefined
+  useEffect(() => {
+    if (!listening) return
+    return registerDictationTarget({
+      hasFocus: () => composerRef.current?.hasFocus() ?? false,
+      isActive: () => activeRef.current !== null,
+      start: () => { void shortcutHandlersRef.current.start() },
+      stop: () => shortcutHandlersRef.current.stop(),
+      cancel: () => shortcutHandlersRef.current.cancel(),
+    })
+  }, [composerRef, listening])
+
   const getLevel = useCallback(() => activeRef.current?.recording?.getLevel() ?? 0, [])
 
   return useMemo(() => ({
@@ -333,24 +412,32 @@ export function useComposerDictation({ composerRef, draft, blocked, contextKey }
     issue,
     pendingText,
     startedAt,
+    limitSeconds,
+    sendRequested,
     toggle,
+    stopAndSend,
     cancel,
     insertPending,
     dismissPending,
     dismissIssue,
     getLevel,
+    focusComposer,
     compositionHandlers: { onCompositionStart, onCompositionEnd },
   }), [
     phase,
     issue,
     pendingText,
     startedAt,
+    limitSeconds,
+    sendRequested,
     toggle,
+    stopAndSend,
     cancel,
     insertPending,
     dismissPending,
     dismissIssue,
     getLevel,
+    focusComposer,
     onCompositionStart,
     onCompositionEnd,
   ])

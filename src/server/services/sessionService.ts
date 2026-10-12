@@ -107,6 +107,7 @@ export type SessionListItem = {
   runtimeProviderId?: string | null
   runtimeModelId?: string
   effortLevel?: string
+  openAIFastMode?: boolean
 }
 
 export type SubagentTranscriptFragment = {
@@ -196,6 +197,7 @@ export type SessionLaunchInfo = {
   runtimeProviderId?: string | null
   runtimeModelId?: string
   effortLevel?: string
+  openAIFastMode?: boolean
 }
 
 type ProviderContextWindowHint = Pick<SessionLaunchInfo, 'runtimeProviderId' | 'runtimeModelId'>
@@ -639,6 +641,21 @@ function providerModelLooksRelated(
   ))
 }
 
+type FileIdentity = { dev: bigint, ino: bigint }
+
+async function statFileIdentity(filePath: string): Promise<FileIdentity | null> {
+  try {
+    const stat = await fs.stat(filePath, { bigint: true })
+    return { dev: stat.dev, ino: stat.ino }
+  } catch {
+    return null
+  }
+}
+
+function isSameFileIdentity(left: FileIdentity, right: FileIdentity | null): boolean {
+  return right !== null && left.dev === right.dev && left.ino === right.ino
+}
+
 // ============================================================================
 // Service
 // ============================================================================
@@ -725,6 +742,11 @@ export class SessionService {
     }>
   >()
   private readonly taskNotificationMutationEpochs = new Map<string, number>()
+
+  async drainForMigration(): Promise<void> {
+    const writes = [...this.pendingTaskNotificationWrites.values()].flatMap(entries => [...entries].map(entry => entry.promise))
+    await Promise.all(writes)
+  }
   private readonly clearingTaskNotificationSessions = new Set<string>()
 
   private readonly localIndexGateway: LocalIndexGateway
@@ -1073,6 +1095,7 @@ export class SessionService {
       runtimeProviderId?: string | null
       runtimeModelId?: string
       effortLevel?: string
+      openAIFastMode?: boolean
     },
   ): boolean {
     if (!launchInfo) return false
@@ -1102,6 +1125,9 @@ export class SessionService {
       return false
     }
     if (launchInfo.effortLevel !== resolveSessionEffortLevel(metadata, launchInfo.effortLevel)) {
+      return false
+    }
+    if (typeof metadata.openAIFastMode === 'boolean' && launchInfo.openAIFastMode !== metadata.openAIFastMode) {
       return false
     }
     return true
@@ -1352,6 +1378,7 @@ export class SessionService {
         permissionMode: undefined as string | undefined,
         runtimeProviderId: undefined as string | null | undefined,
         runtimeModelId: undefined as string | undefined, effortLevel: undefined as string | undefined,
+        openAIFastMode: undefined as boolean | undefined,
         customTitle: null as string | null, nonemptyCustomTitle: null as string | null,
         goalTitle: null as string | null, aiTitle: null as string | null, firstUserTitle: null as string | null,
         createdAt: null as string | null, modifiedAt: null as string | null,
@@ -1375,6 +1402,7 @@ export class SessionService {
           if (record.runtimeProviderId === null || typeof record.runtimeProviderId === 'string') state.runtimeProviderId = record.runtimeProviderId as string | null
           if (typeof record.runtimeModelId === 'string') state.runtimeModelId = record.runtimeModelId
           state.effortLevel = resolveSessionEffortLevel(record, state.effortLevel)
+          if (typeof record.openAIFastMode === 'boolean') state.openAIFastMode = record.openAIFastMode
         }
         state.repository = this.resolveRepositoryFromEntries([entry]) ?? state.repository
         const worktree = this.resolveWorktreeSessionFromEntries([entry])
@@ -1399,6 +1427,7 @@ export class SessionService {
         ...(state.runtimeProviderId !== undefined ? { runtimeProviderId: state.runtimeProviderId } : {}),
         ...(state.runtimeModelId ? { runtimeModelId: state.runtimeModelId } : {}),
         ...(state.effortLevel ? { effortLevel: state.effortLevel } : {}),
+        ...(state.openAIFastMode !== undefined ? { openAIFastMode: state.openAIFastMode } : {}),
         ...(state.repository ? { repository: state.repository } : {}),
         ...(state.worktreeSession !== undefined ? { worktreeSession: state.worktreeSession } : {}),
       })
@@ -1903,18 +1932,43 @@ export class SessionService {
   }
 
   private async fileHasConversationTranscript(filePath: string): Promise<boolean> {
-    let hasTranscript = false
-    const scan = await withHistoryReadBudget(undefined, () => streamBoundedHistory(
-      filePath,
-      entry => {
-        if (!hasTranscript && this.hasConversationTranscript([entry as RawEntry])) hasTranscript = true
-      },
-      undefined,
-      { maxRecordBytes: HISTORY_SEMANTIC_RECORD_BYTES },
-    ), 'metadata')
-    // An oversized record may be the only conversation turn. Prefer that
-    // transcript over a newer metadata-only placeholder until it can be read.
-    return hasTranscript || scan.oversizedRecords > 0
+    // The first conversation record settles the answer. Scanning on would make
+    // every session lookup cost a full parse of the transcript.
+    const found = new AbortController()
+    try {
+      const scan = await withHistoryReadBudget(undefined, () => streamBoundedHistory(
+        filePath,
+        entry => {
+          if (this.hasConversationTranscript([entry as RawEntry])) found.abort()
+        },
+        found.signal,
+        { maxRecordBytes: HISTORY_SEMANTIC_RECORD_BYTES },
+      ), 'metadata')
+      // An oversized record may be the only conversation turn. Prefer that
+      // transcript over a newer metadata-only placeholder until it can be read.
+      // A final line without a newline is reported after the last abort check.
+      return found.signal.aborted || scan.oversizedRecords > 0
+    } catch (error) {
+      if (found.signal.aborted && error === found.signal.reason) return true
+      throw error
+    }
+  }
+
+  /** Content is only needed to choose between several files for one session. */
+  private async rankSessionFileMatches<T extends { filePath: string; mtimeMs: number }>(
+    matches: T[],
+    onReadError: (error: unknown) => 'drop' | 'fail',
+  ): Promise<T[] | null> {
+    if (matches.length < 2) return matches
+    const ranked: Array<T & { hasTranscript: boolean }> = []
+    for (const match of matches) {
+      try {
+        ranked.push({ ...match, hasTranscript: await this.fileHasConversationTranscript(match.filePath) })
+      } catch (error) {
+        if (onReadError(error) === 'fail') return null
+      }
+    }
+    return ranked.sort((a, b) => Number(b.hasTranscript) - Number(a.hasTranscript) || b.mtimeMs - a.mtimeMs || a.filePath.localeCompare(b.filePath))
   }
 
   // --------------------------------------------------------------------------
@@ -2121,6 +2175,36 @@ export class SessionService {
       ...(outputFile ? { outputFile } : {}),
       ...(timestamp ? { timestamp } : {}),
     }
+  }
+
+  // A notification the CLI drains while a turn is running is recorded as a
+  // queued_command attachment instead of a user turn, and one that was queued
+  // but never delivered (e.g. the session exited first) only as a
+  // queue-operation. For a session the desktop never ran, these are the only
+  // records that the task finished.
+  private parseQueuedTaskNotification(
+    entry: RawEntry,
+  ): SessionTaskNotification | null {
+    if (entry.type === 'queue-operation') {
+      return this.parseTaskNotificationContent(entry.content, entry.timestamp)
+    }
+    if (entry.type !== 'attachment') return null
+    const attachment = entry.attachment
+    if (
+      !attachment ||
+      typeof attachment !== 'object' ||
+      Array.isArray(attachment)
+    ) {
+      return null
+    }
+    const record = attachment as Record<string, unknown>
+    if (
+      record.type !== 'queued_command' ||
+      record.commandMode === 'prompt'
+    ) {
+      return null
+    }
+    return this.parseTaskNotificationContent(record.prompt, entry.timestamp)
   }
 
   private parsePersistedTaskNotification(
@@ -2736,8 +2820,10 @@ export class SessionService {
           const projectsRoot = indexedMatches.length > 0
             ? await fs.realpath(this.getProjectsDir())
             : null
-          const hydratedMatches: Array<SessionFileMatch & { mtimeMs: number; hasTranscript: boolean }> = []
+          const hydratedMatches: Array<SessionFileMatch & { mtimeMs: number }> = []
           let hydrationFailed = false
+          const failUnlessMissing = (error: unknown) =>
+            (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'drop' as const : 'fail' as const
           for (const match of indexedMatches) {
             try {
               const stat = await this.validateIndexedTranscriptPath(
@@ -2746,26 +2832,24 @@ export class SessionService {
                 sessionId,
                 projectsRoot!,
               )
-              hydratedMatches.push({
-                ...match,
-                mtimeMs: stat.mtimeMs,
-                hasTranscript: await this.fileHasConversationTranscript(match.filePath),
-              })
+              hydratedMatches.push({ ...match, mtimeMs: stat.mtimeMs })
             } catch (error) {
-              if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+              if (failUnlessMissing(error) === 'fail') {
                 hydrationFailed = true
                 break
               }
             }
           }
+          const rankedMatches = hydrationFailed
+            ? null
+            : await this.rankSessionFileMatches(hydratedMatches, failUnlessMissing)
+          if (!rankedMatches) hydrationFailed = true
           if (
-            !hydrationFailed &&
-            hydratedMatches.length > 0 &&
+            rankedMatches &&
+            rankedMatches.length > 0 &&
             indexedMutationEpoch === getSharedSessionMutationState(this.localIndexGateway).epoch
           ) {
-            return hydratedMatches
-              .sort((a, b) => Number(b.hasTranscript) - Number(a.hasTranscript) || b.mtimeMs - a.mtimeMs || a.filePath.localeCompare(b.filePath))
-              .map(({ filePath, projectDir }) => ({ filePath, projectDir }))
+            return rankedMatches.map(({ filePath, projectDir }) => ({ filePath, projectDir }))
           }
           if (hydrationFailed) this.markIndexReadFailure()
         }
@@ -2791,25 +2875,19 @@ export class SessionService {
       return []
     }
 
-    const matches: Array<{ filePath: string; projectDir: string; mtimeMs: number; hasTranscript: boolean }> = []
+    const matches: Array<{ filePath: string; projectDir: string; mtimeMs: number }> = []
     for (const dir of projectDirs) {
       const filePath = path.join(projectsDir, dir, `${sessionId}.jsonl`)
       try {
         const stat = await fs.stat(filePath)
-        matches.push({
-          filePath,
-          projectDir: dir,
-          mtimeMs: stat.mtimeMs,
-          hasTranscript: await this.fileHasConversationTranscript(filePath),
-        })
+        matches.push({ filePath, projectDir: dir, mtimeMs: stat.mtimeMs })
       } catch {
         continue
       }
     }
 
-    return matches
-      .sort((a, b) => Number(b.hasTranscript) - Number(a.hasTranscript) || b.mtimeMs - a.mtimeMs || a.filePath.localeCompare(b.filePath))
-      .map(({ filePath, projectDir }) => ({ filePath, projectDir }))
+    const ranked = await this.rankSessionFileMatches(matches, () => 'drop')
+    return ranked!.map(({ filePath, projectDir }) => ({ filePath, projectDir }))
   }
 
   async findSessionFile(
@@ -3169,6 +3247,7 @@ export class SessionService {
     let runtimeProviderId: string | null | undefined
     let runtimeModelId: string | undefined
     let effortLevel: string | undefined
+    let openAIFastMode: boolean | undefined
     let customTitle: string | null = null
     let transcriptMessageCount = 0
     const metadata: TranscriptMetadataSnapshot = {}
@@ -3218,6 +3297,7 @@ export class SessionService {
           runtimeModelId = record.runtimeModelId
         }
         effortLevel = resolveSessionEffortLevel(record, effortLevel)
+        if (typeof record.openAIFastMode === 'boolean') openAIFastMode = record.openAIFastMode
       }
 
       const candidateRepository = (entry as Record<string, unknown>)?.repository
@@ -3350,6 +3430,7 @@ export class SessionService {
       ...(runtimeProviderId !== undefined ? { runtimeProviderId } : {}),
       ...(runtimeModelId ? { runtimeModelId } : {}),
       ...(effortLevel ? { effortLevel } : {}),
+      ...(openAIFastMode !== undefined ? { openAIFastMode } : {}),
     }
 
     for (const modelUsage of models.values()) {
@@ -3806,6 +3887,7 @@ export class SessionService {
         : {}),
       ...(row.runtimeModelId ? { runtimeModelId: row.runtimeModelId } : {}),
       ...(row.effortLevel ? { effortLevel: row.effortLevel } : {}),
+      ...(row.openAIFastMode !== undefined ? { openAIFastMode: row.openAIFastMode } : {}),
     }
   }
 
@@ -3829,6 +3911,7 @@ export class SessionService {
       'runtimeProviderId',
       'runtimeModelId',
       'effortLevel',
+      'openAIFastMode',
     ]
     const hash = (value: unknown): string => createHash('sha256')
       .update(JSON.stringify(value) ?? 'undefined')
@@ -3978,6 +4061,7 @@ export class SessionService {
             : {}),
           ...(summary.runtimeModelId ? { runtimeModelId: summary.runtimeModelId } : {}),
           ...(summary.effortLevel ? { effortLevel: summary.effortLevel } : {}),
+          ...(summary.openAIFastMode !== undefined ? { openAIFastMode: summary.openAIFastMode } : {}),
         })
       } catch {
         // Skip unreadable files
@@ -4927,6 +5011,7 @@ export class SessionService {
       runtimeProviderId?: string | null
       runtimeModelId?: string
       effortLevel?: string
+      openAIFastMode?: boolean
     }
   ): Promise<void> {
     if (isSideChatId(sessionId)) {
@@ -4934,6 +5019,7 @@ export class SessionService {
       if (side && !side.closed) {
         Object.assign(side.launchInfo, metadata, {
           effortLevel: resolveSessionEffortLevel(metadata, side.launchInfo.effortLevel),
+          openAIFastMode: typeof metadata.openAIFastMode === 'boolean' ? metadata.openAIFastMode : side.launchInfo.openAIFastMode,
         })
       }
       return
@@ -4961,6 +5047,7 @@ export class SessionService {
         ...(metadata.runtimeProviderId !== undefined ? { runtimeProviderId: metadata.runtimeProviderId } : {}),
         ...(metadata.runtimeModelId ? { runtimeModelId: metadata.runtimeModelId } : {}),
         effortLevel: resolveSessionEffortLevel(metadata, previousInfo.effortLevel),
+        openAIFastMode: typeof metadata.openAIFastMode === 'boolean' ? metadata.openAIFastMode : previousInfo.openAIFastMode,
       })
     }
     if (!persist || !this.shouldPersistSession()) {
@@ -5046,6 +5133,7 @@ export class SessionService {
       ...(metadata.effortLevel && VALID_SESSION_EFFORT_LEVELS.has(metadata.effortLevel)
         ? { effortLevel: metadata.effortLevel }
         : {}),
+      ...(typeof metadata.openAIFastMode === 'boolean' ? { openAIFastMode: metadata.openAIFastMode } : {}),
       timestamp: new Date().toISOString(),
     })
 
@@ -5076,6 +5164,11 @@ export class SessionService {
     }
 
     const keepProjectDir = this.sanitizePath(normalizeDriveRootPathForPlatform(keepWorkDir))
+    // Windows and default macOS volumes are case-insensitive: `D--repo` and
+    // `d--repo` are one folder, and readdir reports whichever spelling created
+    // it. Compare file identity so the CLI's own transcript, still metadata-only
+    // when init arrives, is never mistaken for a stray placeholder.
+    const keepFile = await statFileIdentity(path.join(projectsDir, keepProjectDir, `${sessionId}.jsonl`))
     let removed = 0
     for (const projectDir of projectDirs) {
       if (!projectDir.isDirectory()) continue
@@ -5085,6 +5178,7 @@ export class SessionService {
       if (entries.length === 0) continue
 
       if (this.hasConversationTranscript(entries)) continue
+      if (keepFile && isSameFileIdentity(keepFile, await statFileIdentity(filePath))) continue
 
       await fs.rm(filePath, { force: true })
       removed += 1
@@ -5339,7 +5433,7 @@ export class SessionService {
 
     const entries = await this.readTargetedJsonlEntries(
       found,
-      ['user', PERSISTED_TASK_NOTIFICATION_ENTRY_TYPE],
+      ['user', 'attachment', 'queue-operation', PERSISTED_TASK_NOTIFICATION_ENTRY_TYPE],
     ) ?? await this.readJsonlFile(found.filePath)
     return this.taskNotificationsFromEntries(entries)
   }
@@ -5353,7 +5447,7 @@ export class SessionService {
         ? this.parsePersistedTaskNotification(entry.taskNotification, entry.timestamp)
         : entry.message?.role === 'user'
           ? this.parseTaskNotificationContent(entry.message.content, entry.timestamp)
-          : null
+          : this.parseQueuedTaskNotification(entry)
       if (notification) {
         notifications.set(sessionTaskNotificationIdentity(notification), notification)
       }

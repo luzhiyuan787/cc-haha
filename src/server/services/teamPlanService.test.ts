@@ -1,9 +1,10 @@
-import { afterEach, beforeEach, expect, test } from 'bun:test'
+import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { TeamPlanService } from './teamPlanService.js'
 import { approveTeamPlan, ensureTeamDraft, readTeamPlan, replaceTeamPlan, stageMember, submitTeamPlan } from '../../utils/swarm/teamPlanStore.js'
+import * as teamPlanStore from '../../utils/swarm/teamPlanStore.js'
 import { writeTeamFileAsync } from '../../utils/swarm/teamHelpers.js'
 import type { TeamPlanRecord } from '../../shared/teamPlan.js'
 const saved = { home: process.env.HOME, config: process.env.CLAUDE_CONFIG_DIR }
@@ -54,6 +55,29 @@ test('approval launches once and returns frozen selected runtime to executor', a
   release()
   expect((await settle('running')).launch?.memberIds).toEqual({ worker: 'child-1' })
 })
+test('a plan read while the approval is committing does not orphan the launch', async () => {
+  let launches = 0
+  const service = new TeamPlanService({ validate: async item => item, launch: async () => {
+    launches++
+    return { memberIds: { worker: 'child-1' } }
+  }, stop: async () => {} })
+  const plan = await ready()
+  const commit = teamPlanStore.approveTeamPlan
+  // The UI polls the plan while the approval runs: this read lands after the
+  // plan already says `launching` but before the launch is registered.
+  const approval = spyOn(teamPlanStore, 'approveTeamPlan').mockImplementation(async (...args: Parameters<typeof commit>) => {
+    const result = await commit(...args)
+    await service.getForSession('session')
+    return result
+  })
+  try {
+    expect((await service.approve('review', identity(plan))).state).toBe('launching')
+  } finally {
+    approval.mockRestore()
+  }
+  expect((await settle('running')).launch?.memberIds).toEqual({ worker: 'child-1' })
+  expect(launches).toBe(1)
+})
 test('validation failure starts no process; launch failure requires explicit review retry', async () => {
   let calls = 0
   const plan = await ready()
@@ -66,6 +90,37 @@ test('validation failure starts no process; launch failure requires explicit rev
   const failed = await settle('launch_failed')
   expect(failed.launch?.error).toBe('fixture launch failed')
   expect((await service.action('review', 'retry', identity(failed))).state).toBe('review_pending')
+})
+test('approving after an app restart starts the disconnected lead before launching', async () => {
+  // The real launch refuses a lead without a process ("Team leader must be
+  // connected before launching"); after a restart nothing had started it.
+  let leaderConnected = false
+  const started: string[] = []
+  const service = new TeamPlanService({ validate: async item => item, launch: async () => {
+    if (!leaderConnected) throw new Error('Team leader must be connected before launching')
+    return { memberIds: { worker: 'child-1' } }
+  }, stop: async () => {} })
+  const startLeader = async (sessionId: string) => { started.push(sessionId); leaderConnected = true }
+  const plan = await ready()
+  expect((await service.approve('review', identity(plan), { startLeader })).state).toBe('launching')
+  expect((await settle('running')).launch?.memberIds).toEqual({ worker: 'child-1' })
+  // A replayed approval is already launching: it starts no second lead.
+  await service.approve('review', identity(plan), { startLeader })
+  expect(started).toEqual(['session'])
+})
+test('a lead that cannot start leaves the plan reviewable and launches nothing', async () => {
+  let launches = 0
+  const service = new TeamPlanService({ validate: async item => item, launch: async () => { launches++; return { memberIds: {} } }, stop: async () => {} })
+  const plan = await ready()
+  await expect(service.approve('review', identity(plan), { startLeader: async () => { throw new Error('CLI runtime crashed during startup (code 3)') } }))
+    .rejects.toThrow('Team leader could not start: CLI runtime crashed during startup (code 3)')
+  expect(launches).toBe(0)
+  const pending = await readTeamPlan('review')
+  expect(pending?.state).toBe('review_pending')
+  // Once the lead can start, the same reviewed plan approves without a retry step.
+  expect((await service.approve('review', identity(pending!), { startLeader: async () => {} })).state).toBe('launching')
+  await settle('running')
+  expect(launches).toBe(1)
 })
 test('cold server observes durable pending launch as interrupted instead of replaying', async () => {
   const plan = await ready()
@@ -134,4 +189,28 @@ test('launch transitions preserve future persisted launch metadata', async () =>
   const interrupted = await cold.getForSession('session')
   expect(interrupted?.launch?.futureLaunch).toEqual({ retained: true })
   expect(interrupted?.state).toBe('interrupted')
+})
+
+test('a running team whose owner was lost is re-owned instead of being marked interrupted', async () => {
+  const plan = await ready()
+  const service = new TeamPlanService({ validate: async item => item, launch: async () => ({ memberIds: { worker: 'fixture-child' } }), stop: async () => {} })
+  await service.approve('review', identity(plan))
+  await settle('running')
+  let owned = false
+  const rehydrated: string[] = []
+  const restarted = new TeamPlanService({
+    validate: async item => item, launch: async () => ({ memberIds: {} }), stop: async () => {},
+    isRunning: () => owned,
+    rehydrate: async item => { rehydrated.push(item.planId); owned = true; return true },
+  })
+  expect((await restarted.getForSession('session'))?.state).toBe('running')
+  expect(rehydrated).toHaveLength(1)
+  expect((await readTeamPlan('review'))?.state).toBe('running')
+
+  owned = false
+  const unrecoverable = new TeamPlanService({
+    validate: async item => item, launch: async () => ({ memberIds: {} }), stop: async () => {},
+    isRunning: () => false, rehydrate: async () => false,
+  })
+  expect((await unrecoverable.getForSession('session'))?.state).toBe('interrupted')
 })

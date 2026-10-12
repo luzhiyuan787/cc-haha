@@ -1,5 +1,6 @@
 import type { PermissionMode } from './settings'
 import type { RuntimeSelection } from './runtime'
+import type { TeamMemberActivity, TeamMemberAutoRetry } from './team'
 
 // Source: src/server/ws/events.ts
 
@@ -135,13 +136,21 @@ export type ServerMessage =
   | { type: 'message_complete'; usage: TokenUsage; timing?: TurnTiming }
   /** `complete` marks a whole thinking block; without it `text` is a stream fragment. */
   | { type: 'thinking'; text: string; complete?: boolean }
-  | { type: 'status'; state: ChatState; verb?: string; attemptStart?: boolean }
+  | {
+      type: 'status'
+      state: ChatState
+      verb?: string
+      attemptStart?: boolean
+      /** Re-sent about once a second while a compaction summary streams; absent on the first `compacting` status. */
+      compactProgress?: CompactProgress
+    }
   | {
       type: 'runtime_config_applied'
       providerId: string | null
       modelId: string
       effortLevel?: string
-      requestedConfig?: { providerId: string | null; modelId: string; effortLevel?: string }
+      openAIFastMode?: boolean
+      requestedConfig?: { providerId: string | null; modelId: string; effortLevel?: string; openAIFastMode?: boolean }
     }
   // CLI 回传的权限模式变化（如 ExitPlanMode 退出 plan 后恢复、Shift+Tab）。
   // 桌面端据此把选择器校正回 CLI 的真实权限，避免本地影子值漂移。
@@ -168,6 +177,11 @@ export type ServerMessage =
   | { type: 'team_deleted'; teamName: string; incarnationId?: string; leadSessionId?: string; createdAt?: number }
   | { type: 'task_update'; taskId: string; status: string; progress?: string }
   | { type: 'session_title_updated'; sessionId: string; title: string }
+
+export type CompactProgress = {
+  /** Cumulative summary characters for the current compaction attempt; restarts from 0 on a CLI retry. */
+  outputChars: number
+}
 
 export type AgentRunStreamMessage =
   | { type: 'content_start'; blockType: 'text' | 'tool_use'; toolName?: string; toolUseId?: string; originalToolUseId?: string; parentToolUseId?: string }
@@ -223,8 +237,12 @@ export type TeamMemberStatus = {
    * Omitted when the watcher cannot tell from the roster alone, so a receiver
    * keeps whatever the last full team read established.
    */
-  activity?: 'active' | 'idle' | 'exited' | 'unknown'
+  activity?: TeamMemberActivity
   currentTask?: string
+  /** Why the last turn failed; `null` says the member has recovered. */
+  lastError?: string | null
+  /** A pending automatic continuation; `null` once it has settled. */
+  autoRetry?: TeamMemberAutoRetry | null
 }
 
 export type ComputerUseGrantFlags = {
@@ -378,6 +396,8 @@ export type UIMessage =
       trigger?: 'manual' | 'auto'
       preTokens?: number
       messagesSummarized?: number
+      /** Summary characters generated so far; only meaningful while `phase` is `compacting`. */
+      outputChars?: number
       timestamp: number
     }
   | {

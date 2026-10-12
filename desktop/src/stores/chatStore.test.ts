@@ -10,6 +10,7 @@ import {
   hasVisibleSessionActivity,
 } from '../components/activity/sessionActivityModel'
 import { useSessionRuntimeStore } from './sessionRuntimeStore'
+import { hasRunningBackgroundTasks } from '../lib/backgroundTasks'
 import { registerSideChatSession, unregisterSideChatSession } from '../lib/sideChatSessions'
 
 const {
@@ -25,6 +26,7 @@ const {
   fetchSessionTasksMock,
   clearTasksMock,
   setTasksFromTodosMock,
+  restoreTasksMock,
   markCompletedAndDismissedMock,
   resetCompletedTasksMock,
   refreshTasksMock,
@@ -54,6 +56,7 @@ const {
   fetchSessionTasksMock: vi.fn(),
   clearTasksMock: vi.fn(),
   setTasksFromTodosMock: vi.fn(),
+  restoreTasksMock: vi.fn(),
   markCompletedAndDismissedMock: vi.fn(),
   resetCompletedTasksMock: vi.fn(async () => {}),
   refreshTasksMock: vi.fn(),
@@ -172,8 +175,11 @@ vi.mock('./cliTaskStore', () => ({
       fetchSessionTasks: fetchSessionTasksMock,
       tasks: cliTaskStoreSnapshot.tasks,
       sessionId: cliTaskStoreSnapshot.sessionId,
+      completedAndDismissed: false,
+      dismissedCompletionKey: null,
       clearTasks: clearTasksMock,
       setTasksFromTodos: setTasksFromTodosMock,
+      restoreTasks: restoreTasksMock,
       markCompletedAndDismissed: markCompletedAndDismissedMock,
       resetCompletedTasks: resetCompletedTasksMock,
       refreshTasks: refreshTasksMock,
@@ -541,6 +547,7 @@ describe('chatStore history mapping', () => {
     fetchSessionTasksMock.mockReset()
     clearTasksMock.mockReset()
     setTasksFromTodosMock.mockReset()
+    restoreTasksMock.mockReset()
     markCompletedAndDismissedMock.mockReset()
     resetCompletedTasksMock.mockReset()
     refreshTasksMock.mockReset()
@@ -1781,6 +1788,90 @@ describe('chatStore history mapping', () => {
       .toBeUndefined()
   })
 
+  it.each(['Bash:0', 'root-shell-task'])(
+    'restores a stopped shell on cold load with terminal toolUseId %s',
+    async (toolUseId) => {
+      vi.mocked(sessionsApi.getFullHistory).mockResolvedValueOnce({
+        messages: [
+          {
+            id: 'root-shell-use',
+            type: 'assistant',
+            timestamp: '2026-04-06T00:00:00.000Z',
+            content: [{
+              type: 'tool_use',
+              id: 'Bash:0',
+              name: 'Bash',
+              input: { command: 'bun test', run_in_background: true },
+            }],
+          },
+          {
+            id: 'root-shell-result',
+            type: 'tool_result',
+            timestamp: '2026-04-06T00:00:01.000Z',
+            content: [{
+              type: 'tool_result',
+              tool_use_id: 'Bash:0',
+              content: 'Command running in background with ID: root-shell-task',
+            }],
+          },
+        ],
+        taskNotifications: [
+          {
+            taskId: 'root-shell-task',
+            toolUseId,
+            status: 'stopped',
+            summary: 'Background task stopped',
+            timestamp: '2026-04-06T00:00:02.000Z',
+          },
+          {
+            taskId: 'root-shell-task',
+            toolUseId: 'unrelated-shell-tool',
+            status: 'failed',
+            summary: 'A task ID match must not override an unrelated real tool anchor',
+            timestamp: '2026-04-06T00:00:03.000Z',
+          },
+          {
+            taskId: 'root-shell-task',
+            toolUseId: 'root-shell-task',
+            ownerAgentId: 'child-agent',
+            status: 'failed',
+            summary: 'An owned child notification must not replace the root outcome',
+            timestamp: '2026-04-06T00:00:03.000Z',
+          },
+          {
+            taskId: 'unjoined-child-task',
+            toolUseId: 'unjoined-child-task',
+            status: 'stopped',
+            summary: 'An unowned task with no root transcript anchor must stay excluded',
+          },
+        ],
+      })
+      useChatStore.setState({
+        sessions: {
+          [TEST_SESSION_ID]: makeSession({ messages: [] }),
+        },
+      })
+
+      await useChatStore.getState().loadHistory(TEST_SESSION_ID)
+
+      const session = useChatStore.getState().sessions[TEST_SESSION_ID]
+      expect(session?.backgroundAgentTasks?.['root-shell-task']).toMatchObject({
+        taskId: 'root-shell-task',
+        toolUseId: 'Bash:0',
+        status: 'stopped',
+        summary: 'Background task stopped',
+      })
+      expect(session?.agentTaskNotifications?.['Bash:0']).toMatchObject({
+        taskId: 'root-shell-task',
+        toolUseId: 'Bash:0',
+        status: 'stopped',
+      })
+      expect(session?.agentTaskNotifications?.['root-shell-task']).toBeUndefined()
+      expect(session?.agentTaskNotifications?.['unrelated-shell-tool']).toBeUndefined()
+      expect(session?.backgroundAgentTasks?.['unjoined-child-task']).toBeUndefined()
+    },
+  )
+
   it('does not assign an unjoined child notification to the root run', async () => {
     vi.mocked(sessionsApi.getFullHistory).mockResolvedValueOnce({
       messages: [{
@@ -2149,6 +2240,134 @@ describe('chatStore history mapping', () => {
       }
     },
   )
+
+  it('drops the tool calls a retried stream attempt finished streaming but never ran', () => {
+    const send = (message: ServerMessage) =>
+      useChatStore.getState().handleServerMessage(TEST_SESSION_ID, message)
+    const planBeforeAttempt = [{ id: '1', subject: 'Earlier plan', status: 'in_progress' }]
+    cliTaskStoreSnapshot.sessionId = TEST_SESSION_ID
+    cliTaskStoreSnapshot.tasks = planBeforeAttempt
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          chatState: 'thinking',
+          messages: [
+            { id: 'user-1', type: 'user_text', content: 'Fix the build', timestamp: 1 },
+            {
+              id: 'earlier-read',
+              type: 'tool_use',
+              toolName: 'Read',
+              toolUseId: 'toolu_earlier_read',
+              input: { file_path: 'build.log' },
+              timestamp: 2,
+              isPending: false,
+            },
+            {
+              id: 'earlier-read-result',
+              type: 'tool_result',
+              toolUseId: 'toolu_earlier_read',
+              content: 'error TS2322',
+              isError: false,
+              timestamp: 3,
+            },
+            // From an earlier turn, before this attempt: never this retry's to drop.
+            {
+              id: 'earlier-unresolved',
+              type: 'tool_use',
+              toolName: 'Bash',
+              toolUseId: 'toolu_earlier_unresolved',
+              input: { command: 'ls' },
+              timestamp: 4,
+              isPending: false,
+            },
+          ],
+        }),
+      },
+    })
+
+    send({ type: 'status', state: 'thinking', attemptStart: true })
+    // The server completes a call at its block stop, before message_stop.
+    send({ type: 'content_start', blockType: 'tool_use', toolName: 'TodoWrite', toolUseId: 'toolu_ghost_todo' })
+    send({
+      type: 'tool_use_complete',
+      toolName: 'TodoWrite',
+      toolUseId: 'toolu_ghost_todo',
+      input: { todos: [{ content: 'Plan from the discarded attempt', status: 'in_progress' }] },
+    })
+    send({ type: 'content_start', blockType: 'tool_use', toolName: 'Bash', toolUseId: 'toolu_ghost_bash' })
+    send({
+      type: 'tool_use_complete',
+      toolName: 'Bash',
+      toolUseId: 'toolu_ghost_bash',
+      input: { command: 'npm run build' },
+    })
+    // A call that did run keeps its card, as does a sub-agent's call still
+    // running in the same window: only the root request is being retried.
+    send({ type: 'tool_use_complete', toolName: 'Grep', toolUseId: 'toolu_ran', input: { pattern: 'TS2322' } })
+    send({ type: 'tool_result', toolUseId: 'toolu_ran', content: 'src/a.ts', isError: false })
+    send({
+      type: 'tool_use_complete',
+      toolName: 'Read',
+      toolUseId: 'toolu_agent/toolu_child',
+      input: { file_path: 'src/a.ts' },
+      parentToolUseId: 'toolu_agent',
+    })
+    send({ type: 'content_start', blockType: 'tool_use', toolName: 'Edit', toolUseId: 'toolu_partial' })
+
+    send({ type: 'streaming_fallback', cause: 'stream_retry' })
+
+    const session = useChatStore.getState().sessions[TEST_SESSION_ID]
+    const toolCards = session?.messages
+      .filter((message): message is Extract<UIMessage, { type: 'tool_use' }> => message.type === 'tool_use')
+      .map((message) => message.toolUseId)
+    expect(toolCards).toEqual([
+      'toolu_earlier_read',
+      'toolu_earlier_unresolved',
+      'toolu_ran',
+      'toolu_agent/toolu_child',
+    ])
+    expect(session?.messages.filter((message) => message.type === 'tool_result')).toHaveLength(2)
+    expect(session?.chatState).toBe('thinking')
+    // The plan the discarded TodoWrite showed early is taken back.
+    expect(setTasksFromTodosMock).toHaveBeenCalledTimes(1)
+    expect(restoreTasksMock).toHaveBeenCalledWith({
+      sessionId: TEST_SESSION_ID,
+      tasks: planBeforeAttempt,
+      completedAndDismissed: false,
+      dismissedCompletionKey: null,
+    })
+  })
+
+  it('keeps a TodoWrite that ran when a later stream attempt is retried', () => {
+    const send = (message: ServerMessage) =>
+      useChatStore.getState().handleServerMessage(TEST_SESSION_ID, message)
+    cliTaskStoreSnapshot.sessionId = TEST_SESSION_ID
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          chatState: 'thinking',
+          messages: [{ id: 'user-1', type: 'user_text', content: 'Plan the work', timestamp: 1 }],
+        }),
+      },
+    })
+
+    send({ type: 'status', state: 'thinking', attemptStart: true })
+    send({
+      type: 'tool_use_complete',
+      toolName: 'TodoWrite',
+      toolUseId: 'toolu_plan',
+      input: { todos: [{ content: 'Committed plan', status: 'in_progress' }] },
+    })
+    send({ type: 'tool_result', toolUseId: 'toolu_plan', content: 'Todos have been modified', isError: false })
+    send({ type: 'status', state: 'thinking', attemptStart: true })
+    send({ type: 'streaming_fallback', cause: 'stream_retry' })
+
+    expect(restoreTasksMock).not.toHaveBeenCalled()
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]?.messages
+      .filter((message) => message.type === 'tool_use')
+      .map((message) => message.type === 'tool_use' ? message.toolUseId : ''))
+      .toEqual(['toolu_plan'])
+  })
 
   it('treats the first history load as cold when a live task arrived before it started', async () => {
     const sessionId = 'cold-live-before-load'
@@ -4026,6 +4245,85 @@ describe('chatStore history mapping', () => {
     })
   })
 
+  it('restores a background shell stopped by TaskStop when no notification was recorded', () => {
+    const shellStart = (toolUseId: string, taskId: string, minute: number): MessageEntry[] => [
+      {
+        id: `${toolUseId}-use`,
+        type: 'assistant',
+        timestamp: `2026-04-06T00:0${minute}:00.000Z`,
+        content: [{
+          type: 'tool_use',
+          id: toolUseId,
+          name: 'Bash',
+          input: { command: 'bun run dev', description: `Start ${taskId}`, run_in_background: true },
+        }],
+      },
+      {
+        id: `${toolUseId}-result`,
+        type: 'tool_result',
+        timestamp: `2026-04-06T00:0${minute}:01.000Z`,
+        content: [{
+          type: 'tool_result',
+          tool_use_id: toolUseId,
+          content: `Command running in background with ID: ${taskId}. Output is being written to: /tmp/${taskId}.output`,
+        }],
+      },
+    ]
+    const taskStop = (
+      toolUseId: string,
+      taskId: string,
+      minute: number,
+      isError = false,
+    ): MessageEntry[] => [
+      {
+        id: `${toolUseId}-use`,
+        type: 'assistant',
+        timestamp: `2026-04-06T00:0${minute}:00.000Z`,
+        content: [{ type: 'tool_use', id: toolUseId, name: 'TaskStop', input: { task_id: taskId } }],
+      },
+      {
+        id: `${toolUseId}-result`,
+        type: 'tool_result',
+        timestamp: `2026-04-06T00:0${minute}:01.000Z`,
+        content: [{
+          type: 'tool_result',
+          tool_use_id: toolUseId,
+          // The CLI records the stop as a JSON string and leaves no task-notification.
+          content: isError
+            ? 'No task found with ID: ' + taskId
+            : JSON.stringify({
+              message: `Successfully stopped task: ${taskId} (bun run dev)`,
+              task_id: taskId,
+              task_type: 'local_bash',
+              command: 'bun run dev',
+            }),
+          ...(isError ? { is_error: true } : {}),
+        }],
+      },
+    ]
+
+    const restored = reconstructRunActivityFromTranscript([
+      ...shellStart('shell-tool-stopped', 'stopped-task', 0),
+      ...shellStart('shell-tool-live', 'live-task', 1),
+      ...taskStop('stop-tool-1', 'stopped-task', 2),
+      ...taskStop('stop-tool-2', 'live-task', 3, true),
+      ...taskStop('stop-tool-3', 'unknown-task', 4),
+    ])
+
+    expect(restored.backgroundAgentTasks['stopped-task']).toMatchObject({
+      taskId: 'stopped-task',
+      toolUseId: 'shell-tool-stopped',
+      status: 'stopped',
+      description: 'Start stopped-task',
+      taskType: 'local_bash',
+    })
+    expect(restored.backgroundAgentTasks['live-task']?.status).toBe('running')
+    expect(restored.backgroundAgentTasks['unknown-task']).toBeUndefined()
+    expect(hasRunningBackgroundTasks({
+      'stopped-task': restored.backgroundAgentTasks['stopped-task']!,
+    })).toBe(false)
+  })
+
   it('recognizes manually backgrounded PowerShell from structured tool output', () => {
     const restored = reconstructRunActivityFromTranscript([
       {
@@ -5487,6 +5785,22 @@ describe('chatStore history mapping', () => {
       ],
       [TEST_SESSION_ID, { type: 'prewarm_session' }],
     ])
+  })
+
+  it('replays OAuth Fast and confirms both enabling and disabling without treating the old ack as current', () => {
+    const enabled = { providerId: 'openai-official', modelId: 'gpt-6-sol', effortLevel: 'high' as const, openAIFastMode: true }
+    useSessionRuntimeStore.getState().setSelection(TEST_SESSION_ID, enabled)
+    useChatStore.getState().connectToSession(TEST_SESSION_ID, { prewarm: false, minimalBootstrap: true })
+    expect(sendMock).toHaveBeenCalledWith(TEST_SESSION_ID, { type: 'set_runtime_config', ...enabled })
+
+    const disabled = { ...enabled, openAIFastMode: false }
+    useSessionRuntimeStore.getState().setSelection(TEST_SESSION_ID, disabled)
+    useChatStore.getState().setSessionRuntime(TEST_SESSION_ID, disabled)
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, { type: 'runtime_config_applied', ...enabled })
+    expect(useSessionRuntimeStore.getState().selections[TEST_SESSION_ID]).toEqual(disabled)
+    useChatStore.getState().handleServerMessage(TEST_SESSION_ID, { type: 'runtime_config_applied', ...disabled })
+    expect(useSessionRuntimeStore.getState().selections[TEST_SESSION_ID]).toEqual(disabled)
+    expect(sendMock).toHaveBeenLastCalledWith(TEST_SESSION_ID, { type: 'set_runtime_config', ...disabled })
   })
 
   it.each(['reconnect', 'send'] as const)('recovers a removed provider before %s without replaying its stale model or effort', (action) => {
@@ -12135,6 +12449,68 @@ describe('chatStore history mapping', () => {
     expect(updateTabStatusMock).toHaveBeenLastCalledWith(TEST_SESSION_ID, 'running')
   })
 
+  it('carries live compaction progress on the tail divider without losing its start time', () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(1_000_000)
+      useChatStore.setState({
+        sessions: {
+          [TEST_SESSION_ID]: makeSession({
+            chatState: 'thinking',
+            messages: [{ id: 'old-user', type: 'user_text', content: 'old context', timestamp: 1 }],
+          }),
+        },
+      })
+      const store = useChatStore.getState()
+      const tailDivider = () => {
+        const messages = useChatStore.getState().sessions[TEST_SESSION_ID]?.messages ?? []
+        const dividers = messages.filter((message) => message.type === 'compact_summary')
+        expect(dividers).toHaveLength(messages.length - 1)
+        return messages[messages.length - 1]
+      }
+
+      store.handleServerMessage(TEST_SESSION_ID, { type: 'status', state: 'compacting', verb: 'Compacting conversation' })
+      expect(tailDivider()).toEqual(expect.objectContaining({ type: 'compact_summary', phase: 'compacting', timestamp: 1_000_000 }))
+      expect(tailDivider()).not.toHaveProperty('outputChars')
+
+      vi.setSystemTime(1_005_000)
+      store.handleServerMessage(TEST_SESSION_ID, {
+        type: 'status', state: 'compacting', verb: 'Compacting conversation', compactProgress: { outputChars: 1_200 },
+      })
+      expect(tailDivider()).toMatchObject({ phase: 'compacting', outputChars: 1_200, timestamp: 1_000_000 })
+
+      // The 30s CLI keep-alive re-sends a bare compacting status; it must not
+      // wipe the progress already shown.
+      vi.setSystemTime(1_030_000)
+      store.handleServerMessage(TEST_SESSION_ID, { type: 'status', state: 'compacting', verb: 'Compacting conversation' })
+      expect(tailDivider()).toMatchObject({ phase: 'compacting', outputChars: 1_200, timestamp: 1_000_000 })
+
+      store.handleServerMessage(TEST_SESSION_ID, {
+        type: 'status', state: 'compacting', verb: 'Compacting conversation', compactProgress: { outputChars: 3_400 },
+      })
+      expect(tailDivider()).toMatchObject({ outputChars: 3_400, timestamp: 1_000_000 })
+
+      store.handleServerMessage(TEST_SESSION_ID, {
+        type: 'system_notification', subtype: 'compact_boundary', message: 'Context compacted', data: { trigger: 'auto' },
+      })
+      expect(tailDivider()).toMatchObject({ phase: 'complete', trigger: 'auto', timestamp: 1_000_000 })
+      expect(tailDivider()).not.toHaveProperty('outputChars')
+
+      // A later compaction gets its own divider and start time, with no
+      // leftover progress from the finished one.
+      vi.setSystemTime(2_000_000)
+      store.handleServerMessage(TEST_SESSION_ID, { type: 'status', state: 'compacting', verb: 'Compacting conversation' })
+      const messages = useChatStore.getState().sessions[TEST_SESSION_ID]?.messages ?? []
+      expect(messages).toHaveLength(3)
+      expect(messages[1]).toMatchObject({ type: 'compact_summary', phase: 'complete', timestamp: 1_000_000 })
+      expect(messages[2]).toMatchObject({ type: 'compact_summary', phase: 'compacting', timestamp: 2_000_000 })
+      expect(messages[2]).not.toHaveProperty('outputChars')
+    } finally {
+      useChatStore.getState().handleServerMessage(TEST_SESSION_ID, { type: 'status', state: 'idle' })
+      vi.useRealTimers()
+    }
+  })
+
   it('starts an elapsed timer when a reconnected session reports running status', () => {
     vi.useFakeTimers()
 
@@ -16642,5 +17018,331 @@ describe('chatStore inactive complete-page retention', () => {
       vi.clearAllTimers()
       vi.useRealTimers()
     }
+  })
+})
+
+// Edit-and-resend must not send on a swallowed error or an obsolete response:
+// the old turn has already been removed from the server transcript.
+describe('chatStore strict history reload', () => {
+  const sessionId = 'strict-history-reload'
+  const strict = { requireApplied: true }
+  const oldMessages: UIMessage[] = [
+    { id: 'rewound-user', type: 'user_text', content: 'Removed prompt', timestamp: 1 },
+    { id: 'rewound-reply', type: 'assistant_text', content: 'Removed reply', timestamp: 2 },
+  ]
+
+  beforeEach(() => {
+    vi.mocked(sessionsApi.getFullHistory).mockReset()
+    vi.mocked(sessionsApi.getFullHistory).mockResolvedValue({ messages: [] })
+    useChatStore.setState({
+      ...initialState,
+      sessions: { [sessionId]: makeSession({ chatState: 'idle', historyHydrated: true, messages: oldMessages }) },
+    })
+  })
+
+  it('rejects a failed fetch instead of treating stale messages as refreshed', async () => {
+    const failure = new Error('History unavailable after rewind')
+    vi.mocked(sessionsApi.getFullHistory).mockRejectedValueOnce(failure)
+    await expect(useChatStore.getState().reloadHistory(sessionId, undefined, strict)).rejects.toBe(failure)
+    expect(useChatStore.getState().sessions[sessionId]?.messages).toBe(oldMessages)
+  })
+
+  it('keeps best-effort reload failures compatible for existing callers', async () => {
+    vi.mocked(sessionsApi.getFullHistory).mockRejectedValueOnce(new Error('History unavailable'))
+    await expect(useChatStore.getState().reloadHistory(sessionId)).resolves.toBeUndefined()
+    expect(useChatStore.getState().sessions[sessionId]?.messages).toBe(oldMessages)
+  })
+
+  it('resolves once complete authoritative history replaces the removed turn', async () => {
+    await expect(useChatStore.getState().reloadHistory(sessionId, undefined, strict)).resolves.toBeUndefined()
+    expect(useChatStore.getState().sessions[sessionId]?.messages).toEqual([])
+    expect(useChatStore.getState().sessions[sessionId]?.historyStatus).toBe('ready')
+  })
+
+  it('rejects a superseded response even when the transport ignores abort', async () => {
+    let resolveFirst!: (value: { messages: MessageEntry[] }) => void
+    vi.mocked(sessionsApi.getFullHistory).mockReturnValueOnce(new Promise((resolve) => { resolveFirst = resolve }))
+    const rejected = expect(useChatStore.getState().reloadHistory(sessionId, undefined, strict)).rejects.toThrow('History reload was not applied')
+    await useChatStore.getState().reloadHistory(sessionId)
+    resolveFirst({ messages: [{ id: 'stale', type: 'user', content: 'Stale', timestamp: '2026-10-03T00:00:00Z' }] })
+    await rejected
+    expect(useChatStore.getState().sessions[sessionId]?.messages).toEqual([])
+  })
+
+  it('rejects a response for a disconnected session without recreating it', async () => {
+    let resolveHistory!: (value: { messages: MessageEntry[] }) => void
+    vi.mocked(sessionsApi.getFullHistory).mockReturnValueOnce(new Promise((resolve) => { resolveHistory = resolve }))
+    const rejected = expect(useChatStore.getState().reloadHistory(sessionId, undefined, strict)).rejects.toThrow('History reload was not applied')
+    useChatStore.getState().disconnectSession(sessionId)
+    resolveHistory({ messages: [] })
+    await rejected
+    expect(useChatStore.getState().sessions[sessionId]).toBeUndefined()
+  })
+
+  it('rejects a guarded reload when a live prompt changes the conversation', async () => {
+    let resolveHistory!: (value: { messages: MessageEntry[] }) => void
+    vi.mocked(sessionsApi.getFullHistory).mockReturnValueOnce(new Promise((resolve) => { resolveHistory = resolve }))
+    const rejected = expect(useChatStore.getState().reloadHistory(sessionId, { messages: oldMessages }, strict)).rejects.toThrow('History reload was not applied')
+    useChatStore.getState().handleServerMessage(sessionId, { type: 'user_message_replay', content: 'Competing prompt' })
+    const liveMessages = useChatStore.getState().sessions[sessionId]?.messages
+    resolveHistory({ messages: [] })
+    await rejected
+    expect(useChatStore.getState().sessions[sessionId]?.messages).toBe(liveMessages)
+    expect(liveMessages).toContainEqual(expect.objectContaining({ content: 'Competing prompt' }))
+  })
+
+  it('rejects incomplete history instead of retaining removed rows as authoritative', async () => {
+    vi.mocked(sessionsApi.getFullHistory).mockResolvedValueOnce({ messages: [], page: {
+      nextCursor: 'older', hasMore: true, historyComplete: false,
+      sourceVersion: 'version', scannedBytes: 2, omittedOversizedEntries: 1,
+    } })
+    await expect(useChatStore.getState().reloadHistory(sessionId, undefined, strict)).rejects.toThrow('History reload was not applied')
+    expect(useChatStore.getState().sessions[sessionId]?.messages).toBe(oldMessages)
+  })
+})
+
+describe('chatStore composer prefill references', () => {
+  const sessionId = 'prefill-references'
+
+  beforeEach(() => {
+    useChatStore.setState({ ...initialState, sessions: { [sessionId]: makeSession({ chatState: 'idle' }) } })
+  })
+
+  it('retains session context with an edited prompt handed to the composer', () => {
+    const sessionReferences = [{ sessionId: 'referenced-session' }]
+    useChatStore.getState().queueComposerPrefill(sessionId, { text: 'Edited prompt', sessionReferences })
+    expect(useChatStore.getState().sessions[sessionId]?.composerPrefill).toMatchObject({
+      text: 'Edited prompt', sessionReferences,
+    })
+  })
+
+  it('keeps the existing prefill shape when no session references were supplied', () => {
+    useChatStore.getState().queueComposerPrefill(sessionId, { text: 'Existing prefill' })
+    expect(useChatStore.getState().sessions[sessionId]?.composerPrefill).not.toHaveProperty('sessionReferences')
+  })
+})
+
+
+// A completed rewind must retain its edit even when the source tab was closed
+// while the API call was pending; delayed ordinary prefills must stay ignored.
+describe('chatStore closed-session edit recovery', () => {
+  const sessionId = 'closed-edit-recovery'
+  const prefill = {
+    text: 'Recovered edit',
+    attachments: [{ type: 'file' as const, name: 'app.ts', path: '/repo/app.ts' }],
+    sessionReferences: [{ sessionId: 'context-session' }],
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    useChatStore.setState({ ...initialState, sessions: {} })
+  })
+
+  it('ignores a normal delayed prefill for a missing session', () => {
+    useChatStore.getState().queueComposerPrefill(sessionId, prefill)
+    expect(useChatStore.getState().sessions[sessionId]).toBeUndefined()
+  })
+
+  it('retains an explicitly recovered edit without opening a socket or sending it', async () => {
+    const { wsManager } = await import('../api/websocket')
+    useChatStore.getState().queueComposerPrefill(sessionId, prefill, { restoreMissingSession: true })
+    expect(useChatStore.getState().sessions[sessionId]).toMatchObject({
+      connectionState: 'disconnected', chatState: 'idle', messages: [], composerPrefill: prefill,
+    })
+    expect(wsManager.connect).not.toHaveBeenCalled()
+    expect(wsManager.send).not.toHaveBeenCalled()
+    expect(sessionsApi.getFullHistory).not.toHaveBeenCalled()
+  })
+
+  it('preserves the recovered prefill when the user reopens its disconnected session', () => {
+    useChatStore.setState({ sessions: { [sessionId]: makeSession({ connectionState: 'disconnected', chatState: 'idle' }) } })
+    useChatStore.getState().queueComposerPrefill(sessionId, prefill)
+    const recovered = useChatStore.getState().sessions[sessionId]?.composerPrefill
+    useChatStore.getState().connectToSession(sessionId, { minimalBootstrap: true, prewarm: false, applyRuntimeSelection: false })
+    expect(useChatStore.getState().sessions[sessionId]?.composerPrefill).toBe(recovered)
+    expect(useChatStore.getState().sessions[sessionId]?.connectionState).toBe('connecting')
+    expect(sessionsApi.getFullHistory).not.toHaveBeenCalled()
+    expect(sendMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('chatStore streamed turn against its durable copy (#1476)', () => {
+  const sessionId = 'streamed-turn-durable-copy'
+  const THINKING = 'This is a large change (72 files, 14k insertions).'
+  const REPLY = 'Context gathered. Setting up the loop.'
+
+  beforeEach(() => {
+    sendMock.mockReset()
+    vi.mocked(sessionsApi.getFullHistory).mockReset()
+    vi.mocked(sessionsApi.getFullHistory).mockResolvedValue({ messages: [] })
+    useChatStore.setState({ ...initialState, sessions: {} })
+  })
+
+  afterEach(() => {
+    const timer = useChatStore.getState().sessions[sessionId]?.elapsedTimer
+    if (timer) clearInterval(timer)
+    useChatStore.setState({ ...initialState, sessions: {} })
+  })
+
+  const send = (message: ServerMessage) => useChatStore.getState().handleServerMessage(sessionId, message)
+  const timeline = () => (useChatStore.getState().sessions[sessionId]?.messages ?? []).map((message) =>
+    message.type === 'thinking' || message.type === 'assistant_text' || message.type === 'user_text'
+      ? `${message.type}: ${message.content}`
+      : message.type)
+
+  // DeepSeek-style tokenization streams the gap between words as its own delta.
+  async function streamTurn() {
+    send({ type: 'thinking', text: 'This is a large change (72 files,' })
+    send({ type: 'thinking', text: ' ' })
+    send({ type: 'thinking', text: '14k insertions).' })
+    send({ type: 'content_start', blockType: 'tool_use', toolName: 'Bash', toolUseId: 'toolu_status' })
+    send({ type: 'tool_use_complete', toolName: 'Bash', toolUseId: 'toolu_status', input: { command: 'git status' } })
+    send({ type: 'tool_result', toolUseId: 'toolu_status', content: 'clean', isError: false })
+    send({ type: 'content_start', blockType: 'text' })
+    send({ type: 'content_delta', text: REPLY })
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    send({ type: 'message_complete', usage: { input_tokens: 1, output_tokens: 1 } })
+  }
+
+  // The CLI persists each block when it completes, after its first live delta.
+  function durableTurn(): MessageEntry[] {
+    const at = (offset: number) => new Date(Date.now() + offset).toISOString()
+    return [
+      { id: 'durable-user', type: 'user', timestamp: at(-60_000), content: 'review it' },
+      { id: 'durable-thinking', type: 'assistant', timestamp: at(1_000), content: [{ type: 'thinking', thinking: THINKING }] },
+      { id: 'durable-tool', type: 'assistant', timestamp: at(2_000), content: [{ type: 'tool_use', id: 'toolu_status', name: 'Bash', input: { command: 'git status' } }] },
+      { id: 'durable-result', type: 'user', timestamp: at(3_000), content: [{ type: 'tool_result', tool_use_id: 'toolu_status', content: 'clean' }] },
+      { id: 'durable-reply', type: 'assistant', timestamp: at(4_000), content: [{ type: 'text', text: REPLY }] },
+    ]
+  }
+
+  const expectedTimeline = [
+    'user_text: review it',
+    `thinking: ${THINKING}`,
+    'tool_use',
+    'tool_result',
+    `assistant_text: ${REPLY}`,
+  ]
+
+  function touchLiveMessages() {
+    useChatStore.setState((state) => ({
+      sessions: {
+        ...state.sessions,
+        [sessionId]: { ...state.sessions[sessionId]!, messages: [...state.sessions[sessionId]!.messages] },
+      },
+    }))
+  }
+
+  it('keeps whitespace-only thinking deltas that continue a streaming block', () => {
+    useChatStore.setState({ sessions: { [sessionId]: makeSession({ chatState: 'thinking' }) } })
+
+    send({ type: 'thinking', text: '\n\n' })
+    send({ type: 'thinking', text: 'first' })
+    send({ type: 'thinking', text: '\n\n' })
+    send({ type: 'thinking', text: 'second' })
+    send({ type: 'thinking', text: '  ', complete: true })
+
+    expect(useChatStore.getState().sessions[sessionId]?.messages).toMatchObject([
+      { type: 'thinking', content: 'first\n\nsecond' },
+    ])
+  })
+
+  it('does not duplicate the streamed turn when completion runs a cold history load', async () => {
+    useChatStore.setState({ sessions: { [sessionId]: makeSession({
+      chatState: 'thinking',
+      historyHydrated: false,
+      historyStatus: 'error',
+      messages: [{ id: 'live-user', type: 'user_text', content: 'review it', timestamp: Date.now() - 60_000 }],
+    }) } })
+    let resolveHistory!: (value: { messages: MessageEntry[] }) => void
+    vi.mocked(sessionsApi.getFullHistory).mockReturnValueOnce(new Promise((resolve) => {
+      resolveHistory = resolve
+    }))
+
+    await streamTurn()
+    // Live activity (for example a background agent row) lands while REST is
+    // in flight, so the cold merge cannot hydrate transcript ids first.
+    touchLiveMessages()
+    resolveHistory({ messages: durableTurn() })
+    await vi.waitFor(() => expect(useChatStore.getState().sessions[sessionId]?.historyHydrated).toBe(true))
+
+    expect(timeline()).toEqual(expectedTimeline)
+  })
+
+  it('does not duplicate the streamed turn when a bounded reload merges it', async () => {
+    useChatStore.setState({ sessions: { [sessionId]: makeSession({
+      chatState: 'thinking',
+      historyHydrated: true,
+      historyStatus: 'ready',
+      messages: [{ id: 'live-user', type: 'user_text', content: 'review it', timestamp: Date.now() - 60_000, transcriptMessageId: 'durable-user' }],
+    }) } })
+    vi.mocked(sessionsApi.getFullHistory).mockResolvedValueOnce({ messages: durableTurn() })
+    await streamTurn()
+    await vi.waitFor(() => expect(sessionsApi.getFullHistory).toHaveBeenCalledTimes(1))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    let resolveHistory!: (value: SessionHistoryPage) => void
+    vi.mocked(sessionsApi.getFullHistory).mockReturnValueOnce(new Promise((resolve) => {
+      resolveHistory = resolve
+    }))
+    const session = useChatStore.getState().sessions[sessionId]!
+    const reload = useChatStore.getState().reloadHistory(sessionId, {
+      messages: session.messages,
+      backgroundAgentTasks: session.backgroundAgentTasks,
+    })
+    await vi.waitFor(() => expect(sessionsApi.getFullHistory).toHaveBeenCalledTimes(2))
+    // An oversized tool result was omitted, so the page is not authoritative.
+    resolveHistory({
+      messages: durableTurn(),
+      page: {
+        historyComplete: false,
+        omittedOversizedEntries: 1,
+        contentTruncated: false,
+        nextCursor: null,
+        hasMore: false,
+      },
+    } as SessionHistoryPage)
+    await reload
+
+    expect(timeline()).toEqual(expectedTimeline)
+  })
+
+  it('keeps an identical reply to a newer live prompt beside the durable one', async () => {
+    const now = Date.now()
+    useChatStore.setState({ sessions: { [sessionId]: makeSession({
+      chatState: 'idle',
+      historyHydrated: false,
+      historyStatus: 'error',
+      messages: [
+        { id: 'live-tool', type: 'tool_use', toolName: 'Bash', toolUseId: 'toolu_status', input: {}, timestamp: now - 3_000 },
+        { id: 'live-result', type: 'tool_result', toolUseId: 'toolu_status', content: 'clean', isError: false, timestamp: now - 2_000 },
+        { id: 'live-again', type: 'user_text', content: 'again', timestamp: now - 1_000 },
+        { id: 'live-done', type: 'assistant_text', content: 'Done.', timestamp: now },
+      ],
+    }) } })
+    let resolveHistory!: (value: { messages: MessageEntry[] }) => void
+    vi.mocked(sessionsApi.getFullHistory).mockReturnValueOnce(new Promise((resolve) => {
+      resolveHistory = resolve
+    }))
+
+    const load = useChatStore.getState().loadHistory(sessionId)
+    touchLiveMessages()
+    const at = (offset: number) => new Date(now + offset).toISOString()
+    resolveHistory({ messages: [
+      { id: 'durable-user', type: 'user', timestamp: at(-5_000), content: 'review it' },
+      { id: 'durable-tool', type: 'assistant', timestamp: at(-3_000), content: [{ type: 'tool_use', id: 'toolu_status', name: 'Bash', input: {} }] },
+      { id: 'durable-result', type: 'user', timestamp: at(-2_000), content: [{ type: 'tool_result', tool_use_id: 'toolu_status', content: 'clean' }] },
+      { id: 'durable-done', type: 'assistant', timestamp: at(-1_500), content: [{ type: 'text', text: 'Done.' }] },
+    ] })
+    await load
+
+    expect(timeline()).toEqual([
+      'user_text: review it',
+      'tool_use',
+      'tool_result',
+      'assistant_text: Done.',
+      'user_text: again',
+      'assistant_text: Done.',
+    ])
   })
 })
