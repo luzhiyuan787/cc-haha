@@ -254,15 +254,6 @@ async function runInteractive(parsed: {
     if (!inputClosed) rl.prompt()
   }
 
-  // A piped input (test harness, `echo | claude`) ends while a response is in
-  // flight; readline marks itself closed on end, and prompting afterwards is
-  // ERR_USE_AFTER_CLOSE. Skip the prompt and let the loop drain instead.
-  let inputClosed = false
-  rl.on('close', () => { inputClosed = true })
-  const prompt = () => {
-    if (!inputClosed) rl.prompt()
-  }
-
   process.stdout.write(
     `Claude Haha local interactive mode\nmodel: ${model}\ncommands: /exit, /clear\n\n`,
   )

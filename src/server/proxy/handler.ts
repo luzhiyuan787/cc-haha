@@ -766,23 +766,16 @@ async function handleOpenaiChat(
   const knownDeepSeekHost = shouldUseDeepSeekReasoningCompat(baseUrl)
   const reasoningProfile = resolveModelReasoningProfile(body.model, 'openai_chat')
   const url = buildOpenaiEndpoint(baseUrl, 'chat/completions')
-  // Console Go's upstream pool for OpenCode Zen is heterogeneous: some Chat
-  // Completions backends strict-decode the request body and randomly reject
-  // the non-standard `thinking` toggle with
-  // `json: unknown field "thinking"` (verified ~50/50 per request, not
-  // session-sticky). OpenCode's reasoning models return `reasoning_content`
-  // without the toggle, so keep it for real DeepSeek hosts only.
-  //
-  // Upstream's endpoint-learned `unsupportedReasoningFields` (fed by the
-  // `rejectedReasoningFields` a previous 400 reported) composes with that host
-  // rule: either one suppresses a field the upstream refuses.
+  // Upstream's endpoint-learned `unsupportedReasoningFields` (fed by a
+  // previous 400's `rejectedReasoningFields`) suppresses a reasoning field the
+  // upstream refused; the request is then resent without it and that model is
+  // remembered. This supersedes the earlier local rule that withheld the
+  // `thinking` toggle from the whole OpenCode host.
   const unsupportedReasoningFields = new Set([
     ...getOpenAIChatUnsupportedReasoningFields(url, body.model),
     ...rejectedReasoningFields,
   ])
-  const passThinkingToggle = knownDeepSeekHost
-    && !OPENCODE_HOST_PATTERN.test(baseUrl)
-    && !unsupportedReasoningFields.has('thinking')
+  const passThinkingToggle = knownDeepSeekHost && !unsupportedReasoningFields.has('thinking')
   // The local per-family allowlist below sets the static default for the
   // OpenCode gateway (mimo / deepseek families are multimodal, glm is not);
   // every other host starts on vision, and the endpoint-probed learning then
