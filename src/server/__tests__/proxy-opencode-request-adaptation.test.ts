@@ -222,7 +222,7 @@ describe('proxy opencode request adaptation', () => {
     }
   })
 
-  test('never forwards the non-standard thinking toggle to opencode chat (Console Go strict backends reject it)', async () => {
+  test('forwards the thinking toggle to opencode chat so a strict backend can refuse it and be learned', async () => {
     const provider = await makeProvider('openai_chat', 'https://opencode.ai/zen/go/')
     const upstream = mockUpstreamCaptureHeaders(chatCompletionBody())
     try {
@@ -233,7 +233,10 @@ describe('proxy opencode request adaptation', () => {
       })
       expect(res.status).toBe(200)
       const body = upstream.getCapturedBody()
-      expect(body?.thinking).toBeUndefined()
+      // Console Go backends that reject `thinking` answer 400; the proxy learns
+      // the field per model and resends without it rather than withholding the
+      // toggle from the whole host up front.
+      expect(body?.thinking).toEqual({ type: 'enabled' })
       // Reasoning intent still maps onto the standard field.
       expect(body?.reasoning_effort).toBe('high')
       await waitForTraceCallDone(SESSION_ID)
