@@ -343,6 +343,7 @@ export function ActiveSession({ sessionId, active = true }: { sessionId?: string
   const selectedTabId = useTabStore((s) => s.activeTabId)
   const activeTabId = sessionId ?? selectedTabId
   const activeTabType = useTabStore((s) => s.tabs.find((tab) => tab.sessionId === (sessionId ?? s.activeTabId))?.type ?? null)
+  const activeTabTitle = useTabStore((s) => s.tabs.find((tab) => tab.sessionId === (sessionId ?? s.activeTabId))?.title)
   const sessions = useSessionStore((s) => s.sessions)
   const connectToSession = useChatStore((s) => s.connectToSession)
   const stopBackgroundTask = useChatStore((s) => s.stopBackgroundTask)
@@ -373,6 +374,7 @@ export function ActiveSession({ sessionId, active = true }: { sessionId?: string
   const stoppingBackgroundTaskIds = sessionState?.stoppingBackgroundTaskIds
 
   const session = sessions.find((s) => s.id === activeTabId)
+  const isLean = session?.agentProfile === 'lean'
   const sessionMessageCount = Math.max(
     sessionState?.messages.length ?? 0,
     session?.messageCount ?? 0,
@@ -571,7 +573,7 @@ export function ActiveSession({ sessionId, active = true }: { sessionId?: string
       ? sessionState.historyError || t('session.historyLoadFailed')
       : null
   const visibleMessageCount = messages.length > 0 ? messages.length : session?.messageCount ?? 0
-  const headerTitle = session?.title || t('session.untitled')
+  const headerTitle = session?.title || activeTabTitle || t('session.untitled')
   const currentGitInfo = sessionGitInfo?.sessionId === activeTabId ? sessionGitInfo.info : null
   const worktree = currentGitInfo?.worktree?.enabled ? currentGitInfo.worktree : null
   const worktreePath = worktree?.path || worktree?.plannedPath || null
@@ -898,7 +900,7 @@ export function ActiveSession({ sessionId, active = true }: { sessionId?: string
               dock="side"
               cwd={getSessionTerminalCwd(session) ?? ''}
               reviewUnavailableReason={workspaceIsGitRepo === false ? t('workspace.launcher.reviewNeedsGit') : null}
-              sideChatAvailable={!isEmpty}
+              sideChatAvailable={!isEmpty && !isLean}
               visible={active}
             />
           </aside>
@@ -909,7 +911,7 @@ export function ActiveSession({ sessionId, active = true }: { sessionId?: string
             Mobile has no session header, so its side-chat entry lives here. A
             blank session has nothing for a side chat to fork, so it gets none.
           */}
-          {isMobileLayout && !isEmpty && (
+          {isMobileLayout && !isEmpty && !isLean && (
             <div className="flex justify-end px-4 py-2">
               <IconButton icon={<MessageCircleQuestion size={16} strokeWidth={1.75} aria-hidden="true" />} label={t('sideChat.title')} size="sm"
                 pressed={sideChatOpen} onClick={() => void openSideChat(activeTabId)} />
@@ -951,8 +953,8 @@ export function ActiveSession({ sessionId, active = true }: { sessionId?: string
                   metadata={headerMetadata}
                   actions={<>
                     {activeTabId && <TrajectoryViewSwitch sessionId={activeTabId} />}
-                    <IconButton icon={<MessageCircleQuestion size={16} strokeWidth={1.75} aria-hidden="true" />} label={t('sideChat.title')} size="sm"
-                      pressed={sideChatOpen} onClick={() => void openSideChat(activeTabId)} />
+                    {!isLean && <IconButton icon={<MessageCircleQuestion size={16} strokeWidth={1.75} aria-hidden="true" />} label={t('sideChat.title')} size="sm"
+                      pressed={sideChatOpen} onClick={() => void openSideChat(activeTabId)} />}
                   </>}
                 >
                   {session && getSessionWorkspaceState(session) !== 'available' && (

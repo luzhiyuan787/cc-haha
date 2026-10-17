@@ -247,6 +247,12 @@ async function runInteractive(parsed: {
     output: process.stdout,
     prompt: 'you> ',
   })
+  let inputClosed = false
+  rl.once('close', () => { inputClosed = true })
+  const prompt = () => {
+    // EOF can close readline while a response is pending; buffered lines still run.
+    if (!inputClosed) rl.prompt()
+  }
 
   // A piped input (test harness, `echo | claude`) ends while a response is in
   // flight; readline marks itself closed on end, and prompting afterwards is

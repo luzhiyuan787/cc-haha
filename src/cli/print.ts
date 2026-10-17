@@ -1,3 +1,4 @@
+import { filterAgentProfileTools, validateAgentProfileControlRequest, validateAgentProfileInitialize } from '../utils/agentProfile.js'
 import { createSessionMessageInbox, isPendingSessionMessage, sessionMessageUuid } from '../utils/sessionMessageInbox.js'
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import { feature } from 'bun:bundle'
@@ -70,6 +71,7 @@ import type { Stream } from 'src/utils/stream.js'
 import { EMPTY_USAGE } from 'src/services/api/logging.js'
 import {
   loadConversationForResume,
+  ResumeMessageNotFoundError,
   type TurnInterruptionState,
 } from 'src/utils/conversationRecovery.js'
 import type {
@@ -340,6 +342,7 @@ import { asSessionId } from 'src/types/ids.js'
 import { jsonStringify } from '../utils/slowOperations.js'
 import { skillChangeDetector } from '../utils/skills/skillChangeDetector.js'
 import { getCommands, clearCommandsCache } from '../commands.js'
+import { filterCommandsForHeadlessMode } from '../commands/headless.js'
 import {
   isBareMode,
   isEnvTruthy,
@@ -1727,7 +1730,7 @@ function runHeadlessStreaming(
         allTools = [...allTools, syntheticOutputResult.tool]
       }
     }
-    return allTools
+    return filterAgentProfileTools(allTools)
   }
 
   // Bridge handle for remote-control (SDK control message).
@@ -1981,7 +1984,7 @@ function runHeadlessStreaming(
   const idleTimeout = createIdleTimeoutManager(() => !running)
 
   // Mutable commands and agents for hot reloading
-  let currentCommands = commands
+  let currentCommands = filterCommandsForHeadlessMode(commands)
   let currentAgents = agents
 
   // Clear all plugin-related caches, reload commands/agents/hooks.
@@ -2001,7 +2004,7 @@ function runHeadlessStreaming(
     // Headless-specific: currentCommands/currentAgents are local mutable refs
     // captured by the query loop (REPL uses AppState instead). getCommands is
     // fresh because refreshActivePlugins cleared its cache.
-    currentCommands = await getCommands(cwd())
+    currentCommands = filterCommandsForHeadlessMode(await getCommands(cwd()))
 
     // Preserve SDK-provided agents (--agents CLI flag or SDK initialize
     // control_request) — both inject via parseAgentsFromJson with
@@ -2058,7 +2061,7 @@ function runHeadlessStreaming(
   const unsubscribeSkillChanges = skillChangeDetector.subscribe(() => {
     clearCommandsCache()
     void getCommands(cwd()).then(newCommands => {
-      currentCommands = newCommands
+      currentCommands = filterCommandsForHeadlessMode(newCommands)
     })
   })
 
@@ -3073,6 +3076,11 @@ function runHeadlessStreaming(
           sendControlResponseSuccess(message)
           break // exits for-await → falls through to inputClosed=true drain below
         } else if (message.request.subtype === 'initialize') {
+          const profileError = validateAgentProfileInitialize(message.request)
+          if (profileError) {
+            sendControlResponseError(message, profileError)
+            continue
+          }
           // SDK MCP server names from the initialize message
           // Populated by both browser and ProcessTransport sessions
           if (
@@ -3128,6 +3136,11 @@ function runHeadlessStreaming(
             void run()
           }
         } else if (message.request.subtype === 'set_permission_mode') {
+          const profileError = validateAgentProfileControlRequest(message.request.subtype, message.request)
+          if (profileError) {
+            sendControlResponseError(message, profileError)
+            continue
+          }
           const m = message.request // for typescript (TODO: use readonly types to avoid this)
           setAppState(prev => ({
             ...prev,
@@ -3308,7 +3321,7 @@ function runHeadlessStreaming(
               loadAllPluginsCacheOnly(),
             ])
             if (cmdsR.status === 'fulfilled') {
-              currentCommands = cmdsR.value
+              currentCommands = filterCommandsForHeadlessMode(cmdsR.value)
             } else {
               logError(cmdsR.reason)
             }
@@ -4112,6 +4125,11 @@ function runHeadlessStreaming(
             sendControlResponseError(message, result.message)
           }
         } else if (message.request.subtype === 'send_agent_message') {
+          const profileError = validateAgentProfileControlRequest(message.request.subtype, message.request)
+          if (profileError) {
+            sendControlResponseError(message, profileError)
+            continue
+          }
           const agentId = message.request.agent_id.trim()
           const content = message.request.content.trim()
           if (!agentId || !content) {
@@ -4521,6 +4539,7 @@ function runHeadlessStreaming(
 }
 
 export { runHeadlessStreaming as __runHeadlessStreamingForTests }
+export { loadInitialMessages as __loadInitialMessagesForTests }
 
 /**
  * Creates a CanUseToolFn that incorporates a custom permission prompt tool.
@@ -5455,6 +5474,7 @@ async function loadInitialMessages(
       const result = await loadConversationForResume(
         parsedSessionId.sessionId,
         parsedSessionId.jsonlFile || undefined,
+        { resumeSessionAt: options.resumeSessionAt },
       )
 
       // hydrateFromCCRv2InternalEvents writes an empty transcript file for
@@ -5480,23 +5500,6 @@ async function loadInitialMessages(
           gracefulShutdownSync(1)
           return { messages: [] }
         }
-      }
-
-      // Handle resumeSessionAt feature
-      if (options.resumeSessionAt) {
-        const index = result.messages.findIndex(
-          m => m.uuid === options.resumeSessionAt,
-        )
-        if (index < 0) {
-          emitLoadError(
-            `No message found with message.uuid of: ${options.resumeSessionAt}`,
-            options.outputFormat,
-          )
-          gracefulShutdownSync(1)
-          return { messages: [] }
-        }
-
-        result.messages = index >= 0 ? result.messages.slice(0, index + 1) : []
       }
 
       // Match coordinator mode to the resumed session's mode
@@ -5556,6 +5559,11 @@ async function loadInitialMessages(
         agentSetting: result.agentSetting,
       }
     } catch (error) {
+      if (error instanceof ResumeMessageNotFoundError) {
+        emitLoadError(error.message, options.outputFormat)
+        gracefulShutdownSync(1)
+        return { messages: [] }
+      }
       logError(error)
       const errorMessage =
         error instanceof Error

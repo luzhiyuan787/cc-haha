@@ -23,6 +23,12 @@ import {
   isOpenAIChatImageRejection,
   rememberOpenAIChatTextOnlyModel,
 } from './openaiChatImageSupport.js'
+import {
+  findOpenAIChatReasoningFieldRejection,
+  getOpenAIChatUnsupportedReasoningFields,
+  rememberOpenAIChatUnsupportedReasoningField,
+  type OpenAIChatReasoningField,
+} from './openaiChatReasoningFieldSupport.js'
 import { anthropicToOpenaiChat, type OpenAIChatImageContentMode } from './transform/anthropicToOpenaiChat.js'
 import { anthropicToOpenaiResponses } from './transform/anthropicToOpenaiResponses.js'
 import { RequestCompatibilityError, resolveRequestCompatibility, type RequestCompatibilityOptions } from './transform/requestCompatibility.js'
@@ -755,6 +761,7 @@ async function handleOpenaiChat(
   requestOptions: RequestCompatibilityOptions = {},
   upstreamHeaders: Record<string, string> = {},
   imageContentModeOverride?: OpenAIChatImageContentMode,
+  rejectedReasoningFields: ReadonlySet<OpenAIChatReasoningField> = new Set(),
 ): Promise<Response> {
   const knownDeepSeekHost = shouldUseDeepSeekReasoningCompat(baseUrl)
   const reasoningProfile = resolveModelReasoningProfile(body.model, 'openai_chat')
@@ -765,7 +772,17 @@ async function handleOpenaiChat(
   // `json: unknown field "thinking"` (verified ~50/50 per request, not
   // session-sticky). OpenCode's reasoning models return `reasoning_content`
   // without the toggle, so keep it for real DeepSeek hosts only.
-  const passThinkingToggle = knownDeepSeekHost && !OPENCODE_HOST_PATTERN.test(baseUrl)
+  //
+  // Upstream's endpoint-learned `unsupportedReasoningFields` (fed by the
+  // `rejectedReasoningFields` a previous 400 reported) composes with that host
+  // rule: either one suppresses a field the upstream refuses.
+  const unsupportedReasoningFields = new Set([
+    ...getOpenAIChatUnsupportedReasoningFields(url, body.model),
+    ...rejectedReasoningFields,
+  ])
+  const passThinkingToggle = knownDeepSeekHost
+    && !OPENCODE_HOST_PATTERN.test(baseUrl)
+    && !unsupportedReasoningFields.has('thinking')
   // The local per-family allowlist below sets the static default for the
   // OpenCode gateway (mimo / deepseek families are multimodal, glm is not);
   // every other host starts on vision, and the endpoint-probed learning then
@@ -778,6 +795,7 @@ async function handleOpenaiChat(
     ...requestOptions,
     roundTripReasoningContent: knownDeepSeekHost || reasoningProfile?.family === 'deepseek-v4',
     passThinkingToggle,
+    passReasoningEffort: !unsupportedReasoningFields.has('reasoning_effort'),
     imageContentMode,
   })
   relaxForcedToolChoice(transformed as unknown as Record<string, unknown>, baseUrl)
@@ -856,6 +874,7 @@ async function handleOpenaiChat(
       }
       const resent = await handleOpenaiChat(
         body, baseUrl, apiKey, isStream, networkSettings, traceContext, requestOptions, upstreamHeaders, 'text_only',
+        unsupportedReasoningFields,
       )
       if (resent.ok) {
         rememberOpenAIChatTextOnlyModel(url, body.model)
@@ -864,6 +883,41 @@ async function handleOpenaiChat(
           severity: 'info',
           summary: `Upstream rejected image input for ${body.model}; images are omitted for this model for 30 minutes`,
           details: { model: body.model, upstreamUrl: url, httpStatus: upstream.status, upstreamError: errText.slice(0, 500) },
+        })
+      }
+      return resent
+    }
+    const rejectedField = findOpenAIChatReasoningFieldRejection(upstream.status, errText, transformed)
+    if (rejectedField && !unsupportedReasoningFields.has(rejectedField)) {
+      // Same contract as the image fallback: the upstream refused the request
+      // before generating anything, and the field is only remembered once the
+      // resend without it succeeds.
+      if (traceContext) {
+        recordProxyTraceInBackground({
+          context: traceContext,
+          callId: traceCallId,
+          model: body.model,
+          upstreamUrl: url,
+          upstreamRequest: transformed,
+          requestHeaders: upstreamRequestHeaders,
+          startedAt,
+          startedAtMs,
+          responseStatus: upstream.status,
+          upstreamResponseBody: errText,
+          responseHeaders: upstream.headers,
+        })
+      }
+      const resent = await handleOpenaiChat(
+        body, baseUrl, apiKey, isStream, networkSettings, traceContext, requestOptions, upstreamHeaders,
+        imageContentMode, new Set([...unsupportedReasoningFields, rejectedField]),
+      )
+      if (resent.ok) {
+        rememberOpenAIChatUnsupportedReasoningField(url, body.model, rejectedField)
+        void diagnosticsService.recordEvent({
+          type: 'openai_chat_reasoning_field_disabled',
+          severity: 'info',
+          summary: `Upstream rejected ${rejectedField} for ${body.model}; it is omitted for this model for 30 minutes`,
+          details: { model: body.model, field: rejectedField, upstreamUrl: url, httpStatus: upstream.status, upstreamError: errText.slice(0, 500) },
         })
       }
       return resent

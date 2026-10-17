@@ -1,3 +1,4 @@
+import { useUIStore } from '@/stores/uiStore'
 import { getComposerViewForTesting } from './MentionComposer'
 import { useTeamPlanStore } from '@/stores/teamPlanStore'
 import { useTeamStore } from '@/stores/teamStore'
@@ -9,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import '@testing-library/jest-dom'
 import { withAgentTeamRequest } from '@/lib/agentTeamRequest'
 import { COMPUTER_USE_ENABLE_REQUEST } from '@/lib/computerUseEnable'
+import { AGENT_TEAMS_NOTICE_STORAGE_KEY, dismissAgentTeamsNotice } from '@/lib/agentTeamsNotice'
 import { readRecentSkills, RECENT_SKILLS_STORAGE_KEY } from '@/lib/recentSkills'
 import { act, StrictMode } from 'react'
 
@@ -164,6 +166,7 @@ import { workflowsApi } from '../../api/workflows'
 import { computerUseApi } from '../../api/computerUse'
 import { browserHost } from '../../lib/desktopHost/browserHost'
 import { settingsApi } from '../../api/settings'
+import { useCapabilityCatalogStore } from '../../stores/capabilityCatalogStore'
 import {
   captureProjectDisplayNameHydrationRevision,
   hydrateProjectDisplayNames,
@@ -252,6 +255,7 @@ describe('ChatInput file mentions', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     localStorage.removeItem(RECENT_SKILLS_STORAGE_KEY)
+    localStorage.removeItem(AGENT_TEAMS_NOTICE_STORAGE_KEY)
     useSideChatStore.setState({ entries: {} })
     useTeamPlanStore.setState({ bySession: {} })
     useTeamStore.setState({ workbenchesBySession: {} })
@@ -593,7 +597,7 @@ describe('ChatInput file mentions', () => {
     expect(getComposerText()).toBe('keep this draft')
   })
 
-  it('keeps the unsent draft when switching project on an empty active session', async () => {
+  it.each(['standard', 'lean'] as const)('keeps the unsent draft and %s profile when switching project on an empty active session', async (agentProfile) => {
     installElectronFileHost()
     mocks.dialogOpen.mockResolvedValueOnce('/other')
     mocks.create.mockResolvedValueOnce({ sessionId: 'session-project-switch', workDir: '/other' })
@@ -606,6 +610,7 @@ describe('ChatInput file mentions', () => {
     useSessionStore.setState({
       sessions: [{
         id: sessionId,
+        agentProfile,
         title: 'Project',
         createdAt: '2026-05-01T00:00:00.000Z',
         modifiedAt: '2026-05-01T00:00:00.000Z',
@@ -651,7 +656,7 @@ describe('ChatInput file mentions', () => {
     fireEvent.click(await screen.findByRole('button', { name: /Choose a different folder/ }))
 
     await waitFor(() => {
-      expect(mocks.create).toHaveBeenCalledWith({ workDir: '/other' })
+      expect(mocks.create).toHaveBeenCalledWith({ workDir: '/other', ...(agentProfile === 'lean' ? { agentProfile } : {}) })
     })
     await waitFor(() => {
       expect(useTabStore.getState().activeTabId).toBe('session-project-switch')
@@ -800,7 +805,7 @@ describe('ChatInput file mentions', () => {
     expect(parentEditor.textContent).toBe('parent draft')
     expect(mocks.wsSend).not.toHaveBeenCalledWith(sessionId, expect.objectContaining({ type: 'user_message' }))
     expect(container.querySelector('[data-session-id="side-scoped"]')).toBeInTheDocument()
-    expect(mocks.listReferences).toHaveBeenCalledWith('/child', undefined)
+    expect(mocks.listReferences).toHaveBeenCalledWith('/child', undefined, undefined)
   })
 
   it('accepts asynchronous image paste in an explicit child while the global tab stays on its parent', async () => {
@@ -813,6 +818,40 @@ describe('ChatInput file mentions', () => {
     fireEvent.paste(editor, { clipboardData: { files: [], getData: () => '', items: [{ kind: 'file', type: 'image/png', getAsFile: () => file }] } })
     await waitFor(() => expect(within(shells[1] as HTMLElement).getByRole('img')).toBeInTheDocument())
     expect(within(shells[0] as HTMLElement).queryByRole('img')).not.toBeInTheDocument()
+  })
+
+  it('requires a permission change before sending a restored lean plan session', () => {
+    useSessionStore.setState(state => ({ sessions: state.sessions.map(session => ({ ...session, agentProfile: 'lean' as const, permissionMode: 'plan' })) }))
+    render(<ChatInput compact />)
+    setComposerText('Fix the calculation', 19)
+    fireEvent.keyDown(getComposerElement(), { key: 'Enter' })
+    expect(mocks.wsSend).not.toHaveBeenCalledWith(sessionId, expect.objectContaining({ type: 'user_message' }))
+    expect(getComposerText()).toBe('Fix the calculation')
+    expect(useUIStore.getState().toasts.at(-1)?.message).toContain('Choose another permission mode')
+    expect(useSessionStore.getState().sessions[0]?.permissionMode).toBe('plan')
+  })
+
+  it('sends an absolute file path as ordinary input in lean mode', async () => {
+    useSessionStore.setState(state => ({ sessions: state.sessions.map(session => ({ ...session, agentProfile: 'lean' as const })) }))
+    render(<ChatInput compact />)
+    setComposerText('/tmp/cart.js fix the total', 26)
+    fireEvent.keyDown(getComposerElement(), { key: 'Enter' })
+    await waitFor(() => expect(mocks.wsSend).toHaveBeenCalledWith(sessionId, expect.objectContaining({ type: 'user_message' })))
+  })
+
+  it('restores the immutable lean badge with lean creation disabled and rejects the typed side-chat shortcut', () => {
+    useSettingsStore.setState({ leanModeEnabled: false })
+    useSessionStore.setState(state => ({ sessions: state.sessions.map(session => ({ ...session, agentProfile: 'lean' as const })) }))
+    render(<ChatInput compact />)
+    expect(screen.getByText('Lean · experimental')).toBeInTheDocument()
+    expect(mocks.listReferences).toHaveBeenCalledWith('/repo', undefined, 'lean')
+    expect(screen.queryByRole('button', { name: /^Agent mode:/ })).not.toBeInTheDocument()
+    setComposerText('/btw Why this change?', 21)
+    fireEvent.keyDown(getComposerElement(), { key: 'Enter' })
+    expect(mocks.sideOpen).not.toHaveBeenCalled()
+    expect(mocks.wsSend).not.toHaveBeenCalledWith(sessionId, expect.objectContaining({ type: 'user_message' }))
+    expect(getComposerText()).toBe('/btw Why this change?')
+    expect(useUIStore.getState().toasts.some(toast => toast.message === 'This command is unavailable in lean mode. Start a standard chat to use it.')).toBe(true)
   })
 
   it.each(['idle', 'streaming'] as const)('routes /btw immediately while %s without main send or queue', async (chatState) => {
@@ -2132,9 +2171,9 @@ describe('ChatInput file mentions', () => {
     act(() => useSessionRuntimeStore.getState().setSelection(sessionId, { providerId: null, modelId: 'opus' }))
     try {
       render(<ChatInput compact />)
-      await waitFor(() => expect(mocks.listReferences).toHaveBeenLastCalledWith(expect.anything(), 'claude-official'))
+      await waitFor(() => expect(mocks.listReferences).toHaveBeenLastCalledWith(expect.anything(), 'claude-official', undefined))
       act(() => useSessionRuntimeStore.getState().setSelection(sessionId, { providerId: 'grok-official', modelId: 'grok-4.7' }))
-      await waitFor(() => expect(mocks.listReferences).toHaveBeenLastCalledWith(expect.anything(), 'grok-official'))
+      await waitFor(() => expect(mocks.listReferences).toHaveBeenLastCalledWith(expect.anything(), 'grok-official', undefined))
       setComposerText('@imagegen', 9)
       fireEvent.click(await screen.findByRole('option', { name: /imagegen/i }))
       await waitFor(() => expect(document.querySelector('[data-mention-kind="skill"]')).toBeInTheDocument())
@@ -2158,6 +2197,8 @@ describe('ChatInput file mentions', () => {
     expect(mocks.wsSend).toHaveBeenCalledWith(sessionId, {
       type: 'user_message', content: 'Use the Skill tool with skill: "team:review" for this request.', attachments: [],
     })
+    // The sent bubble names the pill from what this composer listed.
+    expect(useCapabilityCatalogStore.getState().entries['skill:skill:team:review']).toEqual({ label: 'Review' })
   })
 
   it.each(['@', '/', '/empty', '+'] as const)('hides withdrawn bundled capabilities in %s while keeping personal skills and other plugins', async (entry) => {
@@ -2278,7 +2319,8 @@ describe('ChatInput file mentions', () => {
     render(<ChatInput compact />)
 
     fireEvent.click(screen.getByLabelText('Open composer tools'))
-    fireEvent.click(screen.getByRole('option', { name: 'More tools' }))
+    // Agents sit on the menu's first level; there is no More row to open first.
+    expect(screen.queryByRole('option', { name: 'More tools' })).not.toBeInTheDocument()
     fireEvent.click(await screen.findByRole('option', { name: /^Agents/ }))
     fireEvent.click(await screen.findByRole('option', { name: /debugger/ }))
 
@@ -2351,6 +2393,17 @@ describe('ChatInput file mentions', () => {
 
     fireEvent.click(screen.getByLabelText('Open composer tools'))
     fireEvent.click((await screen.findByRole('option', { name: /Agent Teams/ })).querySelector('input[type="checkbox"]')!)
+
+    // Arming costs tokens and time, so the first attempt explains that. Cancel
+    // leaves the composer plain; confirming arms it.
+    const notice = await screen.findByRole('dialog')
+    expect(notice).toHaveTextContent('Uses a lot of tokens')
+    fireEvent.click(within(notice).getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByTestId('agent-team-chip')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByLabelText('Open composer tools'))
+    fireEvent.click((await screen.findByRole('option', { name: /Agent Teams/ })).querySelector('input[type="checkbox"]')!)
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Turn on anyway' }))
     const chip = await screen.findByTestId('agent-team-chip')
     expect(chip).toHaveTextContent('Agent Teams')
 
@@ -2375,6 +2428,7 @@ describe('ChatInput file mentions', () => {
   })
 
   it('disarms Agent Team from the chip before sending', async () => {
+    dismissAgentTeamsNotice()
     render(<ChatInput compact />)
     fireEvent.click(screen.getByLabelText('Open composer tools'))
     fireEvent.click((await screen.findByRole('option', { name: /Agent Teams/ })).querySelector('input[type="checkbox"]')!)

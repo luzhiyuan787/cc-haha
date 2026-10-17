@@ -6,6 +6,7 @@ import { marketApi } from '@/api/market'
 import { workflowsApi } from '@/api/workflows'
 import { useTranslation } from '@/i18n'
 import { COMPUTER_USE_ENABLE_REQUEST, needsComputerUsePermissionCard } from '@/lib/computerUseEnable'
+import { dismissAgentTeamsNotice, isAgentTeamsNoticeDismissed } from '@/lib/agentTeamsNotice'
 import { readRecentSkills } from '@/lib/recentSkills'
 import { useMarketStore } from '@/stores/marketStore'
 import { useSettingsStore } from '@/stores/settingsStore'
@@ -19,6 +20,7 @@ import type { WorkflowDefinition } from '@/types/workflow'
 import {
   buildCapabilitySections,
   type CapabilityAction,
+  type CapabilityMenuItem,
   type CapabilityMenuSection,
 } from './capabilityMenuModel'
 
@@ -58,6 +60,13 @@ export type ComputerUseConsent = {
   platform: 'darwin' | 'win32'
   onClose(): void
   onConfirm(): Promise<void>
+}
+
+/** Cost notice shown before the composer arms Agent Teams. */
+export type AgentTeamsNotice = {
+  open: boolean
+  onClose(): void
+  onConfirm(options: { dontRemind: boolean }): void
 }
 
 type CapabilityMenuData = {
@@ -108,6 +117,7 @@ export function resetPopularSkillsCache(): void {
 
 export function useCapabilityMenu(options: {
   open: boolean
+  lean?: boolean
   cwd: string
   references: ComposerReferenceCandidate[]
   handlers: CapabilityMenuComposerHandlers
@@ -117,21 +127,23 @@ export function useCapabilityMenu(options: {
   /** Agent Team is armed for the next message. */
   agentTeamArmed: boolean
   disarmAgentTeam(): void
+  agentTeamsNotice: AgentTeamsNotice
   computerUseConsent: ComputerUseConsent
 } {
-  const { open, cwd, references, handlers } = options
+  const { open, cwd, references, handlers, lean = false } = options
   const t = useTranslation()
   const [data, setData] = useState<CapabilityMenuData>(EMPTY_DATA)
   const [popularSkills, setPopularSkills] = useState<NormalizedSkill[]>([])
   const [recentSkillIds, setRecentSkillIds] = useState<string[]>([])
   const [armed, setArmed] = useState(false)
   const [consent, setConsent] = useState<{ open: boolean, loading: boolean }>({ open: false, loading: false })
+  const [agentTeamsNoticeOpen, setAgentTeamsNoticeOpen] = useState(false)
   const agentTeamsEnabled = useSettingsStore(state => state.agentTeamsEnabled)
   const installingSkillIds = useMarketStore(state => state.installingIds)
-  const agentTeamArmed = armed && agentTeamsEnabled
+  const agentTeamArmed = armed && agentTeamsEnabled && !lean
 
   useEffect(() => {
-    if (!open) return
+    if (!open || lean) return
     let active = true
     const cwdArg = cwd || undefined
     setRecentSkillIds(readRecentSkills())
@@ -168,7 +180,7 @@ export function useCapabilityMenu(options: {
     })()
 
     return () => { active = false }
-  }, [open, cwd])
+  }, [open, cwd, lean])
 
   const sections = useMemo(() => buildCapabilitySections({
     skills: references.filter(reference => reference.kind === 'skill'),
@@ -212,6 +224,7 @@ export function useCapabilityMenu(options: {
   }
 
   const onAction = (action: CapabilityAction) => {
+    if (lean && !isLeanAction(action)) return
     switch (action.type) {
       case 'attachment':
         handlers.onAttachment()
@@ -247,6 +260,13 @@ export function useCapabilityMenu(options: {
         void installSkill(action.id, action.name)
         return
       case 'toggleAgentTeam':
+        if (!armed && !isAgentTeamsNoticeDismissed()) {
+          // Arming costs real tokens and time: say so first. Turning it off
+          // never asks.
+          setAgentTeamsNoticeOpen(true)
+          handlers.onClose()
+          return
+        }
         setArmed(previous => !previous)
         return
       case 'toggleComputerUse': {
@@ -270,6 +290,16 @@ export function useCapabilityMenu(options: {
         return
       }
     }
+  }
+
+  const agentTeamsNotice: AgentTeamsNotice = {
+    open: agentTeamsNoticeOpen,
+    onClose: () => setAgentTeamsNoticeOpen(false),
+    onConfirm: ({ dontRemind }) => {
+      if (dontRemind) dismissAgentTeamsNotice()
+      setAgentTeamsNoticeOpen(false)
+      setArmed(true)
+    },
   }
 
   const computerUseConsent: ComputerUseConsent = {
@@ -300,10 +330,30 @@ export function useCapabilityMenu(options: {
   }
 
   return {
-    sections,
+    sections: lean ? sections.map(section => ({
+      ...section,
+      searchOnly: [],
+      items: filterLeanItems(section.items),
+    })).filter(section => section.items.length > 0) : sections,
     onAction,
     agentTeamArmed,
     disarmAgentTeam: () => setArmed(false),
+    agentTeamsNotice,
     computerUseConsent,
   }
+}
+
+function isLeanAction(action: CapabilityAction): boolean {
+  return action.type === 'attachment' || action.type === 'slashTrigger' ||
+    (action.type === 'insertMention' && action.reference.kind === 'skill')
+}
+
+function filterLeanItems(items: CapabilityMenuItem[]): CapabilityMenuItem[] {
+  return items.flatMap(item => {
+    if (item.children) {
+      const children = filterLeanItems(item.children)
+      return children.length ? [{ ...item, children, count: children.length }] : []
+    }
+    return item.action && isLeanAction(item.action) ? [item] : []
+  })
 }

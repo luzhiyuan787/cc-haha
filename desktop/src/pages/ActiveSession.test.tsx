@@ -195,6 +195,20 @@ describe('ActiveSession trajectory view', () => {
     useChatStore.setState({ sessions: { [id]: { ...createDefaultSessionState(), connectionState: 'connected', historyStatus: 'ready', historyHydrated: true, messages: [{ id: 'm', type: 'assistant_text', content: 'main', timestamp: 1 }] } } })
   }
 
+  it('retains the known tab title when summary metadata is unavailable', async () => {
+    const id = 'history-with-unavailable-summary'
+    seedSession(id)
+    useTabStore.setState({ tabs: [{ sessionId: id, title: 'Known search result title', type: 'session', status: 'idle' }] })
+    useSessionStore.setState({ sessions: [] })
+    await act(async () => { render(<ActiveSession sessionId={id} />) })
+    expect(screen.getByRole('heading', { name: 'Known search result title' })).toBeInTheDocument()
+    act(() => useSessionStore.setState({ sessions: [{
+      id, title: 'Authoritative loaded title', messageCount: 1, createdAt: '', modifiedAt: '',
+      projectPath: '/repo', workDir: '/repo', workDirExists: true,
+    }] }))
+    expect(screen.getByRole('heading', { name: 'Authoritative loaded title' })).toBeInTheDocument()
+  })
+
   it('swaps the chat body for the trajectory while keeping the chat and composer mounted', async () => {
     const id = 'trajectory-session'
     seedSession(id)
@@ -330,6 +344,15 @@ describe('ActiveSession task polling', () => {
     expect(headerEntry).toHaveLength(1)
     fireEvent.click(headerEntry[0]!)
     expect(openSideChat).toHaveBeenCalledWith(id)
+  })
+
+  it('does not offer side chats for restored lean sessions', () => {
+    const id = 'lean-parent'
+    useTabStore.setState({ activeTabId: id, tabs: [{ sessionId: id, title: 'Main', type: 'session', status: 'idle' }] })
+    useSessionStore.setState({ sessions: [{ id, agentProfile: 'lean', title: 'Main', messageCount: 1, createdAt: '', modifiedAt: '', projectPath: '/repo', workDir: '/repo', workDirExists: true }] })
+    useChatStore.setState({ sessions: { [id]: { ...createDefaultSessionState(), connectionState: 'connected', historyStatus: 'ready', historyHydrated: true } } })
+    render(<ActiveSession sessionId={id} />)
+    expect(screen.queryByRole('button', { name: 'Side chat' })).not.toBeInTheDocument()
   })
 
   it('can hide a mobile side chat without destroying its temporary tab', () => {

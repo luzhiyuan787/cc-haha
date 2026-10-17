@@ -45,6 +45,10 @@ import {
 } from '../services/providerRuntimeEnv.js'
 import { isOpenAIOfficialProviderId } from '../services/openaiOfficialProvider.js'
 import { isGrokOfficialProviderId } from '../services/grokOfficialProvider.js'
+import {
+  DEEPSEEK_ACCOUNT_PROVIDER,
+  isDeepSeekAccountProviderId,
+} from '../services/deepseekAccountProvider.js'
 import { getDesktopOpenAICodexModelCatalog } from '../services/openaiModelCatalog.js'
 import {
   OPENAI_DEFAULT_MAIN_MODEL,
@@ -2007,6 +2011,10 @@ async function handleSetPermissionMode(
       message: 'Permission mode is invalid.',
       code: 'PERMISSION_MODE_INVALID',
     })
+    return
+  }
+  if (message.mode === 'plan' && (await sessionService.getSessionLaunchInfo(sessionId))?.agentProfile === 'lean') {
+    sendMessage(ws, { type: 'error', message: 'Plan mode is unavailable in lean sessions. Choose another permission mode.', code: 'LEAN_CAPABILITY_UNAVAILABLE' })
     return
   }
   const pendingStartup = sessionStartupPromises.get(sessionId)
@@ -5322,6 +5330,7 @@ function isKnownRuntimeProviderId(
   return (
     isOpenAIOfficialProviderId(providerId) ||
     isGrokOfficialProviderId(providerId) ||
+    isDeepSeekAccountProviderId(providerId) ||
     providers.some((provider) => provider.id === providerId)
   )
 }
@@ -5470,6 +5479,10 @@ async function getDefaultRuntimeSettings(): Promise<RuntimeSettings> {
     } else if (isGrokOfficialProviderId(resolvedActiveId)) {
       model = model || GROK_DEFAULT_MAIN_MODEL
       effort = (await getGrokReasoningEfforts(model)).defaultEffort
+    } else if (isDeepSeekAccountProviderId(resolvedActiveId)) {
+      // Built-in, so absent from the saved list; its models are the preset's.
+      model = model || DEEPSEEK_ACCOUNT_PROVIDER.models.main
+      effort = await normalizeSavedProviderRuntimeEffort(resolvedActiveId, model, effort)
     } else {
       const activeProvider = providers.find((provider) => provider.id === resolvedActiveId)
       effort = await normalizeSavedProviderRuntimeEffort(
