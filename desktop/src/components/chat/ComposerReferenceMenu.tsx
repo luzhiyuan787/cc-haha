@@ -72,10 +72,16 @@ export const ComposerReferenceMenu = forwardRef<ComposerReferenceMenuHandle, Pro
   const directoryQuery = filter.replace(/\\/g, '/').trim()
   const browsingDirectory = directoryQuery.endsWith('/')
   const isSearching = directoryQuery.length > 0 || override !== undefined
-  const loading = isSearching && !browseReferences && currentResult === null
+  /** The filesystem is read for a query, and for the working directory the
+   *  unfiltered menu previews; a capability-only menu never reads it. */
+  const listsFiles = !browseReferences && (isSearching || !!cwd)
+  const loading = listsFiles && currentResult === null
 
   useEffect(() => {
-    if (browseReferences || !filter.trim() && override === undefined) return
+    // The unfiltered `@` menu previews the working directory too, so browse it
+    // as soon as one is known. Without a working directory there is nothing to
+    // list, and the empty-path request would resolve against a server default.
+    if (browseReferences || (!filter.trim() && override === undefined && !cwd)) return
     let active = true
     const controller = new AbortController()
     const base = (cwd || rootRef.current.path).replace(/[\\/]+$/, '')
@@ -125,7 +131,12 @@ export const ComposerReferenceMenu = forwardRef<ComposerReferenceMenuHandle, Pro
     ? [{ kind: 'results', label: t('chat.references'), rows: !browseReferences && (override || browsingDirectory)
       ? groups.find(group => group.kind === 'files')!.rows
       : rankComposerSuggestions(groups.flatMap(group => group.rows), filter) }]
-    : groups.filter(group => group.kind !== 'files' && (browseReferences || group.kind !== 'actions')).map(group => ({ ...group, rows: browseReferences ? group.rows : group.rows.slice(0, 3) }))
+    // Capabilities preview three rows each, but the working directory is a
+    // browse surface rather than a suggestion list: capping it hid the
+    // directory and file listing from the unfiltered menu entirely.
+    : groups
+        .filter(group => browseReferences ? group.kind !== 'files' : group.kind !== 'actions')
+        .map(group => ({ ...group, rows: browseReferences || group.kind === 'files' ? group.rows : group.rows.slice(0, 3) }))
   const rows = visibleGroups.flatMap(group => group.rows)
   const selectionKey = queryKey
   const foundIndex = selection?.query === selectionKey ? rows.findIndex(row => row.key === selection.key) : -1

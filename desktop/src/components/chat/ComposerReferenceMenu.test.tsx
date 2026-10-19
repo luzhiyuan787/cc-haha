@@ -22,13 +22,16 @@ beforeEach(() => {
   vi.mocked(filesystemApi.search).mockResolvedValue({ currentPath: '/work', parentPath: '/', entries: [file] })
 })
 
-it('previews capabilities without tabs or filesystem reads and inserts structured references', () => {
+it('previews capabilities and the working directory and inserts structured references', async () => {
   const ref = createRef<ComposerReferenceMenuHandle>()
   const onSelect = vi.fn()
   render(<ComposerReferenceMenu ref={ref} id="references" cwd="/work" references={references} onSelect={onSelect} />)
-  expect(screen.getAllByRole('option').map(row => row.textContent)).toEqual(['DesignCreate interfacesPersonal', 'HyperFramesVideo creationPlugin'])
+  // Capabilities preview three rows each; the working directory lists its own
+  // entries so `@` reaches a file without typing a filter first.
+  await screen.findByRole('option', { name: 'src' })
+  expect(screen.getAllByRole('option').map(row => row.textContent)).toEqual(['DesignCreate interfacesPersonal', 'HyperFramesVideo creationPlugin', 'src', 'app.ts'])
   expect(screen.queryByRole('radiogroup')).not.toBeInTheDocument()
-  expect(filesystemApi.browse).not.toHaveBeenCalled()
+  expect(filesystemApi.browse).toHaveBeenCalledWith('/work', { includeFiles: true, signal: expect.any(AbortSignal) })
   expect(filesystemApi.search).not.toHaveBeenCalled()
   expect(screen.getByRole('option', { name: 'HyperFrames' })).toHaveAccessibleDescription('Video creation')
   act(() => { ref.current!.handleKeyDown(new KeyboardEvent('keydown', { key: 'Enter', isComposing: true })) })
@@ -37,12 +40,34 @@ it('previews capabilities without tabs or filesystem reads and inserts structure
   expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ kind: 'skill', path: '/skills/design/SKILL.md', modelText: 'Use design' }))
 })
 
-it('limits empty previews to three per capability and gives embedded category browsers full access', () => {
+it('lists skills, sessions and the working directory together on a bare @', async () => {
+  vi.mocked(sessionCollaborationApi.list).mockResolvedValue({ sessions: [{ sessionId: 'past-session', title: 'Auth review', cwd: '/work/api', status: 'idle', updatedAt: '2026-09-20T00:00:00Z' }] })
+  render(<ComposerReferenceMenu id="bare" cwd="/work" references={references} onSelect={vi.fn()} />)
+  expect(await screen.findByRole('option', { name: 'src' })).toBeInTheDocument()
+  // Session suggestions settle after their own debounce.
+  expect(await screen.findByRole('option', { name: 'Auth review' })).toBeInTheDocument()
+  expect(screen.getByRole('group', { name: 'Skills' })).toBeInTheDocument()
+  expect(screen.getByRole('group', { name: 'Sessions' })).toBeInTheDocument()
+  expect(screen.getByRole('group', { name: 'Files' })).toBeInTheDocument()
+})
+
+it('does not read the filesystem for an unfiltered menu with no working directory', () => {
+  render(<ComposerReferenceMenu id="nocwd" cwd="" references={references} onSelect={vi.fn()} />)
+  expect(screen.getAllByRole('option')).toHaveLength(2)
+  expect(filesystemApi.browse).not.toHaveBeenCalled()
+  expect(filesystemApi.search).not.toHaveBeenCalled()
+})
+
+it('limits empty capability previews to three rows and gives embedded category browsers full access', async () => {
   const many = Array.from({ length: 12 }, (_, index) => ({ ...references[1]!, id: String(index), displayName: `Design ${index}` }))
   const action = { key: 'manage', label: 'Manage', onSelect: vi.fn() }
   const view = render(<ComposerReferenceMenu id="large" cwd="/work" references={many} actions={[action]} onSelect={vi.fn()} />)
-  expect(screen.getAllByRole('option')).toHaveLength(3)
+  // Three previewed skills plus the two working-directory entries; the action
+  // row belongs to search results, not the unfiltered menu.
+  await screen.findByRole('option', { name: 'src' })
+  expect(screen.getAllByRole('option')).toHaveLength(5)
   expect(screen.queryByRole('option', { name: 'Manage' })).not.toBeInTheDocument()
+  vi.mocked(filesystemApi.browse).mockClear()
   view.rerender(<ComposerReferenceMenu embedded browseReferences id="large" cwd="/work" references={many} actions={[action]} onSelect={vi.fn()} />)
   expect(screen.getAllByRole('option')).toHaveLength(13)
   fireEvent.click(screen.getByRole('option', { name: 'Manage' }))

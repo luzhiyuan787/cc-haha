@@ -3,6 +3,7 @@ import { render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import '@testing-library/jest-dom'
 
+import { filesystemApi } from '@/api/filesystem'
 import { sessionCollaborationApi } from '@/api/sessionCollaboration'
 import type { ComposerReferenceCandidate } from '@/types/composerReference'
 import { ComposerCapabilityMenu } from './ComposerCapabilityMenu'
@@ -34,6 +35,10 @@ const originalOffsetParent = Object.getOwnPropertyDescriptor(HTMLElement.prototy
 
 beforeEach(() => {
   vi.mocked(sessionCollaborationApi.list).mockResolvedValue({ sessions: [] })
+  // The unfiltered @ menu previews the working directory, so these are reached
+  // even when no query is typed.
+  vi.mocked(filesystemApi.browse).mockResolvedValue({ currentPath: '/work', parentPath: '/', entries: [] })
+  vi.mocked(filesystemApi.search).mockResolvedValue({ currentPath: '/work', parentPath: '/', entries: [] })
   HTMLElement.prototype.getBoundingClientRect = function getBoundingClientRect(this: HTMLElement) {
     const box = this.dataset.testid === 'page'
       ? { top: PAGE_TOP, bottom: 751 }
