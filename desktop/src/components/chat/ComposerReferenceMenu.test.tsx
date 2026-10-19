@@ -61,6 +61,17 @@ it('enters a subdirectory from the unfiltered working-directory list with ArrowR
   expect(onNavigate).toHaveBeenLastCalledWith('src/')
 })
 
+it('titles a truncated file row with its full relative path', async () => {
+  const longName = 'a-very-long-component-file-name-that-cannot-fit.tsx'
+  vi.mocked(filesystemApi.browse).mockResolvedValue({
+    currentPath: '/work/src',
+    parentPath: '/work',
+    entries: [{ name: longName, path: `/work/src/${longName}`, isDirectory: false }],
+  })
+  render(<ComposerReferenceMenu id="titles" cwd="/work" filter="src/" references={[]} onSelect={vi.fn()} />)
+  expect(await screen.findByRole('option', { name: longName })).toHaveAttribute('title', `src/${longName}`)
+})
+
 it('does not read the filesystem for an unfiltered menu with no working directory', () => {
   render(<ComposerReferenceMenu id="nocwd" cwd="" references={references} onSelect={vi.fn()} />)
   expect(screen.getAllByRole('option')).toHaveLength(2)

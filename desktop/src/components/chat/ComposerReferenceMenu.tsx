@@ -188,6 +188,9 @@ export const ComposerReferenceMenu = forwardRef<ComposerReferenceMenuHandle, Pro
               const sourceLabel = row.file ? null : skillSourceLabelKey(row.source)
               return <ComposerSuggestionRow key={row.key} id={getComposerReferenceOptionId(id, index)}
                 label={row.label} description={row.description}
+                // A deep path and a long name both truncate in the row, so hover
+                // shows the whole relative path as the file's identity.
+                title={row.file ? (row.file.relativePath ?? row.file.name) : undefined}
                 details={row.session ? <SessionReferenceDetails session={row.session} shortId={row.shortId!} /> : undefined} selected={activeIndex === index}
                 onMouseEnter={() => highlight(row)} onClick={event => {
                   if ((event.target as Element).closest('[data-navigate-directory]')) navigate(row)
