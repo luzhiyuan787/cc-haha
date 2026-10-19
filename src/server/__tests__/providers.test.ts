@@ -2665,8 +2665,9 @@ describe('ProviderService', () => {
           expect(calls).toHaveLength(2)
           expect(calls[0]!.thinking).toEqual({ type: 'enabled' })
           expect(calls[1]!.thinking).toBeUndefined()
-          // Only the refused field is dropped; the effort the user chose survives.
-          expect(calls[1]!.reasoning_effort).toBe('medium')
+          // Only the refused field is dropped; the effort survives, raised to
+          // the gateway's product-mandated maximum.
+          expect(calls[1]!.reasoning_effort).toBe('max')
 
           await diagnosticsService.drainForMigration()
           const [learned] = (await diagnosticsService.readRecentEvents(20))

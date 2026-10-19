@@ -113,19 +113,47 @@ function relaxForcedToolChoice(
 }
 
 /**
- * MiMo backends behind Console Go hard-reject the extended effort levels with
- * `Streaming response failed: [400] Invalid request parameters` (live bisect:
- * low/high pass, max fails, everything else in the production payload passes).
- * Claude Code's GLM/thinking profiles default to effort `max`, so every MiMo
- * request carrying one would 400. Degrading to `high` keeps the request valid.
+ * Console Go's Chat backends only understand `thinking` as an object typed
+ * `enabled` or `disabled`. Claude 5 profiles run Claude Code in adaptive
+ * thinking, which used to reach the gateway as `{type:'adaptive'}` and answer
+ * `400 ... thinking must be an object with type enabled or disabled` with a
+ * null `error.param` — a shape the field-level refusal learning cannot name,
+ * so the request failed on every attempt. Adaptive means "think at the
+ * model's discretion", the same posture the gateway's own thinking mode takes,
+ * so an unknown type normalizes to `enabled` and the reasoning strength rides
+ * on `reasoning_effort` below.
  */
-function clampUnsupportedReasoningEffort(
+function normalizeGatewayThinkingToggle(
   request: Record<string, unknown>,
   baseUrl: string,
 ): void {
   if (!OPENCODE_HOST_PATTERN.test(baseUrl)) return
-  if (request.reasoning_effort === 'max' || request.reasoning_effort === 'xhigh') {
-    request.reasoning_effort = 'high'
+  const thinking = request.thinking
+  if (!thinking || typeof thinking !== 'object') return
+  const type = (thinking as Record<string, unknown>).type
+  if (type !== 'enabled' && type !== 'disabled') request.thinking = { type: 'enabled' }
+}
+
+/**
+ * Every OpenCode-gateway model runs at maximum reasoning strength. Claude
+ * Code's budgets/profiles map to low/medium/high/max per request; on this host
+ * any effort the request carries is raised to `max`. Requests whose
+ * `reasoning_effort` was already dropped by the refusal learning stay dropped
+ * — re-adding it would turn a recoverable 400 into a permanent loop.
+ * (Known trade-off: the 2026-09-23 live bisect saw MiMo backends reject `max`
+ * with a generic `Invalid request parameters`; if that resurfaces, this is the
+ * single place to reinstate a per-family cap.)
+ */
+function forceGatewayMaxReasoningEffort(
+  request: Record<string, unknown>,
+  baseUrl: string,
+): void {
+  if (!OPENCODE_HOST_PATTERN.test(baseUrl)) return
+  if (request.reasoning_effort !== undefined) request.reasoning_effort = 'max'
+  const reasoning = request.reasoning
+  if (reasoning && typeof reasoning === 'object'
+    && (reasoning as Record<string, unknown>).effort !== undefined) {
+    ;(reasoning as Record<string, unknown>).effort = 'max'
   }
 }
 
@@ -792,7 +820,8 @@ async function handleOpenaiChat(
     imageContentMode,
   })
   relaxForcedToolChoice(transformed as unknown as Record<string, unknown>, baseUrl)
-  clampUnsupportedReasoningEffort(transformed as unknown as Record<string, unknown>, baseUrl)
+  normalizeGatewayThinkingToggle(transformed as unknown as Record<string, unknown>, baseUrl)
+  forceGatewayMaxReasoningEffort(transformed as unknown as Record<string, unknown>, baseUrl)
   if (traceContext) {
     traceContext.protocolTrace = new ProtocolTraceObserver('openai_chat', transformed,
       resolveRequestCompatibility(body, { ...requestOptions, protocol: 'openai_chat' }).outputBudget)
@@ -1087,7 +1116,7 @@ async function handleOpenaiResponses(
 ): Promise<Response> {
   const transformed = anthropicToOpenaiResponses(body, { ...requestOptions, cacheKey: promptCacheKey })
   relaxForcedToolChoice(transformed as unknown as Record<string, unknown>, baseUrl)
-  clampUnsupportedReasoningEffort(transformed as unknown as Record<string, unknown>, baseUrl)
+  forceGatewayMaxReasoningEffort(transformed as unknown as Record<string, unknown>, baseUrl)
   if (traceContext) {
     traceContext.protocolTrace = new ProtocolTraceObserver('openai_responses', transformed,
       resolveRequestCompatibility(body, { ...requestOptions, protocol: 'openai_responses' }).outputBudget)

@@ -237,8 +237,31 @@ describe('proxy opencode request adaptation', () => {
       // the field per model and resends without it rather than withholding the
       // toggle from the whole host up front.
       expect(body?.thinking).toEqual({ type: 'enabled' })
-      // Reasoning intent still maps onto the standard field.
-      expect(body?.reasoning_effort).toBe('high')
+      // Reasoning intent still maps onto the standard field, and the gateway
+      // raises every carried effort to max.
+      expect(body?.reasoning_effort).toBe('max')
+      await waitForTraceCallDone(SESSION_ID)
+    } finally {
+      upstream.restore()
+    }
+  })
+
+  test('normalizes adaptive thinking to a gateway-accepted toggle (strict backends reject the type)', async () => {
+    const provider = await makeProvider('openai_chat', 'https://opencode.ai/zen/go/')
+    const upstream = mockUpstreamCaptureHeaders(chatCompletionBody())
+    try {
+      // Claude 5 profiles run Claude Code in adaptive thinking; Console Go's
+      // validators answer `{type:'adaptive'}` with a null-param 400
+      // (`thinking must be an object with type enabled or disabled`) that the
+      // refusal learning cannot name, so the toggle must reach the wire typed.
+      const res = await callProxy(provider.id, SESSION_ID, {
+        thinking: { type: 'adaptive' },
+        output_config: { effort: 'max' },
+      })
+      expect(res.status).toBe(200)
+      const body = upstream.getCapturedBody()
+      expect(body?.thinking).toEqual({ type: 'enabled' })
+      expect(body?.reasoning_effort).toBe('max')
       await waitForTraceCallDone(SESSION_ID)
     } finally {
       upstream.restore()
@@ -308,19 +331,37 @@ describe('proxy opencode request adaptation', () => {
     }
   })
 
-  test('degrades the extended reasoning efforts the MiMo backends reject', async () => {
+  test('raises every carried reasoning effort to max on the gateway', async () => {
     const provider = await makeProvider('openai_chat', 'https://opencode.ai/zen/go/')
     const upstream = mockUpstreamCaptureHeaders(chatCompletionBody())
     try {
-      // Claude Code expresses the GLM/thinking profile default as output_config
-      // effort; both extended spellings must reach the wire as a value the
-      // backend takes (live bisect: low/high pass, max answers
-      // `Streaming response failed: [400] Invalid request parameters`).
-      for (const effort of ['max', 'xhigh'] as const) {
+      // Product rule: all OpenCode models run at maximum reasoning strength.
+      // Whatever effort the profile carries — a budget-mapped low/medium/high
+      // or an extended max/xhigh spelling — reaches the wire as `max`.
+      for (const effort of ['low', 'medium', 'high', 'max', 'xhigh'] as const) {
         const res = await callProxy(provider.id, SESSION_ID, { output_config: { effort } })
         expect(res.status).toBe(200)
-        expect(upstream.getCapturedBody()?.reasoning_effort, effort).toBe('high')
+        expect(upstream.getCapturedBody()?.reasoning_effort, effort).toBe('max')
       }
+      // A budget-mapped effort rides the same rule.
+      const budgeted = await callProxy(provider.id, SESSION_ID, {
+        thinking: { type: 'enabled', budget_tokens: 1024 },
+      })
+      expect(budgeted.status).toBe(200)
+      expect(upstream.getCapturedBody()?.reasoning_effort).toBe('max')
+      await waitForTraceCallDone(SESSION_ID)
+    } finally {
+      upstream.restore()
+    }
+  })
+
+  test('raises the responses lane reasoning effort to max on the gateway', async () => {
+    const provider = await makeProvider('openai_responses', 'https://opencode.ai/zen/go/')
+    const upstream = mockUpstreamCaptureHeaders(responsesBody())
+    try {
+      const res = await callProxy(provider.id, SESSION_ID, { output_config: { effort: 'low' } })
+      expect(res.status).toBe(200)
+      expect(upstream.getCapturedBody()?.reasoning).toEqual({ effort: 'max' })
       await waitForTraceCallDone(SESSION_ID)
     } finally {
       upstream.restore()
