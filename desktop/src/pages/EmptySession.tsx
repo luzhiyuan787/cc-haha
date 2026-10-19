@@ -607,10 +607,13 @@ export function EmptySession({ initialWorkDir = '', visible = true }: EmptySessi
     // Ignore key events during IME composition (e.g. Chinese input method)
     if (event.isComposing || event.keyCode === 229) return false
 
-    // Route reference selection and directory navigation to the unified menu
+    // Route reference selection and directory navigation to the unified menu.
+    // `ArrowRight` belongs here like the reference menu's own handler expects:
+    // without it the key reaches the editor, so a subdirectory in the `@` list
+    // could never be opened from this composer.
     if (fileSearchOpen) {
       const key = event.key
-      if (key === 'ArrowDown' || key === 'ArrowUp' || key === 'Enter' || key === 'Tab' || key === 'Escape') {
+      if (key === 'ArrowDown' || key === 'ArrowUp' || key === 'ArrowRight' || key === 'Enter' || key === 'Tab' || key === 'Escape') {
         event.preventDefault()
         if (key === 'Escape') {
           setFileSearchOpen(false)

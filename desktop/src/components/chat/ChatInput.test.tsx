@@ -2160,6 +2160,30 @@ describe('ChatInput file mentions', () => {
     expect(useChatStore.getState().sessions[sessionId]?.queuedUserMessages?.[0]).toMatchObject({ sessionReferences: [{ sessionId: 'prior' }] })
   })
 
+  it('enters a subdirectory from the unfiltered @ menu with ArrowRight', async () => {
+    mocks.browse.mockResolvedValue({
+      currentPath: '/repo',
+      parentPath: null,
+      entries: [
+        { name: 'src', path: '/repo/src', isDirectory: true },
+        { name: 'README.md', path: '/repo/README.md', isDirectory: false },
+      ],
+    })
+    render(<ChatInput compact />)
+    setComposerText('@', 1)
+    // Directories sort first, so the menu opens on the directory; walk down to
+    // the file and back to prove the keyboard drives the selection.
+    const option = await screen.findByRole('option', { name: 'src' })
+    expect(option).toHaveAttribute('aria-selected', 'true')
+    fireEvent.keyDown(getComposerElement(), { key: 'ArrowDown' })
+    expect(option).toHaveAttribute('aria-selected', 'false')
+    fireEvent.keyDown(getComposerElement(), { key: 'ArrowDown' })
+    expect(option).toHaveAttribute('aria-selected', 'true')
+    fireEvent.keyDown(getComposerElement(), { key: 'ArrowRight' })
+    expect(getComposerText()).toBe('@src/')
+    await waitFor(() => expect(mocks.browse).toHaveBeenLastCalledWith('/repo/src', expect.objectContaining({ includeFiles: true })))
+  })
+
   it('asks for @ candidates with the session provider and refetches when the provider changes', async () => {
     const imagegen = {
       kind: 'skill' as const, id: 'imagegen', name: 'imagegen', displayName: 'imagegen',

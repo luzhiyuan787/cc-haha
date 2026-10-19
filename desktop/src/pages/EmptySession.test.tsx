@@ -526,6 +526,28 @@ describe('EmptySession', () => {
     expect(mocks.createSession).not.toHaveBeenCalled()
   })
 
+  it('enters a subdirectory from the unfiltered @ menu with ArrowRight', async () => {
+    mocks.browse.mockResolvedValue({
+      currentPath: '/workspace/project',
+      parentPath: null,
+      entries: [
+        { name: 'src', path: '/workspace/project/src', isDirectory: true },
+        { name: 'README.md', path: '/workspace/project/README.md', isDirectory: false },
+      ],
+    })
+    render(<EmptySession />)
+    await pickProject()
+    setComposerText('@', 1)
+    // Directories sort first, so the menu opens on the directory already.
+    const option = await screen.findByRole('option', { name: 'src' })
+    expect(option).toHaveAttribute('aria-selected', 'true')
+    // Without ArrowRight in this composer's routing the key reached the editor
+    // and the subdirectory stayed shut.
+    fireEvent.keyDown(getComposerElement(), { key: 'ArrowRight' })
+    expect(getComposerText()).toBe('@src/')
+    await waitFor(() => expect(mocks.browse).toHaveBeenLastCalledWith('/workspace/project/src', expect.objectContaining({ includeFiles: true })))
+  })
+
   it('keeps user-only skills as slash text when no mention capability is available', async () => {
     mocks.listSkills.mockResolvedValue({ skills: [{ name: 'manual-only', description: 'User invocation only', userInvocable: true, disableModelInvocation: true }] })
     render(<EmptySession />)

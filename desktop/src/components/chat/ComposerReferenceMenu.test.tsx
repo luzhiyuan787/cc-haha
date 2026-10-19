@@ -51,6 +51,16 @@ it('lists skills, sessions and the working directory together on a bare @', asyn
   expect(screen.getByRole('group', { name: 'Files' })).toBeInTheDocument()
 })
 
+it('enters a subdirectory from the unfiltered working-directory list with ArrowRight', async () => {
+  const ref = createRef<ComposerReferenceMenuHandle>()
+  const onNavigate = vi.fn()
+  render(<ComposerReferenceMenu ref={ref} id="walk" cwd="/work" references={[]} onSelect={vi.fn()} onNavigate={onNavigate} />)
+  const option = await screen.findByRole('option', { name: 'src' })
+  fireEvent.mouseEnter(option)
+  act(() => { ref.current!.handleKeyDown(new KeyboardEvent('keydown', { key: 'ArrowRight' })) })
+  expect(onNavigate).toHaveBeenLastCalledWith('src/')
+})
+
 it('does not read the filesystem for an unfiltered menu with no working directory', () => {
   render(<ComposerReferenceMenu id="nocwd" cwd="" references={references} onSelect={vi.fn()} />)
   expect(screen.getAllByRole('option')).toHaveLength(2)
