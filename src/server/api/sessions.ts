@@ -545,11 +545,19 @@ async function getSessionMessages(req: Request, sessionId: string, url: URL): Pr
   // A full read always starts from the tail; mixing it with a cursor would
   // silently turn it back into a paged read with a larger budget.
   if (mode === 'full' && cursor) throw ApiError.badRequest('mode=full does not take a cursor')
+  // The desktop may ask for a smaller first screenful; the server still caps it
+  // at HISTORY_FULL_BYTES. Older history stays reachable through nextCursor.
+  const budgetBytesRaw = url.searchParams.get('budgetBytes')
+  const fullBytes = budgetBytesRaw === null ? undefined : Number(budgetBytesRaw)
+  if (fullBytes !== undefined && (!Number.isFinite(fullBytes) || fullBytes < 1)) {
+    throw ApiError.badRequest('Invalid history byte budget')
+  }
   return Response.json(await sessionService.getSessionHistoryPage(sessionId, {
     cursor,
     // `mode=full` returns the whole transcript up to the reader's byte budget in
     // one response so the desktop timeline never stitches pages together.
     full: mode === 'full',
+    ...(mode === 'full' && fullBytes !== undefined ? { fullBytes } : {}),
     signal: req.signal,
   }))
 }
@@ -1501,11 +1509,60 @@ function repoNameFromWorkDir(workDir: string): string {
   return path.basename(workDir) || workDir.split(/[\\/]/).filter(Boolean).at(-1) || ''
 }
 
+type GitInfoPayload = {
+  branch: string | null
+  repoName: string | null
+  workDir: string
+  changedFiles: number
+  worktree: {
+    enabled: boolean
+    path: string | null
+    plannedPath: string | null
+    sourceWorkDir: string | null
+    slug: string | null
+    branch: string | null
+  } | null
+}
+
+/**
+ * The desktop asks for this on every tab switch and every turn-state change.
+ * Overlapping requests used to run their own git commands, so a slow moment
+ * multiplied into dozens of concurrent spawns and stalled the event loop.
+ * Concurrent callers share one computation, and a short TTL absorbs bursts;
+ * each caller still gets its own Response because a body can only be read once.
+ */
+const GIT_INFO_CACHE_TTL_MS = 2_000
+const gitInfoInFlight = new Map<string, Promise<GitInfoPayload>>()
+const gitInfoCache = new Map<string, { payload: GitInfoPayload, expiresAt: number }>()
+
 async function getGitInfo(sessionId: string): Promise<Response> {
   const workDir = conversationService.getSessionWorkDir(sessionId) || await sessionService.getSessionWorkDir(sessionId)
   if (!workDir) {
     throw ApiError.notFound(`Session not found: ${sessionId}`)
   }
+  // The workDir is part of the key: a session can switch worktrees, and the
+  // answer describes that checkout.
+  const cacheKey = `${sessionId}\0${workDir}`
+  const cached = gitInfoCache.get(cacheKey)
+  if (cached && cached.expiresAt > Date.now()) {
+    return Response.json(cached.payload)
+  }
+
+  let pending = gitInfoInFlight.get(cacheKey)
+  if (!pending) {
+    const request = computeGitInfo(sessionId, workDir)
+    pending = request.finally(() => {
+      if (gitInfoInFlight.get(cacheKey) === pending) gitInfoInFlight.delete(cacheKey)
+    })
+    gitInfoInFlight.set(cacheKey, pending)
+  }
+
+  const payload = await pending
+  gitInfoCache.set(cacheKey, { payload, expiresAt: Date.now() + GIT_INFO_CACHE_TTL_MS })
+  return Response.json(payload)
+}
+
+async function computeGitInfo(sessionId: string, workDir: string): Promise<GitInfoPayload> {
   registerFilesystemAccessRoot(workDir)
   const launchInfo = await sessionService.getSessionLaunchInfo(sessionId).catch(() => null)
   const repository = launchInfo?.repository
@@ -1535,13 +1592,13 @@ async function getGitInfo(sessionId: string): Promise<Response> {
   const gitRoot = findGitRoot(workDir)
   if (!gitRoot) {
     const dirName = repoNameFromWorkDir(workDir)
-    return Response.json({
+    return {
       branch: sessionBranch,
       repoName: dirName,
       workDir,
       changedFiles: 0,
       worktree,
-    })
+    }
   }
 
   try {
@@ -1565,22 +1622,22 @@ async function getGitInfo(sessionId: string): Promise<Response> {
     const statusText = await runGitInfoCommand(workDir, ['-c', 'core.fsmonitor=false', 'status', '--porcelain'])
     const changedFiles = statusText?.split('\n').filter(Boolean).length ?? 0
 
-    return Response.json({
+    return {
       branch,
       repoName,
       workDir,
       changedFiles,
       worktree,
-    })
+    }
   } catch {
     // Not a git repo or git not available
-    return Response.json({
+    return {
       branch: sessionBranch,
       repoName: null,
       workDir,
       changedFiles: 0,
       worktree,
-    })
+    }
   }
 }
 

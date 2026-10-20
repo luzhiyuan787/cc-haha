@@ -4826,6 +4826,20 @@ describe('Sessions API', () => {
     }
   })
 
+  it('GET /api/sessions/:id/git-info should answer a concurrent burst with independent bodies', async () => {
+    // The desktop fires this from several components at once; they share one
+    // computation, but each caller still needs its own readable body.
+    const workDir = await createCleanGitRepo(tmpDir)
+    const { sessionId } = await sessionService.createSession(workDir)
+
+    const responses = await Promise.all(
+      Array.from({ length: 5 }, () => fetch(`${baseUrl}/api/sessions/${sessionId}/git-info`)),
+    )
+    expect(responses.every(res => res.status === 200)).toBe(true)
+    const bodies = await Promise.all(responses.map(res => res.json()))
+    for (const body of bodies) expect(body).toEqual(bodies[0])
+  })
+
   it('GET /api/sessions/:id/git-info should keep the session launch branch stable', async () => {
     const workDir = await createCleanGitRepo(tmpDir)
     const { sessionId } = await sessionService.createSession(
