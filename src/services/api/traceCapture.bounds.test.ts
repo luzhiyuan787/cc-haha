@@ -1,7 +1,7 @@
 import { expect, spyOn, test } from 'bun:test'
 import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
   clearTraceCaptureStateForTests,
   drainTraceCaptureForTests,
@@ -204,6 +204,37 @@ test('bounds queued cold jobs and cancels queued work before opening source file
   }
 }))
 
+
+test('rotates a session trace file once it outgrows the size cap', async () => {
+  const previous = process.env.CC_HAHA_TRACE_ROTATE_BYTES
+  process.env.CC_HAHA_TRACE_ROTATE_BYTES = '1024'
+  try {
+    await fixture(async filePath => {
+      for (let index = 0; index < 12; index += 1) {
+        await traceCaptureService.recordEvent({
+          sessionId: 'fixture',
+          phase: 'grow',
+          metadata: { index, pad: 'x'.repeat(200) },
+        })
+      }
+
+      const files = (await fs.readdir(dirname(filePath))).filter(name => name.startsWith('fixture'))
+      expect(files).toContain('fixture.jsonl')
+      expect(files.length).toBeGreaterThan(1)
+
+      // The canonical file keeps only the newest entries; the rest live in the
+      // archive beside it instead of making one unbounded file.
+      const canonical = await fs.readFile(filePath, 'utf8')
+      expect(Buffer.byteLength(canonical)).toBeLessThanOrEqual(1024 + 4096)
+      const latest = JSON.parse(canonical.trim().split('\n').at(-1)!)
+      expect(latest.event).toMatchObject({ phase: 'grow' })
+      expect(latest.event.metadata.index).toBe(11)
+    })
+  } finally {
+    if (previous === undefined) delete process.env.CC_HAHA_TRACE_ROTATE_BYTES
+    else process.env.CC_HAHA_TRACE_ROTATE_BYTES = previous
+  }
+})
 
 test('live event metadata is bounded without invoking accessors', () => fixture(async filePath => {
   let getterCalls = 0

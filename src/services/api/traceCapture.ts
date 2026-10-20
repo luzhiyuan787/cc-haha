@@ -2896,6 +2896,40 @@ async function projectAppendedTraceEntry(
   }
 }
 
+// Above the 64 MiB read-window fixtures so window semantics stay intact, and
+// below the hundreds-of-megabytes files a multi-day session produced.
+const TRACE_ROTATE_BYTES_LIMIT = 128 * 1024 * 1024
+
+function getTraceRotateBytesLimit(): number {
+  const raw = process.env.CC_HAHA_TRACE_ROTATE_BYTES
+  if (!raw) return TRACE_ROTATE_BYTES_LIMIT
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : TRACE_ROTATE_BYTES_LIMIT
+}
+
+/**
+ * Keeps one session's trace bounded. A session that runs for days used to grow
+ * a single JSONL file to hundreds of megabytes, which made reads and indexing
+ * slow. Past the cap the current file is archived beside it and a fresh
+ * canonical file starts; the session's index entry is dropped so the new file
+ * is projected from byte zero. Archives stay on disk and in the file list.
+ */
+async function rotateTraceFileIfNeeded(
+  sessionId: string,
+  filePath: string,
+  incomingBytes: number,
+  target: TraceIndexTarget,
+): Promise<void> {
+  const existing = await fs.stat(filePath).catch(() => null)
+  if (!existing || existing.size === 0) return
+  if (existing.size + incomingBytes <= getTraceRotateBytesLimit()) return
+  const archivePath = filePath.replace(/\.jsonl$/, `.${Date.now()}.jsonl`)
+  await fs.rename(filePath, archivePath)
+  traceReadCache.delete(filePath)
+  canonicalTraceRevisions.delete(filePath)
+  withTraceIndex(index => index.deleteSession(sessionId), target)
+}
+
 async function appendTraceEntry(sessionId: string, entry: TraceFileEntry): Promise<void> {
   const normalizedSessionId = sanitizeTraceFileName(sessionId)
   const scope = getClaudeConfigHomeDir()
@@ -2917,6 +2951,7 @@ async function appendTraceEntry(sessionId: string, entry: TraceFileEntry): Promi
       await traceAppendBeforeWriteHookForTests?.()
       await fs.mkdir(dirname(filePath), { recursive: true })
       const line = Buffer.from(`${JSON.stringify(boundedTraceEntry(entry))}\n`, 'utf-8')
+      await rotateTraceFileIfNeeded(normalizedSessionId, filePath, line.byteLength, target)
       await fs.appendFile(filePath, line)
       const after = await fs.stat(filePath)
       traceReadCache.delete(filePath)
