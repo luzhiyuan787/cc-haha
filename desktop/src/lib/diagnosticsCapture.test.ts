@@ -32,4 +32,38 @@ describe('renderer performance diagnostics', () => {
     expect(record).toHaveBeenCalledTimes(1)
     stop()
   })
+
+  it('does not report time spent hidden as a stall after the window returns', () => {
+    let now = 0
+    let sample: (() => void) | undefined
+    let visibilityHandler: (() => void) | undefined
+    let visible = true
+    const record = vi.fn().mockResolvedValue(undefined)
+    const stop = startRendererPerformanceMonitor({
+      now: () => now,
+      visible: () => visible,
+      record,
+      subscribeVisibility: (handler) => {
+        visibilityHandler = handler
+        return () => {}
+      },
+      setInterval: ((callback: TimerHandler) => {
+        sample = callback as () => void
+        return 1
+      }) as typeof window.setInterval,
+      clearInterval: vi.fn() as unknown as typeof window.clearInterval,
+    })
+
+    // A minute hidden: throttled timers are not a renderer stall.
+    visible = false
+    now = 60_000
+    sample?.()
+
+    visible = true
+    visibilityHandler?.()
+    now = 61_200
+    sample?.()
+    expect(record).not.toHaveBeenCalled()
+    stop()
+  })
 })

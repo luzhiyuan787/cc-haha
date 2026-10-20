@@ -4370,7 +4370,7 @@ export class SessionService {
     return { entries: visibleEntries, contextScanBytes: context.scannedBytes }
   }
 
-  async getSessionHistoryPage(sessionId: string, options: { cursor?: string; limit?: number; signal?: AbortSignal; full?: boolean; projectContext?: boolean } = {}): Promise<{
+  async getSessionHistoryPage(sessionId: string, options: { cursor?: string; limit?: number; signal?: AbortSignal; full?: boolean; fullBytes?: number; projectContext?: boolean } = {}): Promise<{
     messages: MessageEntry[]
     taskNotifications: SessionTaskNotification[]
     page: HistoryPageInfo

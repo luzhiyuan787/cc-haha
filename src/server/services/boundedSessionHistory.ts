@@ -154,6 +154,8 @@ function firstBytes(parts: Buffer[], limit: number): Buffer {
 
 export async function readBoundedHistoryPage(filePath: string, options: {
   cursor?: string; limit?: number; signal?: AbortSignal; full?: boolean; budget?: HistoryPageBudget
+  /** Caller's output budget for the full-history path, capped at HISTORY_FULL_BYTES. */
+  fullBytes?: number
   /** Report complete oversized records (with a bounded line head) in `oversized`. */
   captureOversized?: boolean
   /** Page-path byte cost of one parsed record; defaults to its serialized length. */
@@ -212,7 +214,9 @@ export async function readBoundedHistoryPage(filePath: string, options: {
       const budget = options.full ? undefined : options.budget
       const pageRecords = clampBudget(budget?.records, HISTORY_PAGE_RECORDS, HISTORY_PAGE_BUDGET_MAX.records)
       const recordLimit = Math.max(1, Math.min(options.full ? Number.MAX_SAFE_INTEGER : pageRecords, Math.floor(options.limit ?? (options.full ? HISTORY_FULL_ROWS : pageRecords))))
-      const byteBudget = options.full ? HISTORY_FULL_BYTES : clampBudget(budget?.bytes, HISTORY_PAGE_BYTES, HISTORY_PAGE_BUDGET_MAX.bytes)
+      const byteBudget = options.full
+        ? clampBudget(options.fullBytes, HISTORY_FULL_BYTES, HISTORY_FULL_BYTES)
+        : clampBudget(budget?.bytes, HISTORY_PAGE_BYTES, HISTORY_PAGE_BUDGET_MAX.bytes)
       const rowBudget = options.full ? HISTORY_FULL_ROWS : clampBudget(budget?.rows, HISTORY_PAGE_ROWS, HISTORY_PAGE_BUDGET_MAX.rows)
       const scanBudget = options.full ? HISTORY_FULL_SCAN_BYTES : HISTORY_SCAN_BYTES
       const load = async (): Promise<boolean> => {

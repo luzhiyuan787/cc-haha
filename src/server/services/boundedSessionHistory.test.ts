@@ -32,6 +32,17 @@ describe('bounded history full read', () => {
     expect(result.entries.at(-1)!.entry.uuid).toBe('39')
   })
 
+  test('honors a caller-supplied byte budget below the full-read default', async () => {
+    await writeFile(file, Array.from({ length: 20 }, (_, index) => row(String(index), 'x'.repeat(256 * 1024))).join(''))
+    const result = await readBoundedHistoryPage(file, { full: true, fullBytes: 512 * 1024 })
+    expect(result.entries.length).toBeGreaterThan(0)
+    expect(result.entries.length).toBeLessThan(20)
+    expect(result.page.historyComplete).toBe(false)
+    expect(result.page.nextCursor).not.toBeNull()
+    // The newest slice is kept; the client continues backward from this cursor.
+    expect(result.entries.at(-1)!.entry.uuid).toBe('19')
+  })
+
   test('honors the row limit while leaving a continuation cursor', async () => {
     await writeFile(file, Array.from({ length: 12 }, (_, index) => row(String(index))).join(''))
     const result = await readBoundedHistoryPage(file, { full: true, limit: 4 })

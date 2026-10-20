@@ -12,6 +12,7 @@ type RendererPerformanceMonitorDependencies = {
   record?: typeof rawRecordDiagnosticEvent
   setInterval?: typeof window.setInterval
   clearInterval?: typeof window.clearInterval
+  subscribeVisibility?: (handler: () => void) => () => void
 }
 
 export function installClientDiagnosticsCapture() {
@@ -50,13 +51,25 @@ export function startRendererPerformanceMonitor(
   const record = dependencies.record ?? rawRecordDiagnosticEvent
   const schedule = dependencies.setInterval ?? window.setInterval.bind(window)
   const cancel = dependencies.clearInterval ?? window.clearInterval.bind(window)
+  const subscribeVisibility = dependencies.subscribeVisibility ?? ((handler: () => void) => {
+    document.addEventListener('visibilitychange', handler)
+    return () => document.removeEventListener('visibilitychange', handler)
+  })
   let expectedAt = now() + EVENT_LOOP_SAMPLE_MS
   let lastReportedAt = Number.NEGATIVE_INFINITY
+  // Chromium throttles timers while the window is hidden; measuring that as a
+  // renderer stall reported minutes-long "freezes" that never happened. Restart
+  // the clock whenever visibility changes, and never measure hidden time.
+  const resetClock = () => { expectedAt = now() + EVENT_LOOP_SAMPLE_MS }
+  const unsubscribeVisibility = subscribeVisibility(resetClock)
   const timer = schedule(() => {
     const sampledAt = now()
+    if (!visible()) {
+      expectedAt = sampledAt + EVENT_LOOP_SAMPLE_MS
+      return
+    }
     const lagMs = Math.max(0, sampledAt - expectedAt)
     expectedAt = sampledAt + EVENT_LOOP_SAMPLE_MS
-    if (!visible()) return
     if (
       lagMs < EVENT_LOOP_STALL_MS ||
       sampledAt - lastReportedAt < EVENT_LOOP_REPORT_COOLDOWN_MS
@@ -80,7 +93,10 @@ export function startRendererPerformanceMonitor(
       },
     })
   }, EVENT_LOOP_SAMPLE_MS)
-  return () => cancel(timer)
+  return () => {
+    cancel(timer)
+    unsubscribeVisibility()
+  }
 }
 
 export function reportReactError(error: unknown, errorInfo: React.ErrorInfo) {

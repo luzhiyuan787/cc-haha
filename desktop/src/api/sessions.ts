@@ -5,6 +5,11 @@ import type { AgentProfile, LocalIndexStatus, SessionListItem, MessageEntry } fr
 import type { PermissionMode } from '../types/settings'
 import type { TraceCallRecord, TraceSession } from '../types/trace'
 
+/** First-screen budget for a session timeline. A multi-day transcript used to
+ *  arrive as one 30MB+ response on every reload and froze the renderer; older
+ *  rows now arrive through the windowed "load older" path. */
+const INITIAL_HISTORY_BUDGET_BYTES = 8 * 1024 * 1024
+
 export type SessionsResponse = {
   sessions: SessionListItem[]
   total: number
@@ -472,9 +477,15 @@ export const sessionsApi = {
   },
 
   // The timeline receives one assembled transcript. Ordinary sessions fit in
-  // `mode=full`; larger sessions continue within the server's request budgets.
+  // `mode=full`; larger sessions stop at the initial byte budget and leave the
+  // rest behind `nextCursor`, which the windowed "load older" path consumes.
+  // Assembling a multi-day transcript in one go froze the renderer for tens of
+  // seconds per reload.
   async getFullHistory(sessionId: string, options?: ApiRequestOptions): Promise<SessionHistoryPage> {
-    const newest = await api.get<SessionHistoryPage>(`/api/sessions/${sessionId}/messages?mode=full`, options)
+    const newest = await api.get<SessionHistoryPage>(
+      `/api/sessions/${sessionId}/messages?mode=full&budgetBytes=${INITIAL_HISTORY_BUDGET_BYTES}`,
+      options,
+    )
     if (!newest.page?.nextCursor) return newest
 
     // Transport budgets are page boundaries, not timeline boundaries. Join raw
@@ -485,7 +496,7 @@ export const sessionsApi = {
     let omitted = newest.page.omittedOversizedEntries
     let truncated = Boolean(newest.page.contentTruncated)
     let scannedBytes = newest.page.scannedBytes
-    while (cursor) {
+    while (cursor && scannedBytes < INITIAL_HISTORY_BUDGET_BYTES) {
       if (options?.signal?.aborted) throw options.signal.reason ?? new DOMException('Aborted', 'AbortError')
       if (seen.has(cursor)) throw new Error('Session history cursor did not advance')
       seen.add(cursor)
@@ -507,9 +518,9 @@ export const sessionsApi = {
       taskNotifications: pages.flatMap(page => page.taskNotifications ?? []),
       page: {
         ...newest.page,
-        nextCursor: null,
-        hasMore: false,
-        historyComplete: omitted === 0 && !truncated && !newest.page.previousCursor,
+        nextCursor: cursor,
+        hasMore: Boolean(cursor),
+        historyComplete: !cursor && omitted === 0 && !truncated && !newest.page.previousCursor,
         contentTruncated: truncated,
         omittedOversizedEntries: omitted,
         scannedBytes,

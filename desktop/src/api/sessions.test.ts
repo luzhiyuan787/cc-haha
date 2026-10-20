@@ -376,10 +376,20 @@ describe('full session history assembly', () => {
     expect(result.taskNotifications?.map(notice => notice.taskId)).toEqual(['user', 'call', 'result'])
     expect(result.page).toMatchObject({ nextCursor: null, hasMore: false, historyComplete: true, scannedBytes: 30 })
     expect(fetchMock.mock.calls.map(call => call[0])).toEqual([
-      'http://127.0.0.1:3456/api/sessions/fixture/messages?mode=full',
+      'http://127.0.0.1:3456/api/sessions/fixture/messages?mode=full&budgetBytes=8388608',
       'http://127.0.0.1:3456/api/sessions/fixture/messages?cursor=middle',
       'http://127.0.0.1:3456/api/sessions/fixture/messages?cursor=oldest',
     ])
+  })
+
+  it('stops at the initial byte budget and leaves older rows to the windowed loader', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(response(page('new', 'older', { scannedBytes: 9 * 1024 * 1024 })))
+    const result = await sessionsApi.getFullHistory('fixture')
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(result.messages.map(message => message.id)).toEqual(['new'])
+    // The cursor survives so MessageList's "load older" path can continue.
+    expect(result.page).toMatchObject({ nextCursor: 'older', hasMore: true, historyComplete: false })
   })
 
   it('keeps the single-request fast path', async () => {
