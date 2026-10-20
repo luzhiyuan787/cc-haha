@@ -283,6 +283,31 @@ describe('anthropicToOpenaiChat', () => {
     expect(msg.tool_calls?.[0].id).toBe('call_1')
   })
 
+  test('keeps reasoning_content with the tool call when Claude Code splits the turn into two assistant messages', () => {
+    // The CLI stores a streamed turn as `thinking` and `tool_use` in separate
+    // assistant messages. DeepSeek's thinking mode rejects the follow-up
+    // request with "The reasoning_content in the thinking mode must be passed
+    // back to the API" unless the tool-call message carries it.
+    const req: AnthropicRequest = {
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 100,
+      messages: [
+        { role: 'user', content: 'What is the weather?' },
+        { role: 'assistant', content: [{ type: 'thinking', thinking: 'Need the weather first.' }] },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'call_1', name: 'get_weather', input: { location: 'Hangzhou' } }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_1', content: 'sunny' }] },
+      ],
+    }
+
+    const result = anthropicToOpenaiChat(req, { roundTripReasoningContent: true })
+    const assistants = result.messages.filter(message => message.role === 'assistant')
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0]!.reasoning_content).toBe('Need the weather first.')
+    expect(assistants[0]!.tool_calls?.[0]?.id).toBe('call_1')
+    // The tool result still follows as its own message.
+    expect(result.messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: 'call_1' })
+  })
+
   test('user message with tool_result', () => {
     const req: AnthropicRequest = {
       model: 'gpt-4',

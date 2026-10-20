@@ -629,6 +629,26 @@ function convertAssistantMessage(
     msg.reasoning_content = reasoningContent
   }
 
+  // Claude Code stores one streamed turn as two assistant messages: a
+  // thinking-only message followed by the text/tool_use message. Chat
+  // Completions has one assistant message per turn, and thinking-mode
+  // upstreams (DeepSeek) reject a tool-call message whose history carries no
+  // `reasoning_content`, so fold adjacent assistant messages together and keep
+  // the reasoning attached to the calls it produced.
+  const previous = output.at(-1)
+  if (previous?.role === 'assistant') {
+    if (textContent) {
+      previous.content = previous.content ? `${previous.content}\n\n${textContent}` : textContent
+    }
+    if (reasoningContent) {
+      previous.reasoning_content = `${previous.reasoning_content ?? ''}${reasoningContent}`
+    }
+    if (toolCalls.length > 0) {
+      previous.tool_calls = [...(previous.tool_calls ?? []), ...toolCalls]
+    }
+    return
+  }
+
   output.push(msg)
 }
 
