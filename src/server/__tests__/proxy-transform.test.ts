@@ -308,6 +308,34 @@ describe('anthropicToOpenaiChat', () => {
     expect(result.messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: 'call_1' })
   })
 
+  test('backfills reasoning_content on DeepSeek tool-call history that has no thinking', () => {
+    // The transcript can genuinely lack reasoning for a tool-call turn: the
+    // model may answer a call without emitting a thinking block at all, and
+    // the CLI strips thinking after a model/credential change. DeepSeek still
+    // rejects the replay ("reasoning_content ... must be passed back"), so the
+    // transform supplies a marker instead of leaving the field absent.
+    const req: AnthropicRequest = {
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 100,
+      messages: [
+        { role: 'user', content: 'list the files' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'call_1', name: 'Bash', input: { command: 'ls' } }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_1', content: 'a.ts' }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'One file.' }] },
+      ],
+    }
+
+    const defaultResult = anthropicToOpenaiChat(req)
+    expect(defaultResult.messages[1].reasoning_content).toBeUndefined()
+
+    const result = anthropicToOpenaiChat(req, { roundTripReasoningContent: true })
+    expect(result.messages[1]).toMatchObject({ role: 'assistant', tool_calls: [{ id: 'call_1' }] })
+    expect(result.messages[1]!.reasoning_content).toBe('(reasoning omitted)')
+    // A plain assistant turn without tool calls does not need the marker.
+    expect(result.messages.at(-1)).toMatchObject({ role: 'assistant', content: 'One file.' })
+    expect(result.messages.at(-1)!.reasoning_content).toBeUndefined()
+  })
+
   test('user message with tool_result', () => {
     const req: AnthropicRequest = {
       model: 'gpt-4',

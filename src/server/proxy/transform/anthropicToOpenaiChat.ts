@@ -42,6 +42,14 @@ const FILE_IMAGE_OMITTED_TEXT = '\n[Image omitted: file-based image source is no
 const MEDIA_RESULT_ATTACHED_TEXT = 'Media result attached after this tool result.'
 const DOCUMENT_TEXT_INLINE_LIMIT = 2000
 
+// DeepSeek's thinking mode validates history structurally: an assistant turn
+// that carries `tool_calls` must also carry `reasoning_content`, even though
+// the upstream ignores replayed reasoning. A transcript can legitimately lack
+// it — the model answered a tool call without emitting reasoning, the CLI
+// stripped thinking after a model/credential change, or the session predates
+// thinking — so a marker keeps those turns replayable.
+const MISSING_REASONING_CONTENT = '(reasoning omitted)'
+
 /**
  * Convert Anthropic Messages request to OpenAI Chat Completions request.
  */
@@ -68,6 +76,18 @@ export function anthropicToOpenaiChat(
   const messageOptions = compatibility.passReasoning ? options : { ...options, roundTripReasoningContent: false }
   for (const msg of body.messages) {
     convertMessage(msg, messages, messageOptions)
+  }
+
+  // Thinking-mode upstreams reject a tool-call turn whose history carries no
+  // reasoning, and the transcript cannot always supply real reasoning (see
+  // MISSING_REASONING_CONTENT). Backfill before serialization so the request
+  // stays valid; turns that do have reasoning keep it untouched.
+  if (messageOptions.roundTripReasoningContent) {
+    for (const message of messages) {
+      if (message.role === 'assistant' && message.tool_calls?.length && !message.reasoning_content) {
+        message.reasoning_content = MISSING_REASONING_CONTENT
+      }
+    }
   }
 
   // Build request

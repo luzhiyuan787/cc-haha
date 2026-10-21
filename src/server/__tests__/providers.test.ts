@@ -2539,6 +2539,34 @@ describe('ProviderService', () => {
         const genericMessages = calls[1].messages as Array<Record<string, unknown>>
         const genericAssistant = genericMessages.find(message => message.role === 'assistant')
         expect(genericAssistant?.reasoning_content).toBeUndefined()
+
+        // A tool-call turn the transcript stored without thinking — the model
+        // emitted none, or the CLI stripped it after a model change — must
+        // still replay; otherwise every later request repeats the 400 that the
+        // mock raises whenever the assistant message lacks reasoning_content.
+        const noThinkingRequest = new Request('http://localhost:3456/proxy/v1/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'deepseek-v4-flash',
+            max_tokens: 64,
+            messages: [
+              {
+                role: 'assistant',
+                content: [{ type: 'tool_use', id: 'call_1', name: 'read_file', input: { path: 'README.md' } }],
+              },
+              {
+                role: 'user',
+                content: [{ type: 'tool_result', tool_use_id: 'call_1', content: 'Repository contents' }],
+              },
+            ],
+          }),
+        })
+        const noThinkingResponse = await handleProxyRequest(noThinkingRequest, new URL(noThinkingRequest.url))
+        expect(noThinkingResponse.status).toBe(200)
+        const noThinkingMessages = calls[2].messages as Array<Record<string, unknown>>
+        const noThinkingAssistant = noThinkingMessages.find(message => message.role === 'assistant')
+        expect(noThinkingAssistant?.reasoning_content).toBe('(reasoning omitted)')
       } finally {
         globalThis.fetch = originalFetch
       }
