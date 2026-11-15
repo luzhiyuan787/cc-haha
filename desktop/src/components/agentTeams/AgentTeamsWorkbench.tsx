@@ -14,6 +14,7 @@ import type {
 import { AgentTeamsCanvas } from './AgentTeamsCanvas'
 import { AgentTeamsCommunicationFeed } from './AgentTeamsCommunicationFeed'
 import { AgentTeamsMemberInspector } from './AgentTeamsMemberInspector'
+import { AgentTeamsRuntimeControls } from './AgentTeamsRuntimeControls'
 import {
   getMemberWorkState,
   getWorkbenchPhase,
@@ -319,6 +320,8 @@ export function AgentTeamsWorkbench({ sessionId }: { sessionId: string }) {
   return (
     <section
       aria-label={t('agentTeams.title')}
+      // Find-in-page scope for the message lists' controller (useTranscriptFind).
+      data-agent-teams-workbench=""
       className="relative flex h-full min-h-0 min-w-0 w-full flex-col overflow-hidden bg-[var(--color-surface)] text-[var(--color-text-primary)]"
     >
       {/* A narrow pane wraps the controls onto a row of their own instead of
@@ -489,6 +492,8 @@ export function AgentTeamsWorkbench({ sessionId }: { sessionId: string }) {
           )}
         </div>
       </header>
+
+      <AgentTeamsRuntimeControls team={snapshot.team} readOnly={!followingLive || timeline?.source === 'archive' || timeline?.source === 'transcript'} />
 
       <div className="relative flex min-h-0 flex-1">
         <div

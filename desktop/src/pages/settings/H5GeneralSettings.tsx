@@ -7,6 +7,7 @@ import { modelsApi } from '@/api/models'
 import { SettingsGroup, SettingsRow, SettingsSection, SettingsSwitchRow } from '@/components/settings/SettingsSection'
 import { SelectField, type SelectFieldProps } from '@/components/ui/SelectField'
 import type { ChatSendBehavior, ThemeMode, UserSettings, EffortLevel } from '@/types/settings'
+import { SettingsHelpTopic } from './SettingsHelpTopic'
 
 export function H5GeneralSettings() {
   const t = useTranslation()
@@ -37,6 +38,7 @@ export function H5GeneralSettings() {
     { value: 'white', label: t('settings.general.appearance.white') }, { value: 'paper', label: t('settings.general.appearance.paper') },
     { value: 'warm-classic', label: t('settings.general.appearance.warmClassic') }, { value: 'celadon', label: t('settings.general.appearance.celadon') },
     { value: 'dark', label: t('settings.general.appearance.dark') }, { value: 'ink-blue', label: t('settings.general.appearance.inkBlue') },
+    { value: 'neutral-dark', label: t('settings.general.appearance.neutralDark') },
   ]
   const effortLabels = {
     low: t('settings.general.effort.low'), medium: t('settings.general.effort.medium'), high: t('settings.general.effort.high'),
@@ -73,8 +75,8 @@ export function H5GeneralSettings() {
         {select(t('settings.general.outputStyleTitle'), { disabled: busy, value: settings.outputStyle || 'default', options: styles, onChange: (outputStyle) => void save({ outputStyle }) })}
         {select<EffortLevel>(t('h5Settings.effort'), { disabled: busy || !effortOptions.length, value: selectedEffort, options: effortOptions.map((value) => ({ value, label: effortLabels[value] })), onChange: (value) => void effort(value) })}
         {select<ChatSendBehavior>(t('h5Settings.sendBehavior'), { disabled: busy, value: settings.chatSendBehavior, options: [{ value: 'enter', label: t('h5Settings.enter') }, { value: 'modifierEnter', label: t('h5Settings.modifierEnter') }], onChange: (chatSendBehavior) => void save({ chatSendBehavior }) })}
-        <SettingsSwitchRow disabled={busy} checked={settings.thinkingEnabled} title={t('settings.general.thinkingEnabled')} description={t('settings.general.thinkingDescription')} onChange={(alwaysThinkingEnabled) => void save({ alwaysThinkingEnabled })} />
-        <SettingsSwitchRow disabled={busy} checked={settings.workflowKeywordTriggerEnabled} title={t('settings.general.workflowKeywordEnabled')} description={t('settings.general.workflowKeywordDescription')} onChange={(workflowKeywordTriggerEnabled) => void save({ workflowKeywordTriggerEnabled })} />
+        <SettingsSwitchRow disabled={busy} checked={settings.thinkingEnabled} title={t('settings.general.thinkingEnabled')} description={t('settings.general.thinkingDescription')} help={<SettingsHelpTopic topic="thinking" />} onChange={(alwaysThinkingEnabled) => void save({ alwaysThinkingEnabled })} />
+        <SettingsSwitchRow disabled={busy} checked={settings.workflowKeywordTriggerEnabled} title={t('settings.general.workflowKeywordEnabled')} description={t('settings.general.workflowKeywordDescription')} help={<SettingsHelpTopic topic="ultracode" />} onChange={(workflowKeywordTriggerEnabled) => void save({ workflowKeywordTriggerEnabled })} />
       </SettingsGroup>
     </SettingsSection>
   </div>

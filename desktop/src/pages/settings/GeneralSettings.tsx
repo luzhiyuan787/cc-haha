@@ -48,6 +48,9 @@ import { ChatAppearanceSettings } from './ChatAppearanceSettings'
 import { DataMigrationSettings } from './DataMigrationSettings'
 import { TabBehaviorSettings } from './TabBehaviorSettings'
 import { LeanModeSettings } from './LeanModeSettings'
+import { PreventSleepSettings } from './PreventSleepSettings'
+import { IdlePowerSettings } from './IdlePowerSettings'
+import { SettingsHelpTopic } from './SettingsHelpTopic'
 
 /**
  * The General settings panel — the largest of the seven, and the one most often
@@ -90,6 +93,10 @@ export function GeneralSettings() {
     setThinkingEnabled,
     workflowKeywordTriggerEnabled,
     setWorkflowKeywordTriggerEnabled,
+    nextPromptSuggestionsEnabled,
+    setNextPromptSuggestionsEnabled,
+    maxOutputTokensEscalationMode,
+    setMaxOutputTokensEscalationMode,
     agentTeamsEnabled,
     setAgentTeamsEnabled,
     maxConcurrentSubagents,
@@ -154,9 +161,12 @@ export function GeneralSettings() {
   const [notificationPermission, setNotificationPermission] = useState<DesktopNotificationPermission>('default')
   const [notificationActionRunning, setNotificationActionRunning] = useState(false)
   const [autoDreamConfirmOpen, setAutoDreamConfirmOpen] = useState(false)
+  const [promptSuggestionsConfirmOpen, setPromptSuggestionsConfirmOpen] = useState(false)
+  const [promptSuggestionsSaving, setPromptSuggestionsSaving] = useState(false)
   const [autoDreamActionRunning, setAutoDreamActionRunning] = useState(false)
   const [agentTeamsSaving, setAgentTeamsSaving] = useState(false)
   const [agentTeamsNoticeOpen, setAgentTeamsNoticeOpen] = useState(false)
+  const [outputEscalationSaving, setOutputEscalationSaving] = useState(false)
   const [subagentLimitInput, setSubagentLimitInput] = useState(String(maxConcurrentSubagents ?? ''))
   const [subagentLimitSaving, setSubagentLimitSaving] = useState(false)
   const [subagentLimitError, setSubagentLimitError] = useState<string | null>(null)
@@ -340,6 +350,7 @@ export function GeneralSettings() {
     { value: 'celadon', label: t('settings.general.appearance.celadon') },
     { value: 'dark', label: t('settings.general.appearance.dark') },
     { value: 'ink-blue', label: t('settings.general.appearance.inkBlue') },
+    { value: 'neutral-dark', label: t('settings.general.appearance.neutralDark') },
   ]
   // Split by ground, in the order THEMES already lists them, so the two rows
   // shown while following the system stay consistent with the flat picker.
@@ -350,6 +361,7 @@ export function GeneralSettings() {
     { value: 'auto', label: t('settings.general.webSearch.mode.auto') },
     { value: 'tavily', label: t('settings.general.webSearch.mode.tavily') },
     { value: 'brave', label: t('settings.general.webSearch.mode.brave') },
+    { value: 'deepseek', label: t('settings.general.webSearch.mode.deepseek') },
     { value: 'anthropic', label: t('settings.general.webSearch.mode.anthropic') },
     { value: 'disabled', label: t('settings.general.webSearch.mode.disabled') },
   ]
@@ -440,6 +452,29 @@ export function GeneralSettings() {
       return
     }
     void setAutoDreamEnabled(false)
+  }
+
+  const handlePromptSuggestionsToggle = (enabled: boolean) => {
+    // Each suggestion is an extra model request: explain the cost before saving.
+    if (enabled) {
+      setPromptSuggestionsConfirmOpen(true)
+      return
+    }
+    void setNextPromptSuggestionsEnabled(false).catch(() => {
+      addToast({ type: 'error', message: t('settings.general.promptSuggestionsSaveFailed') })
+    })
+  }
+
+  const confirmPromptSuggestionsEnable = async () => {
+    setPromptSuggestionsSaving(true)
+    try {
+      await setNextPromptSuggestionsEnabled(true)
+      setPromptSuggestionsConfirmOpen(false)
+    } catch {
+      addToast({ type: 'error', message: t('settings.general.promptSuggestionsSaveFailed') })
+    } finally {
+      setPromptSuggestionsSaving(false)
+    }
   }
 
   const confirmAutoDreamEnable = async () => {
@@ -653,6 +688,18 @@ export function GeneralSettings() {
     }
   }
 
+  const handleOutputEscalationChange = async (mode: typeof maxOutputTokensEscalationMode) => {
+    if (outputEscalationSaving || mode === maxOutputTokensEscalationMode) return
+    setOutputEscalationSaving(true)
+    try {
+      await setMaxOutputTokensEscalationMode(mode)
+    } catch {
+      addToast({ type: 'error', message: t('settings.general.maxOutputTokensEscalationSaveFailed') })
+    } finally {
+      setOutputEscalationSaving(false)
+    }
+  }
+
   const handleOutputStyleChange = async (value: string) => {
     try {
       await setOutputStyle(value, outputStyleWorkDir)
@@ -863,7 +910,7 @@ export function GeneralSettings() {
         </div>
       )}
 
-      {/* Theme. The six palettes stay, drawn as cards; following the system
+      {/* Theme palettes, drawn as cards; following the system
           splits them into the ground each OS mode returns to. */}
       <SettingsSection title={t('settings.general.appearanceTitle')} description={t('settings.general.appearanceDescription')}>
         <SettingsGroup>
@@ -977,6 +1024,16 @@ export function GeneralSettings() {
               items={CHAT_SEND_BEHAVIORS.map(({ value, label }) => ({ value, label }))}
             />
           </SettingsRow>
+          {/* The touch composer has no Tab key and never asks for suggestions. */}
+          {!isTouchH5Document() && (
+            <SettingsSwitchRow
+              title={t('settings.general.promptSuggestionsEnabled')}
+              description={t('settings.general.promptSuggestionsDescription')}
+              checked={nextPromptSuggestionsEnabled}
+              onChange={handlePromptSuggestionsToggle}
+              disabled={promptSuggestionsSaving}
+            />
+          )}
           <SettingsRow
             title={t('settings.general.defaultPermissionTitle')}
             description={t('settings.general.defaultPermissionHint')}
@@ -1027,6 +1084,7 @@ export function GeneralSettings() {
           <SettingsSwitchRow
             title={t('settings.general.thinkingEnabled')}
             description={t('settings.general.thinkingDescription')}
+            help={<SettingsHelpTopic topic="thinking" />}
             checked={thinkingEnabled}
             onChange={(enabled) => void setThinkingEnabled(enabled)}
           />
@@ -1100,11 +1158,13 @@ export function GeneralSettings() {
           <SettingsSwitchRow
             title={t('settings.general.workflowKeywordEnabled')}
             description={t('settings.general.workflowKeywordDescription')}
+            help={<SettingsHelpTopic topic="ultracode" />}
             checked={workflowKeywordTriggerEnabled}
             onChange={(enabled) => void setWorkflowKeywordTriggerEnabled(enabled)}
           />
           <SettingsSwitchRow
             title={t('settings.general.agentTeamsEnabled')}
+            help={<SettingsHelpTopic topic="agentTeams" />}
             description={(
               <>
                 <span>{t('settings.general.agentTeamsDescription')}</span>{' '}
@@ -1120,8 +1180,26 @@ export function GeneralSettings() {
             disabled={agentTeamsSaving}
           />
           <SettingsRow
+            title={t('settings.general.maxOutputTokensEscalationTitle')}
+            description={t('settings.general.maxOutputTokensEscalationDescription')}
+            data-testid="max-output-tokens-escalation-setting"
+          >
+            <SegmentedControl
+              label={t('settings.general.maxOutputTokensEscalationTitle')}
+              items={[
+                { value: 'auto', label: t('settings.general.maxOutputTokensEscalationAuto'), disabled: outputEscalationSaving },
+                { value: 'enabled', label: t('settings.general.maxOutputTokensEscalationEnabled'), disabled: outputEscalationSaving },
+                { value: 'disabled', label: t('settings.general.maxOutputTokensEscalationDisabled'), disabled: outputEscalationSaving },
+              ]}
+              value={maxOutputTokensEscalationMode}
+              onChange={(mode) => void handleOutputEscalationChange(mode)}
+              size="sm"
+            />
+          </SettingsRow>
+          <SettingsRow
             title={t('settings.general.subagentConcurrencyTitle')}
             description={t('settings.general.subagentConcurrencyDescription')}
+            help={<SettingsHelpTopic topic="subagents" />}
             data-testid="subagent-concurrency-setting"
             footer={(
               <p className="text-xs leading-[1.5] text-[var(--color-text-tertiary)]">
@@ -1158,6 +1236,7 @@ export function GeneralSettings() {
           <SettingsSwitchRow
             title={t('settings.general.autoQuestionEnabled')}
             description={t('settings.general.autoQuestionHint')}
+            help={<SettingsHelpTopic topic="autoQuestion" />}
             checked={autoQuestion.enabled}
             onChange={(enabled) => void setAutoQuestion({ ...autoQuestion, enabled }).catch(() => {
               addToast({ type: 'error', message: t('settings.general.autoQuestionSaveFailed') })
@@ -1186,6 +1265,7 @@ export function GeneralSettings() {
           )}
           <SettingsSwitchRow
             title={t('settings.general.autoDreamEnabled')}
+            help={<SettingsHelpTopic topic="autoDream" />}
             description={autoDreamEnabled
               ? t('settings.general.autoDreamHintOn')
               : t('settings.general.autoDreamHintOff')}
@@ -1227,6 +1307,9 @@ export function GeneralSettings() {
           )}
         </SettingsGroup>
       </SettingsSection>
+
+      <PreventSleepSettings />
+      <IdlePowerSettings />
 
       <SettingsSection title={t('settings.general.networkTitle')} description={t('settings.general.networkDescription')}>
         <SettingsGroup>
@@ -1350,6 +1433,7 @@ export function GeneralSettings() {
 
           <SettingsSwitchRow
             title={t('settings.general.webFetchPreflightEnabled')}
+            help={<SettingsHelpTopic topic="webFetchPreflight" />}
             description={(
               <>
                 <span>{t('settings.general.webFetchPreflightDescription')}</span>{' '}
@@ -1443,6 +1527,40 @@ export function GeneralSettings() {
               }
             />
           </SettingsRow>
+          <SettingsRow
+            title={t('settings.general.webSearchDeepSeekKey')}
+            htmlFor="web-search-deepseek-key"
+            description={(
+              <>
+                {t('settings.general.webSearchDeepSeekHint')}{' '}
+                <a
+                  href="https://platform.deepseek.com/api_keys"
+                  target="_blank"
+                  rel="noreferrer"
+                  aria-label={t('settings.general.webSearchDeepSeekApiKeyLink')}
+                  className="whitespace-nowrap text-[var(--color-text-accent)] hover:underline"
+                >
+                  {t('settings.general.webSearchGetApiKey')}
+                </a>
+              </>
+            )}
+          >
+            <Input
+              id="web-search-deepseek-key"
+              type="password"
+              size="md"
+              containerClassName="w-full sm:w-[260px]"
+              value={webSearchDraft.deepseekApiKey ?? ''}
+              placeholder={t('settings.general.webSearchDeepSeekPlaceholder')}
+              autoComplete="off"
+              onChange={(event) =>
+                setWebSearchDraft({
+                  ...webSearchDraft,
+                  deepseekApiKey: event.target.value,
+                })
+              }
+            />
+          </SettingsRow>
           <SettingsBlock className="flex justify-end">
             <Button
               size="base"
@@ -1461,6 +1579,7 @@ export function GeneralSettings() {
         <SettingsGroup>
           <SettingsSwitchRow
             title={t('settings.general.traceEnabled')}
+            help={<SettingsHelpTopic topic="trace" />}
             description={traceCapture.enabled ? t('settings.general.traceHintOn') : t('settings.general.traceHintOff')}
             checked={traceCapture.enabled}
             onChange={(enabled) => void setTraceCaptureEnabled(enabled)}
@@ -1676,6 +1795,24 @@ export function GeneralSettings() {
         cancelLabel={t('common.cancel')}
         confirmVariant="primary"
         loading={modeActionRunning}
+      />
+      <ConfirmDialog
+        open={promptSuggestionsConfirmOpen}
+        onClose={() => {
+          if (!promptSuggestionsSaving) setPromptSuggestionsConfirmOpen(false)
+        }}
+        onConfirm={() => void confirmPromptSuggestionsEnable()}
+        title={t('settings.general.promptSuggestionsConfirmTitle')}
+        body={(
+          <div className="space-y-2">
+            <p>{t('settings.general.promptSuggestionsConfirmHow')}</p>
+            <p>{t('settings.general.promptSuggestionsConfirmTokenCost')}</p>
+          </div>
+        )}
+        confirmLabel={t('settings.general.promptSuggestionsConfirmEnable')}
+        cancelLabel={t('common.cancel')}
+        confirmVariant="primary"
+        loading={promptSuggestionsSaving}
       />
       <ConfirmDialog
         open={autoDreamConfirmOpen}

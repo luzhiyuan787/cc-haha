@@ -12,9 +12,17 @@ import type { AppMode, ChatSendBehavior, PermissionMode, ThemeMode, UpdateProxyS
 import { browserHost } from '../lib/desktopHost/browserHost'
 import { settingsApi } from '../api/settings'
 
-const MOCK_DELETE_PROVIDER = vi.fn()
-const MOCK_GET_SETTINGS = vi.fn()
-const MOCK_UPDATE_SETTINGS = vi.fn()
+// Hoisted like the other mocks: a store that imports the providers API at load
+// time runs the module factory below before plain top-level consts exist.
+const { MOCK_DELETE_PROVIDER, MOCK_GET_SETTINGS, MOCK_UPDATE_SETTINGS, MOCK_MAGPIE } = vi.hoisted(() => ({
+  MOCK_DELETE_PROVIDER: vi.fn(),
+  MOCK_GET_SETTINGS: vi.fn(),
+  MOCK_UPDATE_SETTINGS: vi.fn(),
+  MOCK_MAGPIE: vi.fn().mockResolvedValue({
+    status: { installed: false, running: false, baseUrl: 'http://127.0.0.1:3425' },
+    models: null,
+  }),
+}))
 const desktopNotificationsMock = vi.hoisted(() => ({
   getDesktopNotificationPermission: vi.fn(),
   getDesktopNotificationPlatform: vi.fn(),
@@ -41,7 +49,7 @@ const providerStoreState = {
   hasLoadedProviders: true,
   presets: [] as ProviderPreset[],
   isLoading: false,
-  fetchProviders: vi.fn(),
+  fetchProviders: vi.fn().mockResolvedValue(undefined),
   deleteProvider: MOCK_DELETE_PROVIDER,
   activateProvider: vi.fn(),
   activateOfficial: vi.fn(),
@@ -82,13 +90,14 @@ vi.mock('../api/agents', () => ({
 }))
 
 vi.mock('../stores/providerStore', () => ({
-  useProviderStore: () => providerStoreState,
+  useProviderStore: Object.assign(() => providerStoreState, { getState: () => providerStoreState }),
 }))
 
 vi.mock('../api/providers', () => ({
   providersApi: {
     getSettings: MOCK_GET_SETTINGS,
     updateSettings: MOCK_UPDATE_SETTINGS,
+    magpie: MOCK_MAGPIE,
   },
 }))
 
@@ -104,7 +113,9 @@ vi.mock('qrcode', () => ({
 }))
 
 vi.mock('../components/settings/ClaudeOfficialLogin', () => ({
-  ClaudeOfficialLogin: () => <div data-testid="claude-official-login" />,
+  ClaudeOfficialLogin: ({ usageOnly }: { usageOnly?: boolean }) => (
+    <div data-testid={usageOnly ? 'claude-official-usage' : 'claude-official-login'} />
+  ),
 }))
 
 vi.mock('../components/settings/ChatGPTOfficialLogin', () => ({
@@ -224,7 +235,7 @@ describe('Settings > General tab', () => {
     providerStoreState.hasLoadedProviders = true
     providerStoreState.presets = []
     providerStoreState.isLoading = false
-    providerStoreState.fetchProviders = vi.fn()
+    providerStoreState.fetchProviders = vi.fn().mockResolvedValue(undefined)
     providerStoreState.activateProvider = vi.fn()
     providerStoreState.activateOfficial = vi.fn()
     providerStoreState.testProvider = vi.fn()
@@ -251,6 +262,7 @@ describe('Settings > General tab', () => {
       thinkingEnabled: true,
       workflowKeywordTriggerEnabled: true,
       agentTeamsEnabled: true,
+      maxOutputTokensEscalationMode: 'auto',
       autoDreamEnabled: false,
       skipWebFetchPreflight: true,
       desktopNotificationsEnabled: true,
@@ -444,13 +456,13 @@ describe('Settings > General tab', () => {
     expect(screen.getByLabelText('Skip WebFetch domain preflight')).toBeInTheDocument()
   })
 
-  it('offers all six palettes, paper grounds before ink ones', () => {
+  it('offers all seven palettes, light grounds before dark ones', () => {
     render(<Settings />)
 
     fireEvent.click(screen.getByText('General'))
     // The picker order is load-bearing: the four paper grounds come first, then
-    // the two ink ones, so the list reads light-to-dark rather than shuffled.
-    const order = ['Pure White', 'Paper', 'Warm Classic', 'Celadon', 'Ink Night', 'Ink Blue']
+    // the three dark ones, so the list reads light-to-dark rather than shuffled.
+    const order = ['Pure White', 'Paper', 'Warm Classic', 'Celadon', 'Ink Night', 'Ink Blue', 'Neutral Dark']
       .map((name) => screen.getByRole('button', { name }))
 
     for (const [index, chip] of order.slice(0, -1).entries()) {
@@ -466,6 +478,18 @@ describe('Settings > General tab', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Ink Blue' }))
     expect(useSettingsStore.getState().setTheme).toHaveBeenCalledWith('ink-blue')
+  })
+
+  it('offers a neutral dark palette and marks it selected after choosing it', () => {
+    render(<Settings />)
+    fireEvent.click(screen.getByText('General'))
+
+    const neutralDark = screen.getByRole('button', { name: 'Neutral Dark' })
+    fireEvent.click(neutralDark)
+
+    expect(useSettingsStore.getState().setTheme).toHaveBeenCalledWith('neutral-dark')
+    expect(neutralDark).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: 'Ink Night' })).toHaveAttribute('aria-pressed', 'false')
   })
 
   it('gives the settings rail the handoff width and a rounded selected item', () => {
@@ -531,7 +555,7 @@ describe('Settings > General tab', () => {
 
     expect(screen.getByText('Use in light mode')).toBeInTheDocument()
     expect(screen.getByText('Use in dark mode')).toBeInTheDocument()
-    for (const label of ['Pure White', 'Paper', 'Warm Classic', 'Celadon', 'Ink Night', 'Ink Blue']) {
+    for (const label of ['Pure White', 'Paper', 'Warm Classic', 'Celadon', 'Ink Night', 'Ink Blue', 'Neutral Dark']) {
       expect(screen.getByRole('button', { name: label }), label).toBeInTheDocument()
     }
   })
@@ -548,6 +572,16 @@ describe('Settings > General tab', () => {
     expect(screen.getByRole('button', { name: 'Ink Blue' })).toHaveAttribute('aria-pressed', 'true')
     expect(screen.getByRole('button', { name: 'Pure White' })).toHaveAttribute('aria-pressed', 'false')
     expect(screen.getByRole('button', { name: 'Ink Night' })).toHaveAttribute('aria-pressed', 'false')
+  })
+
+  it('selects neutral dark as the dark preference while following a light system', () => {
+    useUIStore.setState({ followSystemTheme: true, lightTheme: 'white', darkTheme: 'neutral-dark', theme: 'white' })
+    render(<Settings />)
+    fireEvent.click(screen.getByText('General'))
+
+    expect(screen.getByRole('button', { name: 'Neutral Dark' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: 'Pure White' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: 'Ink Blue' })).toHaveAttribute('aria-pressed', 'false')
   })
 
   it('keeps the theme swatches at preview size on a wide settings frame', () => {
@@ -1413,6 +1447,78 @@ describe('Settings > General tab', () => {
     }
   })
 
+  it('renders and saves the max output tokens escalation mode tri-state', async () => {
+    const updateUser = vi.spyOn(settingsApi, 'updateUser').mockResolvedValue({ ok: true })
+    try {
+      render(<Settings />)
+      fireEvent.click(screen.getByText('General'))
+
+      // Default is Auto
+      expect(screen.getByTestId('max-output-tokens-escalation-setting')).toBeVisible()
+      const radiogroup = screen.getByRole('radiogroup', { name: 'Max output tokens escalation' })
+      const autoBtn = within(radiogroup).getByRole('radio', { name: 'Auto' })
+      const enabledBtn = within(radiogroup).getByRole('radio', { name: 'Enabled' })
+      const disabledBtn = within(radiogroup).getByRole('radio', { name: 'Disabled' })
+      expect(autoBtn).toHaveAttribute('aria-checked', 'true')
+
+      // Each saved choice becomes available for the next change.
+      await act(async () => { fireEvent.click(enabledBtn) })
+      expect(enabledBtn).toHaveAttribute('aria-checked', 'true')
+      expect(updateUser).toHaveBeenLastCalledWith({ maxOutputTokensEscalationMode: 'enabled' })
+
+      await act(async () => { fireEvent.click(disabledBtn) })
+      expect(disabledBtn).toHaveAttribute('aria-checked', 'true')
+      expect(updateUser).toHaveBeenLastCalledWith({ maxOutputTokensEscalationMode: 'disabled' })
+
+      await act(async () => { fireEvent.click(autoBtn) })
+      expect(autoBtn).toHaveAttribute('aria-checked', 'true')
+      expect(updateUser).toHaveBeenLastCalledWith({ maxOutputTokensEscalationMode: 'auto' })
+    } finally {
+      updateUser.mockRestore()
+    }
+  })
+
+  it('blocks overlapping output escalation saves and restores the choice after a save failure', async () => {
+    let rejectSave!: (error: Error) => void
+    const updateUser = vi.spyOn(settingsApi, 'updateUser')
+      .mockImplementationOnce(() => new Promise((_, reject) => { rejectSave = reject }))
+      .mockResolvedValue({ ok: true })
+    try {
+      render(<Settings />)
+      fireEvent.click(screen.getByText('General'))
+      const radiogroup = screen.getByRole('radiogroup', { name: 'Max output tokens escalation' })
+      const autoBtn = within(radiogroup).getByRole('radio', { name: 'Auto' })
+      const enabledBtn = within(radiogroup).getByRole('radio', { name: 'Enabled' })
+      const disabledBtn = within(radiogroup).getByRole('radio', { name: 'Disabled' })
+
+      await act(async () => { fireEvent.click(enabledBtn) })
+      expect(enabledBtn).toHaveAttribute('aria-checked', 'true')
+      for (const button of within(radiogroup).getAllByRole('radio')) {
+        expect(button).toBeDisabled()
+      }
+      fireEvent.click(disabledBtn)
+      expect(updateUser).toHaveBeenCalledTimes(1)
+
+      await act(async () => { rejectSave(new Error('disk full')) })
+
+      expect(autoBtn).toHaveAttribute('aria-checked', 'true')
+      expect(useSettingsStore.getState().maxOutputTokensEscalationMode).toBe('auto')
+      for (const button of within(radiogroup).getAllByRole('radio')) {
+        expect(button).toBeEnabled()
+      }
+      expect(useUIStore.getState().toasts.at(-1)).toMatchObject({
+        type: 'error',
+        message: 'Could not save the output token escalation setting. Please try again.',
+      })
+
+      await act(async () => { fireEvent.click(disabledBtn) })
+      expect(disabledBtn).toHaveAttribute('aria-checked', 'true')
+      expect(updateUser).toHaveBeenLastCalledWith({ maxOutputTokensEscalationMode: 'disabled' })
+    } finally {
+      updateUser.mockRestore()
+    }
+  })
+
   it('lets the user choose a default permission mode for new sessions', async () => {
     render(<Settings />)
 
@@ -1475,6 +1581,78 @@ describe('Settings > General tab', () => {
 
     expect(useSettingsStore.getState().setAutoDreamEnabled).toHaveBeenCalledWith(true)
     expect(screen.getByLabelText('Enable Auto-dream')).toBeChecked()
+  })
+
+  it('keeps next-message suggestions off by default and explains the token cost before enabling them', async () => {
+    useSettingsStore.setState({ nextPromptSuggestionsEnabled: false })
+    const updateUser = vi.spyOn(settingsApi, 'updateUser').mockResolvedValue({ ok: true })
+    try {
+      render(<Settings />)
+      fireEvent.click(screen.getByText('General'))
+
+      const agentSection = screen.getByRole('heading', { name: 'Agent preferences' }).closest('section')!
+      const toggle = within(agentSection).getByRole('switch', { name: 'Next-message suggestions' })
+      expect(toggle).not.toBeChecked()
+
+      // Cancel leaves it off and saves nothing.
+      fireEvent.click(toggle)
+      let dialog = screen.getByRole('dialog', { name: 'Turn on next-message suggestions?' })
+      expect(within(dialog).getByText(/uses additional tokens on every turn/i)).toBeInTheDocument()
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+      expect(screen.queryByRole('dialog', { name: 'Turn on next-message suggestions?' })).not.toBeInTheDocument()
+      expect(updateUser).not.toHaveBeenCalled()
+      expect(toggle).not.toBeChecked()
+
+      fireEvent.click(toggle)
+      dialog = screen.getByRole('dialog', { name: 'Turn on next-message suggestions?' })
+      await act(async () => {
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Turn on' }))
+      })
+      expect(updateUser).toHaveBeenCalledWith({ nextPromptSuggestionsEnabled: true })
+      expect(useSettingsStore.getState().nextPromptSuggestionsEnabled).toBe(true)
+      expect(within(agentSection).getByRole('switch', { name: 'Next-message suggestions' })).toBeChecked()
+
+      // Turning it off needs no confirmation.
+      await act(async () => {
+        fireEvent.click(within(agentSection).getByRole('switch', { name: 'Next-message suggestions' }))
+      })
+      expect(screen.queryByRole('dialog', { name: 'Turn on next-message suggestions?' })).not.toBeInTheDocument()
+      expect(updateUser).toHaveBeenLastCalledWith({ nextPromptSuggestionsEnabled: false })
+      expect(useSettingsStore.getState().nextPromptSuggestionsEnabled).toBe(false)
+    } finally {
+      updateUser.mockRestore()
+      useSettingsStore.setState({ nextPromptSuggestionsEnabled: false })
+    }
+  })
+
+  it('keeps next-message suggestions off and reports it when saving the choice fails', async () => {
+    useSettingsStore.setState({ nextPromptSuggestionsEnabled: false })
+    const updateUser = vi.spyOn(settingsApi, 'updateUser').mockRejectedValue(new Error('disk full'))
+    try {
+      render(<Settings />)
+      fireEvent.click(screen.getByText('General'))
+      const agentSection = screen.getByRole('heading', { name: 'Agent preferences' }).closest('section')!
+
+      fireEvent.click(within(agentSection).getByRole('switch', { name: 'Next-message suggestions' }))
+      const dialog = screen.getByRole('dialog', { name: 'Turn on next-message suggestions?' })
+      await act(async () => {
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Turn on' }))
+      })
+      expect(useSettingsStore.getState().nextPromptSuggestionsEnabled).toBe(false)
+      expect(within(agentSection).getByRole('switch', { name: 'Next-message suggestions' })).not.toBeChecked()
+      expect(useUIStore.getState().toasts.at(-1)).toMatchObject({ type: 'error' })
+
+      // Turning it off can fail too: the switch stays on and the user is told.
+      useSettingsStore.setState({ nextPromptSuggestionsEnabled: true })
+      await act(async () => {
+        fireEvent.click(within(agentSection).getByRole('switch', { name: 'Next-message suggestions' }))
+      })
+      expect(useSettingsStore.getState().nextPromptSuggestionsEnabled).toBe(true)
+      expect(useUIStore.getState().toasts.at(-1)).toMatchObject({ type: 'error' })
+    } finally {
+      updateUser.mockRestore()
+      useSettingsStore.setState({ nextPromptSuggestionsEnabled: false })
+    }
   })
 
   it('lets the user disable Auto-dream without a confirmation dialog', async () => {
@@ -1631,19 +1809,38 @@ describe('Settings > General tab', () => {
     expect(desktopNotificationsMock.openDesktopNotificationSettings).toHaveBeenCalledTimes(1)
   })
 
+  it('starts phone onboarding with Cloudflare and keeps LAN advanced fields out of the first step', async () => {
+    useSettingsStore.setState({ h5Access: { enabled: true, token: 'onboarding-fixture-token', tokenPreview: 'onboarding…token', allowedOrigins: [], publicBaseUrl: 'http://192.168.1.10:3456', fixedPort: null, disconnectGraceSeconds: 30 } })
+    useUIStore.setState({ activeSettingsTab: 'h5Access' })
+    render(<Settings />)
+    expect(screen.getByRole('tab', { name: 'Away from home' })).toHaveAttribute('aria-selected', 'true')
+    fireEvent.click(screen.getByRole('tab', { name: 'Same Wi-Fi' }))
+    expect(screen.getByLabelText('Fixed port')).not.toBeVisible()
+    expect(await screen.findByAltText('H5 access QR code')).toBeVisible()
+    expect(screen.getByText('onboarding…token')).not.toBeVisible()
+    fireEvent.click(screen.getByText('Advanced connection settings'))
+    expect(screen.getByLabelText('Fixed port')).toBeVisible()
+    fireEvent.click(screen.getByRole('tab', { name: 'Away from home' }))
+    expect(screen.getByLabelText('Fixed port')).not.toBeVisible()
+    fireEvent.click(screen.getByRole('tab', { name: 'Same Wi-Fi' }))
+    expect(screen.getByLabelText('Fixed port')).toBeVisible()
+  })
+
   it('moves H5 access out of General into its own Settings tab', () => {
     render(<Settings />)
 
     fireEvent.click(screen.getByText('General'))
-    expect(screen.queryByRole('region', { name: 'H5 Access' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('region', { name: 'Phone connection' })).not.toBeInTheDocument()
 
     const generalTab = screen.getByRole('button', { name: 'General' })
-    const h5Tab = screen.getByRole('button', { name: 'H5 Access' })
+    const h5Tab = screen.getByRole('button', { name: 'Phone connection' })
     expect((generalTab.compareDocumentPosition(h5Tab) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0).toBe(true)
     fireEvent.click(h5Tab)
 
-    const section = screen.getByRole('region', { name: 'H5 Access' })
-    expect(within(section).getByLabelText('Enable H5 access')).not.toBeChecked()
+    const section = screen.getByRole('region', { name: 'Phone connection' })
+    fireEvent.click(within(section).getByRole('tab', { name: 'Same Wi-Fi' }))
+    fireEvent.click(within(section).getByText('Advanced connection settings'))
+    expect(within(section).getByLabelText('Enable local connection')).not.toBeChecked()
     expect(within(section).getByText('Disabled')).toBeInTheDocument()
     expect(within(section).queryByText('Token preview')).not.toBeInTheDocument()
     expect(within(section).queryByRole('button', { name: 'Regenerate token' })).not.toBeInTheDocument()
@@ -1664,15 +1861,17 @@ describe('Settings > General tab', () => {
     })
     render(<Settings />)
 
-    fireEvent.click(screen.getByText('H5 Access'))
-    const section = screen.getByRole('region', { name: 'H5 Access' })
+    fireEvent.click(screen.getByText('Phone connection'))
+    const section = screen.getByRole('region', { name: 'Phone connection' })
+    fireEvent.click(within(section).getByRole('tab', { name: 'Same Wi-Fi' }))
+    fireEvent.click(within(section).getByText('Advanced connection settings'))
 
-    fireEvent.click(within(section).getByLabelText('Enable H5 access'))
-    const dialog = screen.getByRole('dialog', { name: 'Enable LAN H5 access?' })
-    expect(within(dialog).getByText(/desktop H5 app on your LAN address and port/i)).toBeInTheDocument()
+    fireEvent.click(within(section).getByLabelText('Enable local connection'))
+    const dialog = screen.getByRole('dialog', { name: 'Enable local connection?' })
+    expect(within(dialog).getByText(/Anyone with the connection QR code or link/i)).toBeInTheDocument()
 
     await act(async () => {
-      fireEvent.click(within(dialog).getByRole('button', { name: 'Enable H5 access' }))
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Enable local connection' }))
     })
 
     expect(useSettingsStore.getState().enableH5Access).toHaveBeenCalledTimes(1)
@@ -1694,12 +1893,14 @@ describe('Settings > General tab', () => {
     })
     render(<Settings />)
 
-    fireEvent.click(screen.getByText('H5 Access'))
-    const section = screen.getByRole('region', { name: 'H5 Access' })
-    fireEvent.click(within(section).getByLabelText('Enable H5 access'))
+    fireEvent.click(screen.getByText('Phone connection'))
+    const section = screen.getByRole('region', { name: 'Phone connection' })
+    fireEvent.click(within(section).getByRole('tab', { name: 'Same Wi-Fi' }))
+    fireEvent.click(within(section).getByText('Advanced connection settings'))
+    fireEvent.click(within(section).getByLabelText('Enable local connection'))
 
     await act(async () => {
-      fireEvent.click(within(screen.getByRole('dialog', { name: 'Enable LAN H5 access?' })).getByRole('button', { name: 'Enable H5 access' }))
+      fireEvent.click(within(screen.getByRole('dialog', { name: 'Enable local connection?' })).getByRole('button', { name: 'Enable local connection' }))
     })
 
     await within(section).findByAltText('H5 access QR code')
@@ -1730,8 +1931,10 @@ describe('Settings > General tab', () => {
     })
     render(<Settings />)
 
-    fireEvent.click(screen.getByText('H5 Access'))
-    const section = screen.getByRole('region', { name: 'H5 Access' })
+    fireEvent.click(screen.getByText('Phone connection'))
+    const section = screen.getByRole('region', { name: 'Phone connection' })
+    fireEvent.click(within(section).getByRole('tab', { name: 'Same Wi-Fi' }))
+    fireEvent.click(within(section).getByText('Advanced connection settings'))
 
     expect(within(section).getByText('Generate a token to create the QR code.')).toBeInTheDocument()
     expect(within(section).getByText('Click Generate token to create a QR link that can be scanned.')).toBeInTheDocument()
@@ -1759,8 +1962,10 @@ describe('Settings > General tab', () => {
     })
     render(<Settings />)
 
-    fireEvent.click(screen.getByText('H5 Access'))
-    const section = screen.getByRole('region', { name: 'H5 Access' })
+    fireEvent.click(screen.getByText('Phone connection'))
+    const section = screen.getByRole('region', { name: 'Phone connection' })
+    fireEvent.click(within(section).getByRole('tab', { name: 'Same Wi-Fi' }))
+    fireEvent.click(within(section).getByText('Advanced connection settings'))
 
     // No enable/regenerate click this session: everything comes from the
     // persisted token, so a desktop restart no longer loses the QR code.
@@ -1785,8 +1990,10 @@ describe('Settings > General tab', () => {
     })
     render(<Settings />)
 
-    fireEvent.click(screen.getByText('H5 Access'))
-    const section = screen.getByRole('region', { name: 'H5 Access' })
+    fireEvent.click(screen.getByText('Phone connection'))
+    const section = screen.getByRole('region', { name: 'Phone connection' })
+    fireEvent.click(within(section).getByRole('tab', { name: 'Same Wi-Fi' }))
+    fireEvent.click(within(section).getByText('Advanced connection settings'))
     fireEvent.change(within(section).getByLabelText('Fixed port'), {
       target: { value: '28670' },
     })
@@ -1816,8 +2023,10 @@ describe('Settings > General tab', () => {
     })
     render(<Settings />)
 
-    fireEvent.click(screen.getByText('H5 Access'))
-    const section = screen.getByRole('region', { name: 'H5 Access' })
+    fireEvent.click(screen.getByText('Phone connection'))
+    const section = screen.getByRole('region', { name: 'Phone connection' })
+    fireEvent.click(within(section).getByRole('tab', { name: 'Same Wi-Fi' }))
+    fireEvent.click(within(section).getByText('Advanced connection settings'))
     fireEvent.change(within(section).getByLabelText('Fixed port'), {
       target: { value: '99' },
     })
@@ -1841,8 +2050,10 @@ describe('Settings > General tab', () => {
     })
     render(<Settings />)
 
-    fireEvent.click(screen.getByText('H5 Access'))
-    const section = screen.getByRole('region', { name: 'H5 Access' })
+    fireEvent.click(screen.getByText('Phone connection'))
+    const section = screen.getByRole('region', { name: 'Phone connection' })
+    fireEvent.click(within(section).getByRole('tab', { name: 'Same Wi-Fi' }))
+    fireEvent.click(within(section).getByText('Advanced connection settings'))
     fireEvent.change(within(section).getByLabelText('Fixed port'), {
       target: { value: '5061' },
     })
@@ -1865,8 +2076,10 @@ describe('Settings > General tab', () => {
     })
     render(<Settings />)
 
-    fireEvent.click(screen.getByText('H5 Access'))
-    const section = screen.getByRole('region', { name: 'H5 Access' })
+    fireEvent.click(screen.getByText('Phone connection'))
+    const section = screen.getByRole('region', { name: 'Phone connection' })
+    fireEvent.click(within(section).getByRole('tab', { name: 'Same Wi-Fi' }))
+    fireEvent.click(within(section).getByText('Advanced connection settings'))
     fireEvent.change(within(section).getByLabelText('Disconnect grace (sec)'), {
       target: { value: '600' },
     })
@@ -1896,8 +2109,10 @@ describe('Settings > General tab', () => {
     })
     render(<Settings />)
 
-    fireEvent.click(screen.getByText('H5 Access'))
-    const section = screen.getByRole('region', { name: 'H5 Access' })
+    fireEvent.click(screen.getByText('Phone connection'))
+    const section = screen.getByRole('region', { name: 'Phone connection' })
+    fireEvent.click(within(section).getByRole('tab', { name: 'Same Wi-Fi' }))
+    fireEvent.click(within(section).getByText('Advanced connection settings'))
     fireEvent.change(within(section).getByLabelText('Disconnect grace (sec)'), {
       target: { value: '2' },
     })
@@ -1929,8 +2144,10 @@ describe('Settings > General tab', () => {
     })
     render(<Settings />)
 
-    fireEvent.click(screen.getByText('H5 Access'))
-    const section = screen.getByRole('region', { name: 'H5 Access' })
+    fireEvent.click(screen.getByText('Phone connection'))
+    const section = screen.getByRole('region', { name: 'Phone connection' })
+    fireEvent.click(within(section).getByRole('tab', { name: 'Same Wi-Fi' }))
+    fireEvent.click(within(section).getByText('Advanced connection settings'))
 
     const note = within(section).getByTestId('h5-access-fixed-port-restart-note')
     expect(note.textContent).toContain('28670')
@@ -1951,12 +2168,14 @@ describe('Settings > General tab', () => {
     })
     render(<Settings />)
 
-    fireEvent.click(screen.getByText('H5 Access'))
-    const section = screen.getByRole('region', { name: 'H5 Access' })
-    fireEvent.click(within(section).getByLabelText('Enable H5 access'))
+    fireEvent.click(screen.getByText('Phone connection'))
+    const section = screen.getByRole('region', { name: 'Phone connection' })
+    fireEvent.click(within(section).getByRole('tab', { name: 'Same Wi-Fi' }))
+    fireEvent.click(within(section).getByText('Advanced connection settings'))
+    fireEvent.click(within(section).getByLabelText('Enable local connection'))
 
     await act(async () => {
-      fireEvent.click(within(screen.getByRole('dialog', { name: 'Enable LAN H5 access?' })).getByRole('button', { name: 'Enable H5 access' }))
+      fireEvent.click(within(screen.getByRole('dialog', { name: 'Enable local connection?' })).getByRole('button', { name: 'Enable local connection' }))
     })
 
     fireEvent.click(within(section).getByRole('button', { name: 'Show token' }))
@@ -1978,8 +2197,10 @@ describe('Settings > General tab', () => {
     })
     render(<Settings />)
 
-    fireEvent.click(screen.getByText('H5 Access'))
-    const section = screen.getByRole('region', { name: 'H5 Access' })
+    fireEvent.click(screen.getByText('Phone connection'))
+    const section = screen.getByRole('region', { name: 'Phone connection' })
+    fireEvent.click(within(section).getByRole('tab', { name: 'Same Wi-Fi' }))
+    fireEvent.click(within(section).getByText('Advanced connection settings'))
 
     expect(within(section).getByLabelText('Access host / IP')).toHaveValue('https://phone.example/app')
     await act(async () => {
@@ -1997,9 +2218,11 @@ describe('Settings > General tab', () => {
     useSettingsStore.setState({ h5AccessError: 'H5 unavailable' })
     render(<Settings />)
 
-    fireEvent.click(screen.getByText('H5 Access'))
+    fireEvent.click(screen.getByText('Phone connection'))
 
-    const section = screen.getByRole('region', { name: 'H5 Access' })
+    const section = screen.getByRole('region', { name: 'Phone connection' })
+    fireEvent.click(within(section).getByRole('tab', { name: 'Same Wi-Fi' }))
+    fireEvent.click(within(section).getByText('Advanced connection settings'))
     expect(within(section).getByText('H5 unavailable')).toBeInTheDocument()
   })
 
@@ -2017,9 +2240,11 @@ describe('Settings > General tab', () => {
     })
     render(<Settings />)
 
-    fireEvent.click(screen.getByText('H5 Access'))
+    fireEvent.click(screen.getByText('Phone connection'))
 
-    const section = screen.getByRole('region', { name: 'H5 Access' })
+    const section = screen.getByRole('region', { name: 'Phone connection' })
+    fireEvent.click(within(section).getByRole('tab', { name: 'Same Wi-Fi' }))
+    fireEvent.click(within(section).getByText('Advanced connection settings'))
     expect(within(section).getByLabelText('Current port')).toHaveValue('54064')
     fireEvent.change(within(section).getByLabelText('Access host / IP'), {
       target: { value: '192.168.1.100' },
@@ -2050,9 +2275,11 @@ describe('Settings > General tab', () => {
     })
     render(<Settings />)
 
-    fireEvent.click(screen.getByText('H5 Access'))
+    fireEvent.click(screen.getByText('Phone connection'))
 
-    const section = screen.getByRole('region', { name: 'H5 Access' })
+    const section = screen.getByRole('region', { name: 'Phone connection' })
+    fireEvent.click(within(section).getByRole('tab', { name: 'Same Wi-Fi' }))
+    fireEvent.click(within(section).getByText('Advanced connection settings'))
     fireEvent.change(within(section).getByLabelText('Access host / IP'), {
       target: { value: 'https://phone.example/app' },
     })
@@ -2088,9 +2315,11 @@ describe('Settings > General tab', () => {
       },
     })
     render(<Settings />)
-    fireEvent.click(screen.getByText('H5 Access'))
+    fireEvent.click(screen.getByText('Phone connection'))
 
-    const section = screen.getByRole('region', { name: 'H5 Access' })
+    const section = screen.getByRole('region', { name: 'Phone connection' })
+    fireEvent.click(within(section).getByRole('tab', { name: 'Same Wi-Fi' }))
+    fireEvent.click(within(section).getByText('Advanced connection settings'))
     const banner = within(section).getByTestId('h5-access-stale-host-banner')
     expect(banner).toBeInTheDocument()
     expect(banner.textContent).toContain('192.168.1.207')
@@ -2125,9 +2354,11 @@ describe('Settings > General tab', () => {
       },
     })
     render(<Settings />)
-    fireEvent.click(screen.getByText('H5 Access'))
+    fireEvent.click(screen.getByText('Phone connection'))
 
-    const section = screen.getByRole('region', { name: 'H5 Access' })
+    const section = screen.getByRole('region', { name: 'Phone connection' })
+    fireEvent.click(within(section).getByRole('tab', { name: 'Same Wi-Fi' }))
+    fireEvent.click(within(section).getByText('Advanced connection settings'))
     expect(within(section).getByTestId('h5-access-proxy-note')).toBeInTheDocument()
     expect(within(section).queryByTestId('h5-access-stale-host-banner')).toBeNull()
   })
@@ -2158,9 +2389,11 @@ describe('Settings > General tab', () => {
       }),
     })
     render(<Settings />)
-    fireEvent.click(screen.getByText('H5 Access'))
+    fireEvent.click(screen.getByText('Phone connection'))
 
-    const section = screen.getByRole('region', { name: 'H5 Access' })
+    const section = screen.getByRole('region', { name: 'Phone connection' })
+    fireEvent.click(within(section).getByRole('tab', { name: 'Same Wi-Fi' }))
+    fireEvent.click(within(section).getByText('Advanced connection settings'))
     fireEvent.change(within(section).getByLabelText('Access host / IP'), {
       target: { value: '10.255.255.254' },
     })
@@ -2191,11 +2424,37 @@ describe('Settings > General tab', () => {
     })
   })
 
+  it('saves the independent DeepSeek search key without changing other search keys', () => {
+    useSettingsStore.setState({
+      webSearch: { mode: 'auto', tavilyApiKey: 'tvly-existing', braveApiKey: 'brave-existing' },
+    })
+    render(<Settings />)
+    fireEvent.click(screen.getByText('General'))
+    expect(screen.getByRole('radio', { name: 'Model native' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('radio', { name: 'DeepSeek' }))
+    const keyInput = screen.getByLabelText('DeepSeek API key')
+    expect(keyInput).toHaveValue('')
+    expect(keyInput).toHaveAttribute('type', 'password')
+    fireEvent.change(keyInput, { target: { value: 'sk-deepseek-fixture' } })
+    const section = screen.getByRole('heading', { name: 'WebSearch' }).closest('section') as HTMLElement
+    fireEvent.click(within(section).getByRole('button', { name: 'Save' }))
+    expect(useSettingsStore.getState().setWebSearch).toHaveBeenCalledWith({
+      mode: 'deepseek',
+      tavilyApiKey: 'tvly-existing',
+      braveApiKey: 'brave-existing',
+      deepseekApiKey: 'sk-deepseek-fixture',
+    })
+  })
+
   it('links to WebSearch provider API key dashboards', () => {
     render(<Settings />)
 
     fireEvent.click(screen.getByText('General'))
 
+    expect(screen.getByRole('link', { name: 'Get DeepSeek API key' })).toHaveAttribute(
+      'href',
+      'https://platform.deepseek.com/api_keys',
+    )
     expect(screen.getByRole('link', { name: 'Get Tavily API key' })).toHaveAttribute(
       'href',
       'https://app.tavily.com/home',
@@ -2271,6 +2530,7 @@ describe('Settings > Providers tab', () => {
     expect(card.className).toContain('shadow-[0_0_0_3px_var(--color-brand-soft)]')
     expect(card.className).not.toContain('border-[var(--color-border-focus)]')
     // Only the default card carries the accent.
+    fireEvent.click(screen.getByRole('tab', { name: /Official sign-in/ }))
     const other = screen.getByTestId('claude-official-provider')
     expect(other.className).not.toContain('border-[var(--color-primary-fixed-dim)]')
   })
@@ -2301,8 +2561,12 @@ describe('Settings > Providers tab', () => {
     providerStoreState.hasLoadedProviders = true
 
     render(<Settings />)
+    // A fresh install opens on API Key; Claude Official is only the fallback default.
+    expect(screen.queryByTestId('claude-official-login')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('tab', { name: /Official sign-in/ }))
 
     expect(screen.getByTestId('claude-official-login')).toBeInTheDocument()
+    expect(screen.queryByTestId('claude-official-usage')).not.toBeInTheDocument()
   })
 
   it('shows ChatGPT Official as the active built-in provider', () => {
@@ -2317,6 +2581,7 @@ describe('Settings > Providers tab', () => {
     expect(within(openAIProvider).getByText('Default')).toBeInTheDocument()
     expect(screen.getByTestId('chatgpt-official-login')).toBeInTheDocument()
     expect(screen.queryByTestId('claude-official-login')).not.toBeInTheDocument()
+    expect(within(screen.getByTestId('claude-official-provider')).getByTestId('claude-official-usage')).toBeInTheDocument()
   })
 
   it('shows Grok Official as the active built-in provider', () => {
@@ -2331,15 +2596,17 @@ describe('Settings > Providers tab', () => {
     expect(screen.getByTestId('grok-official-login')).toBeInTheDocument()
   })
 
-  it('renders saved and official providers in the stored sortable order', () => {
+  const sortableRows = () => screen.getAllByRole('button', { name: 'Drag to reorder' })
+    .map((handle) => handle.closest('[data-testid]')?.getAttribute('data-testid'))
+
+  it('renders each tab in the stored sortable order', () => {
     providerStoreState.providerOrder = ['provider-1', 'openai-official', 'claude-official']
 
     render(<Settings />)
 
-    const rows = screen.getAllByRole('button', { name: 'Drag to reorder' })
-      .map((handle) => handle.closest('[data-testid]')?.getAttribute('data-testid'))
-    expect(rows).toEqual([
-      'provider-provider-1',
+    expect(sortableRows()).toEqual(['provider-provider-1'])
+    fireEvent.click(screen.getByRole('tab', { name: /Official sign-in/ }))
+    expect(sortableRows()).toEqual([
       'openai-official-provider',
       'claude-official-provider',
       'grok-official-provider',
@@ -2352,10 +2619,9 @@ describe('Settings > Providers tab', () => {
 
     render(<Settings />)
 
-    const rows = screen.getAllByRole('button', { name: 'Drag to reorder' })
-      .map((handle) => handle.closest('[data-testid]')?.getAttribute('data-testid'))
-    expect(rows).toEqual([
-      'provider-provider-1',
+    expect(sortableRows()).toEqual(['provider-provider-1'])
+    fireEvent.click(screen.getByRole('tab', { name: /Official sign-in/ }))
+    expect(sortableRows()).toEqual([
       'claude-official-provider',
       'openai-official-provider',
       'grok-official-provider',
@@ -2907,12 +3173,11 @@ describe('Settings > Providers tab', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: /Save|Add/i }))
 
     await waitFor(() => {
-      expect(MOCK_UPDATE_SETTINGS).toHaveBeenCalled()
+      expect(providerStoreState.createProvider).toHaveBeenCalled()
     })
-    const saved = MOCK_UPDATE_SETTINGS.mock.calls.at(-1)?.[0] as Record<string, unknown>
-    expect(saved).not.toHaveProperty('model')
-    expect(saved).not.toHaveProperty('modelContext')
-    expect(saved).toMatchObject({ futureSetting: true, env: expect.objectContaining({ EXISTING_ENV: '1' }) })
+    // A new provider is not the default yet, so its preview is not written over
+    // the settings the current default's sessions read (#1806).
+    expect(MOCK_UPDATE_SETTINGS).not.toHaveBeenCalled()
   })
 
   it('defaults Tool Search off and requires confirmation before persisting an explicit enable', async () => {
@@ -2985,12 +3250,9 @@ describe('Settings > Providers tab', () => {
         toolSearchEnabled: true,
       }))
     })
-    expect(MOCK_UPDATE_SETTINGS).toHaveBeenCalledWith(expect.objectContaining({
-      env: expect.objectContaining({
-        EXISTING_ENV: '1',
-        ENABLE_TOOL_SEARCH: 'true',
-      }),
-    }))
+    // The flag is saved on the provider; the server writes ENABLE_TOOL_SEARCH
+    // when it becomes the default, not when it is added (#1806).
+    expect(MOCK_UPDATE_SETTINGS).not.toHaveBeenCalled()
   })
 
   it('defaults experimental beta headers on and persists a provider disable', async () => {
@@ -3059,12 +3321,8 @@ describe('Settings > Providers tab', () => {
         disableExperimentalBetas: true,
       }))
     })
-    expect(MOCK_UPDATE_SETTINGS).toHaveBeenCalledWith(expect.objectContaining({
-      env: expect.objectContaining({
-        EXISTING_ENV: '1',
-        CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: '1',
-      }),
-    }))
+    // Saved on the provider; written to settings when it becomes the default (#1806).
+    expect(MOCK_UPDATE_SETTINGS).not.toHaveBeenCalled()
   })
 
   it('saves 1M model declarations for the main and role mappings', async () => {
@@ -3139,15 +3397,9 @@ describe('Settings > Providers tab', () => {
         },
       }))
     })
-    expect(MOCK_UPDATE_SETTINGS).toHaveBeenCalledWith(expect.objectContaining({
-      env: expect.objectContaining({
-        ANTHROPIC_MODEL: 'claude-sonnet-4-6[1m]',
-        ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5',
-        ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-4-6[1m]',
-        ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-4-7',
-        CLAUDE_CODE_MODEL_CONTEXT_WINDOWS: '{"claude-sonnet-4-6":1000000}',
-      }),
-    }))
+    // The preview above shows the [1m] env the server writes once this provider
+    // is the default; adding it leaves the current default's settings alone (#1806).
+    expect(MOCK_UPDATE_SETTINGS).not.toHaveBeenCalled()
   })
 
   it('persists the Fable slot to its own env var with its own 1M marker', async () => {
@@ -3215,15 +3467,20 @@ describe('Settings > Providers tab', () => {
       .toHaveAttribute('placeholder', 'Same as main')
 
     fireEvent.click(within(dialog).getByRole('checkbox', { name: /1M support: fable/i }))
+    await waitFor(() => {
+      expect(dialog.querySelector('textarea')?.value).toContain('"ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5[1m]"')
+    })
     fireEvent.click(within(dialog).getByRole('button', { name: /Save|Add|保存|添加/i }))
 
     await waitFor(() => {
-      expect(MOCK_UPDATE_SETTINGS).toHaveBeenCalledWith(expect.objectContaining({
-        env: expect.objectContaining({
-          ANTHROPIC_DEFAULT_FABLE_MODEL: 'claude-fable-5[1m]',
-        }),
+      expect(providerStoreState.createProvider).toHaveBeenCalledWith(expect.objectContaining({
+        models: expect.objectContaining({ fable: 'claude-fable-5' }),
+        model1mSupport: expect.objectContaining({ fable: true }),
       }))
     })
+    // The server writes ANTHROPIC_DEFAULT_FABLE_MODEL once this provider is the
+    // default; adding it leaves the current default's settings alone (#1806).
+    expect(MOCK_UPDATE_SETTINGS).not.toHaveBeenCalled()
   })
 
   it('hides the API key by default and reveals it from the eye button', () => {

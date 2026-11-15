@@ -6,6 +6,7 @@ import type {
   TeamWorkbenchSessionTimeline,
 } from '../types/team'
 import type { AgentTaskNotification } from '../types/chat'
+import type { TeamMemberRuntimeIdentity, TeamRuntimeControlAction, TeamRuntimeControlView } from '../../../src/shared/teamRuntimeControl'
 
 type TeamsResponse = { teams: TeamSummary[] }
 
@@ -50,6 +51,27 @@ export type TeamTaskAnchor = {
 
 export type { TranscriptMessage }
 
+/** `providerId: null` is Claude Official. */
+export type MemberRuntimeUpdate = {
+  providerId: string | null
+  modelId: string
+  effortLevel?: string
+} & TeamMemberRuntimeIdentity
+
+export type MemberRuntimeUpdateResponse = {
+  ok: true
+  member: {
+    agentId: string
+    name?: string
+    model?: string
+    providerId?: string | null
+    providerName?: string
+  }
+  control?: TeamRuntimeControlView
+}
+
+export type TeamRuntimeAction = TeamRuntimeControlAction
+
 export const teamsApi = {
   list() {
     return api.get<TeamsResponse>('/api/teams')
@@ -62,6 +84,21 @@ export const teamsApi = {
   getWorkbench(name: string) {
     return api.get<TeamWorkbenchSnapshot>(
       `/api/teams/${encodeURIComponent(name)}/workbench`,
+    )
+  },
+
+  getRuntimeControl(name: string, identity: Pick<TeamRuntimeAction, 'leadSessionId' | 'incarnationId'>) {
+    const params = new URLSearchParams(identity)
+    return api.get<{ control: TeamRuntimeControlView | null }>(
+      `/api/teams/${encodeURIComponent(name)}/runtime-control?${params.toString()}`,
+    )
+  },
+
+  /** A labelled human action resumes the eligible team and its lead together. */
+  resumeRuntime(name: string, action: TeamRuntimeAction) {
+    return api.post<{ control: TeamRuntimeControlView }>(
+      `/api/teams/${encodeURIComponent(name)}/runtime-control/resume`,
+      action,
     )
   },
 
@@ -105,6 +142,17 @@ export const teamsApi = {
     return api.post<{ ok: true }>(
       `/api/teams/${encodeURIComponent(teamName)}/members/${encodeURIComponent(agentId)}/messages`,
       { content },
+    )
+  },
+
+  /**
+   * Saves a paused member's model through its own team and CLI identity.
+   * Saving does not resume it. Never route this through the session runtime.
+   */
+  updateMemberRuntime(teamName: string, agentId: string, runtime: MemberRuntimeUpdate) {
+    return api.patch<MemberRuntimeUpdateResponse>(
+      `/api/teams/${encodeURIComponent(teamName)}/members/${encodeURIComponent(agentId)}/runtime`,
+      runtime,
     )
   },
 

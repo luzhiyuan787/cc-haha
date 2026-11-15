@@ -6,6 +6,7 @@ import {
   API_IMAGE_MAX_BASE64_SIZE,
   IMAGE_MAX_HEIGHT,
   IMAGE_MAX_WIDTH,
+  IMAGE_CONTEXT_TARGET_BYTES,
   IMAGE_TARGET_RAW_SIZE,
 } from '../constants/apiLimits.js'
 import { logEvent } from '../services/analytics/index.js'
@@ -173,14 +174,83 @@ const READABLE_JPEG_QUALITIES = [85, 75] as const
 const FALLBACK_JPEG_QUALITIES = [65] as const
 
 /**
+ * Optimize the context copy without changing the source file. The byte target
+ * is soft: keep a high-quality, smaller candidate when it cannot be reached.
+ * Hard API validation and its processor-unavailable fallback still apply.
+ */
+export async function optimizeImageForContext(
+  imageBuffer: Buffer,
+  originalSize: number,
+  ext: string,
+  dimensionLimit?: number,
+  maxBytes = IMAGE_CONTEXT_TARGET_BYTES,
+): Promise<ResizeResult> {
+  const validated = await maybeResizeAndDownsampleImageBuffer(
+    imageBuffer, originalSize, ext, dimensionLimit ?? IMAGE_MAX_WIDTH,
+  )
+  if (validated.buffer.length <= maxBytes) return validated
+
+  let best = validated
+  try {
+    // Use the shipped processor's alpha/orientation contract for re-encoding.
+    const sharp = await getImageProcessor({ requireAutoOrient: true })
+    const metadata = await sharp(validated.buffer).metadata()
+    if (!metadata.width || !metadata.height || metadata.format === 'gif' || (metadata.pages ?? 1) > 1) return validated
+    const autoOrient = !!metadata.orientation && metadata.orientation !== 1
+    const swapAxes = autoOrient && metadata.orientation! >= 5
+    const width = swapAxes ? metadata.height : metadata.width
+    const height = swapAxes ? metadata.width : metadata.height
+    const originalWidth = validated.dimensions?.originalWidth ?? width
+    const originalHeight = validated.dimensions?.originalHeight ?? height
+    // Do not create successive lossy generations at the same pixel grid when
+    // a soft target is unattainable. Simple VP8L WebP is known lossless; treat
+    // extended/unknown WebP conservatively, just like an existing JPEG.
+    const alreadyLossy = metadata.format === 'jpeg' ||
+      (metadata.format === 'webp' && validated.buffer.toString('ascii', 12, 16) !== 'VP8L')
+    const readable = constrainDimensions(width, height, IMAGE_PROMPT_READABLE_LONG_EDGE, IMAGE_PROMPT_READABLE_LONG_EDGE)
+    const sizes = [{ width, height }]
+    if (readable.width !== width || readable.height !== height) sizes.push(readable)
+
+    for (const dimensions of sizes) {
+      if (alreadyLossy && dimensions.width === width && dimensions.height === height) continue
+      const pipeline = () => createImagePipeline(sharp, validated.buffer, width, height, dimensions, autoOrient)
+      const encoders: Array<() => SharpInstance> = []
+      if (metadata.format === 'png') encoders.push(() => pipeline().png({ compressionLevel: 9 }))
+      if (metadata.format === 'png' || metadata.format === 'webp') encoders.push(() => pipeline().webp({ lossless: true }))
+      for (const quality of [90, 85]) {
+        // WebP retains alpha; JPEG would silently flatten a transparent image.
+        encoders.push(() => metadata.hasAlpha ? pipeline().webp({ quality }) : pipeline().jpeg({ quality }))
+      }
+      for (const encode of encoders) {
+        const buffer = await encode().toBuffer()
+        if (buffer.length >= best.buffer.length) continue
+        const output = await sharp(buffer).metadata()
+        if (!output.width || !output.height) continue
+        best = createResizeResult(buffer, output.format, originalWidth, originalHeight,
+          { width: output.width, height: output.height })
+        if (buffer.length <= maxBytes) return best
+      }
+    }
+  } catch (error) {
+    logForDebugging(`Context image optimization unavailable: ${errorMessage(error)}`, { level: 'warn' })
+  }
+  return best
+}
+
+/**
  * Extracted from FileReadTool's readImage function
  * Resizes image buffer to meet size and dimension constraints
+ * An explicit request limit also requires verifiable dimensions on fallback.
  */
 export async function maybeResizeAndDownsampleImageBuffer(
   imageBuffer: Buffer,
   originalSize: number,
   ext: string,
+  dimensionLimit?: number,
 ): Promise<ResizeResult> {
+  const maxWidth = dimensionLimit ?? IMAGE_MAX_WIDTH
+  const maxHeight = dimensionLimit ?? IMAGE_MAX_HEIGHT
+  let knownDimensions: { width: number; height: number } | undefined
   if (imageBuffer.length === 0) {
     // Empty buffer would fall through the catch block below (sharp throws
     // "Unable to determine image format"), and the fallback's size check
@@ -189,7 +259,7 @@ export async function maybeResizeAndDownsampleImageBuffer(
     throw new ImageResizeError('Image file is empty (0 bytes)')
   }
   try {
-    const sharp = await getImageProcessor()
+    const sharp = await getImageProcessor({ requireAutoOrient: dimensionLimit !== undefined })
     const image = sharp(imageBuffer)
     const metadata = await image.metadata()
 
@@ -199,6 +269,9 @@ export async function maybeResizeAndDownsampleImageBuffer(
 
     // If dimensions aren't available from metadata
     if (!metadata.width || !metadata.height) {
+      if (dimensionLimit !== undefined) {
+        throw new ImageResizeError('Unable to determine image dimensions for this request')
+      }
       if (originalSize > IMAGE_TARGET_RAW_SIZE) {
         // Create fresh sharp instance for compression
         const compressedBuffer = await sharp(imageBuffer)
@@ -211,8 +284,11 @@ export async function maybeResizeAndDownsampleImageBuffer(
     }
 
     // Store original dimensions (guaranteed to be defined here)
-    const originalWidth = metadata.width
-    const originalHeight = metadata.height
+    const autoOrient = dimensionLimit !== undefined && !!metadata.orientation && metadata.orientation !== 1
+    const swapAxes = autoOrient && metadata.orientation! >= 5
+    const originalWidth = swapAxes ? metadata.height : metadata.width
+    const originalHeight = swapAxes ? metadata.width : metadata.height
+    knownDimensions = { width: originalWidth, height: originalHeight }
 
     // Calculate dimensions while maintaining aspect ratio
     let width = originalWidth
@@ -221,8 +297,8 @@ export async function maybeResizeAndDownsampleImageBuffer(
     // Check if the original file just works
     if (
       originalSize <= IMAGE_TARGET_RAW_SIZE &&
-      width <= IMAGE_MAX_WIDTH &&
-      height <= IMAGE_MAX_HEIGHT
+      width <= maxWidth &&
+      height <= maxHeight
     ) {
       return {
         buffer: imageBuffer,
@@ -239,8 +315,8 @@ export async function maybeResizeAndDownsampleImageBuffer(
     const hardDims = constrainDimensions(
       width,
       height,
-      IMAGE_MAX_WIDTH,
-      IMAGE_MAX_HEIGHT,
+      maxWidth,
+      maxHeight,
     )
     const needsDimensionResize =
       hardDims.width !== width || hardDims.height !== height
@@ -250,6 +326,7 @@ export async function maybeResizeAndDownsampleImageBuffer(
     if (!needsDimensionResize && originalSize > IMAGE_TARGET_RAW_SIZE) {
       const compressed = await tryEncodeImageCandidate({
         sharp,
+        autoOrient,
         imageBuffer,
         originalWidth,
         originalHeight,
@@ -264,6 +341,7 @@ export async function maybeResizeAndDownsampleImageBuffer(
       logForDebugging(`Resizing to ${hardDims.width}x${hardDims.height}`)
       const hardResize = await tryEncodeImageCandidate({
         sharp,
+        autoOrient,
         imageBuffer,
         originalWidth,
         originalHeight,
@@ -289,6 +367,7 @@ export async function maybeResizeAndDownsampleImageBuffer(
       )
       const softResize = await tryEncodeImageCandidate({
         sharp,
+        autoOrient,
         imageBuffer,
         originalWidth,
         originalHeight,
@@ -314,6 +393,7 @@ export async function maybeResizeAndDownsampleImageBuffer(
       )
       const readableResize = await tryEncodeImageCandidate({
         sharp,
+        autoOrient,
         imageBuffer,
         originalWidth,
         originalHeight,
@@ -347,20 +427,19 @@ export async function maybeResizeAndDownsampleImageBuffer(
     // Calculate the base64 size (API limit is on base64-encoded length)
     const base64Size = Math.ceil((originalSize * 4) / 3)
 
-    // Size-under-5MB does not imply dimensions-under-cap. Don't return the
-    // raw buffer if the PNG header says it's oversized — fall through to
-    // ImageResizeError instead. PNG sig is 8 bytes, IHDR dims at 16-24.
-    const overDim =
-      imageBuffer.length >= 24 &&
-      imageBuffer[0] === 0x89 &&
-      imageBuffer[1] === 0x50 &&
-      imageBuffer[2] === 0x4e &&
-      imageBuffer[3] === 0x47 &&
-      (imageBuffer.readUInt32BE(16) > IMAGE_MAX_WIDTH ||
-        imageBuffer.readUInt32BE(20) > IMAGE_MAX_HEIGHT)
+    // If encoding failed, metadata still describes the original image (all
+    // formats). If the processor could not load or decode it, every format the
+    // API accepts still states its pixel size in the header. Both limits are
+    // equal, so EXIF orientation cannot change this check.
+    knownDimensions ??= readImageHeaderDimensions(imageBuffer)
+    const overDim = knownDimensions &&
+      (knownDimensions.width > maxWidth || knownDimensions.height > maxHeight)
+    // At the request boundary, an unknown size must not silently bypass the
+    // per-request cap when a native processor is unavailable.
+    const unknownDim = dimensionLimit !== undefined && !knownDimensions
 
     // If original image's base64 encoding is within API limit, allow it through uncompressed
-    if (base64Size <= API_IMAGE_MAX_BASE64_SIZE && !overDim) {
+    if (base64Size <= API_IMAGE_MAX_BASE64_SIZE && !overDim && !unknownDim) {
       logEvent('tengu_image_resize_fallback', {
         original_size_bytes: originalSize,
         base64_size_bytes: base64Size,
@@ -371,8 +450,10 @@ export async function maybeResizeAndDownsampleImageBuffer(
 
     // Image is too large and we failed to compress it - fail with user-friendly error
     throw new ImageResizeError(
-      overDim
-        ? `Unable to resize image — dimensions exceed the ${IMAGE_MAX_WIDTH}x${IMAGE_MAX_HEIGHT}px limit and image processing failed. ` +
+      unknownDim
+        ? `Unable to verify image dimensions against the ${maxWidth}x${maxHeight}px request limit because image processing failed. Please use a smaller image or restore image processing support.`
+        : overDim
+        ? `Unable to resize image — dimensions exceed the ${maxWidth}x${maxHeight}px limit and image processing failed. ` +
             `Please resize the image to reduce its pixel dimensions.`
         : `Unable to resize image (${formatFileSize(originalSize)} raw, ${formatFileSize(base64Size)} base64). ` +
             `The image exceeds the 5MB API limit and compression failed. ` +
@@ -458,8 +539,13 @@ function createImagePipeline(
   originalWidth: number,
   originalHeight: number,
   dimensions: ResizeDimensions,
+  autoOrient = false,
 ): SharpInstance {
-  const pipeline = sharp(imageBuffer)
+  let pipeline = sharp(imageBuffer)
+  if (autoOrient) {
+    if (!pipeline.autoOrient) throw new ImageResizeError('Image processor cannot preserve image orientation')
+    pipeline = pipeline.autoOrient()
+  }
   if (
     dimensions.width === originalWidth &&
     dimensions.height === originalHeight
@@ -475,6 +561,7 @@ function createImagePipeline(
 
 async function tryEncodeImageCandidate({
   sharp,
+  autoOrient = false,
   imageBuffer,
   originalWidth,
   originalHeight,
@@ -484,6 +571,7 @@ async function tryEncodeImageCandidate({
   allowFallbackQuality = false,
 }: {
   sharp: SharpFunction
+  autoOrient?: boolean
   imageBuffer: Buffer
   originalWidth: number
   originalHeight: number
@@ -501,6 +589,7 @@ async function tryEncodeImageCandidate({
       originalWidth,
       originalHeight,
       dimensions,
+      autoOrient,
     )
       .png({ compressionLevel: 9 })
       .toBuffer()
@@ -520,6 +609,7 @@ async function tryEncodeImageCandidate({
       originalWidth,
       originalHeight,
       dimensions,
+      autoOrient,
     )
       .webp({ lossless: true })
       .toBuffer()
@@ -539,6 +629,7 @@ async function tryEncodeImageCandidate({
       originalWidth,
       originalHeight,
       dimensions,
+      autoOrient,
     )
       .webp({ lossless: true })
       .toBuffer()
@@ -563,6 +654,7 @@ async function tryEncodeImageCandidate({
       originalWidth,
       originalHeight,
       dimensions,
+      autoOrient,
     )
       .jpeg({ quality })
       .toBuffer()
@@ -1029,6 +1121,45 @@ export function detectImageFormatFromBuffer(buffer: Buffer): ImageMediaType {
 
   // Default to PNG if unknown
   return 'image/png'
+}
+
+/**
+ * Pixel size from the header alone (PNG, GIF, WebP, JPEG), without decoding.
+ * Returns undefined for any other or truncated input.
+ */
+export function readImageHeaderDimensions(bytes: Buffer): { width: number; height: number } | undefined {
+  const valid = (width: number, height: number) => width > 0 && height > 0 ? { width, height } : undefined
+  if (bytes.length >= 24 && bytes.readUInt32BE(0) === 0x89504e47 && bytes.toString('ascii', 12, 16) === 'IHDR') {
+    return valid(bytes.readUInt32BE(16), bytes.readUInt32BE(20))
+  }
+  if (bytes.length >= 10 && bytes.toString('ascii', 0, 3) === 'GIF') {
+    return valid(bytes.readUInt16LE(6), bytes.readUInt16LE(8))
+  }
+  if (bytes.length >= 30 && bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP') {
+    const chunk = bytes.toString('ascii', 12, 16)
+    if (chunk === 'VP8X') return valid(1 + bytes.readUIntLE(24, 3), 1 + bytes.readUIntLE(27, 3))
+    if (chunk === 'VP8L') {
+      const bits = bytes.readUInt32LE(21)
+      return valid(1 + (bits & 0x3fff), 1 + ((bits >> 14) & 0x3fff))
+    }
+    if (chunk === 'VP8 ') return valid(bytes.readUInt16LE(26) & 0x3fff, bytes.readUInt16LE(28) & 0x3fff)
+    return undefined
+  }
+  if (bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8) {
+    let offset = 2
+    while (offset + 9 < bytes.length) {
+      if (bytes[offset] !== 0xff) { offset++; continue }
+      const marker = bytes[offset + 1]!
+      if (marker === 0xff) { offset++; continue }
+      if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { offset += 2; continue }
+      const length = bytes.readUInt16BE(offset + 2)
+      const isFrame = marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc
+      if (isFrame) return valid(bytes.readUInt16BE(offset + 7), bytes.readUInt16BE(offset + 5))
+      if (length < 2) return undefined
+      offset += 2 + length
+    }
+  }
+  return undefined
 }
 
 /**

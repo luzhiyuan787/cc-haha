@@ -4,11 +4,13 @@ import { tmpdir } from 'node:os'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import type { ToolUseContext } from '../../Tool.js'
+import { getDefaultAppState } from '../../state/AppStateStore.js'
 import { getSessionCreatedTeams } from '../../bootstrap/state.js'
 import { readTeamFileAsync } from '../../utils/swarm/teamHelpers.js'
 import { approveTeamPlan, mutateTeamPlan, readTeamPlan } from '../../utils/swarm/teamPlanStore.js'
 import { clearLeaderTeamName, createTask, getCanonicalTeamTaskListId } from '../../utils/tasks.js'
 import { GENERAL_PURPOSE_AGENT } from '../AgentTool/built-in/generalPurposeAgent.js'
+import { AgentTool } from '../AgentTool/AgentTool.js'
 import { EXPLORE_AGENT } from '../AgentTool/built-in/exploreAgent.js'
 import { TeamCreateTool } from '../TeamCreateTool/TeamCreateTool.js'
 import { TaskUpdateTool } from '../TaskUpdateTool/TaskUpdateTool.js'
@@ -20,16 +22,25 @@ import { captureLegacyPlanTasks, resolveProposedTeamPlan, snapshotTeamAgents, te
 let directory: string
 let context: ToolUseContext
 let saved: Record<string, string | undefined>
-const keys = ['CLAUDE_CONFIG_DIR', 'CC_HAHA_TEAM_REVIEW_REQUIRED', 'CC_HAHA_TEAM_LEADER_RUNTIME', 'CLAUDE_CODE_SUBAGENT_MODEL']
+const keys = [
+  'HOME', 'CLAUDE_CONFIG_DIR', 'CC_HAHA_TEAM_REVIEW_REQUIRED', 'CC_HAHA_TEAM_LEADER_RUNTIME', 'CLAUDE_CODE_SUBAGENT_MODEL',
+  'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CODE_USE_AZURE_OPENAI',
+  'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS', 'CC_HAHA_AGENT_TEAMS_ENABLED',
+]
 
 beforeEach(async () => {
   directory = await mkdtemp(join(tmpdir(), 'team-plan-tools-'))
   saved = Object.fromEntries(keys.map(key => [key, process.env[key]]))
+  process.env.HOME = directory
   process.env.CLAUDE_CONFIG_DIR = directory
   process.env.CC_HAHA_TEAM_REVIEW_REQUIRED = '1'
+  process.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = '1'
+  process.env.CC_HAHA_AGENT_TEAMS_ENABLED = '1'
   process.env.CC_HAHA_TEAM_LEADER_RUNTIME = JSON.stringify({ providerId: 'fake-provider', modelId: 'fake-model' })
   delete process.env.CLAUDE_CODE_SUBAGENT_MODEL
-  let state = { mainLoopModel: 'fake-model', inbox: { messages: [] } } as ReturnType<ToolUseContext['getAppState']>
+  let state = { ...getDefaultAppState(), mainLoopModel: 'fake-model', inbox: { messages: [] } } as ReturnType<ToolUseContext['getAppState']>
   context = {
     getAppState: () => state,
     setAppState: update => { state = typeof update === 'function' ? update(state) : update },
@@ -52,6 +63,230 @@ afterEach(async () => {
 })
 
 describe('whole-team planning tools', () => {
+  const stageThroughAgent = (name: string) => AgentTool.call({
+    name, team_name: 'review-team', subagent_type: 'general-purpose',
+    description: 'Propose a team member', prompt: `Work after human approval: ${name}`,
+  }, context)
+  const mappedResult = (data: Awaited<ReturnType<typeof AgentTool.call>>['data']) =>
+    JSON.stringify(AgentTool.mapToolResultToToolResultBlockParam(data, 'staged-member'))
+  const submitCurrentRoster = async () => {
+    const plan = (await readTeamPlan('review-team'))!
+    return TeamPlanTool.call({
+      team_name: plan.teamName, operation: 'submit', expected_revision: plan.revision,
+      plan: {
+        members: plan.members.map(({ id, name, agentType, prompt, runtime }) => ({ id, name, agentType, prompt, runtime })),
+        tasks: plan.members.map(member => ({ id: `task-${member.id}`, subject: `Work by ${member.name}`, ownerId: member.id, dependencies: [] })),
+      },
+    }, context)
+  }
+
+  test('real Agent results let both initial and running-team drafts reach review without starting members (#1856)', async () => {
+    await TeamCreateTool.call({ team_name: 'review-team' }, context)
+    const first = await stageThroughAgent('reviewer')
+    const draft = (await readTeamPlan('review-team'))!
+    expect(first.data).toMatchObject({ status: 'teammate_staged', staged: true, plan_id: draft.planId, revision: draft.revision })
+    expect(mappedResult(first.data)).toContain(draft.planId)
+    expect(mappedResult(first.data)).toContain(`revision: ${draft.revision} (use it as TeamPlan expected_revision)`)
+    expect((await readTeamFileAsync('review-team'))?.members).toHaveLength(1)
+    await submitCurrentRoster()
+    const pending = (await readTeamPlan('review-team'))!
+    expect(pending.state).toBe('review_pending')
+    expect((await readTeamFileAsync('review-team'))?.members).toHaveLength(1)
+    const approved = await approveTeamPlan('review-team', { ...pending, expectedRevision: pending.revision }, 'human-initial', pending)
+    const running = await mutateTeamPlan('review-team', { ...approved.plan, expectedRevision: approved.plan.revision }, value => ({ ...value, state: 'running' }))
+    const added = await stageThroughAgent('fix-touch')
+    const addition = (await readTeamPlan('review-team'))!
+    expect(addition).toMatchObject({ state: 'draft', parentPlanId: running.planId })
+    expect(addition.planId).not.toBe(running.planId)
+    expect(addition.members.map(member => member.name)).toEqual(['fix-touch'])
+    expect(added.data).toMatchObject({ plan_id: addition.planId, revision: addition.revision })
+    expect(mappedResult(added.data)).toContain(addition.planId)
+    await submitCurrentRoster()
+    expect((await readTeamPlan('review-team'))?.state).toBe('review_pending')
+  })
+
+  test('Agent retries and multiple members require the latest revision and renewed human review', async () => {
+    await TeamCreateTool.call({ team_name: 'review-team' }, context)
+    const first = await stageThroughAgent('reviewer')
+    const firstDraft = (await readTeamPlan('review-team'))!
+    const repeated = await stageThroughAgent('reviewer')
+    const second = await stageThroughAgent('fix-touch')
+    const plan = (await readTeamPlan('review-team'))!
+    expect(plan.members.map(member => member.name)).toEqual(['reviewer', 'fix-touch'])
+    expect(plan.revision).toBe(firstDraft.revision + 2)
+    for (const result of [first, repeated, second]) expect(mappedResult(result.data)).toContain('NOT started')
+    expect(mappedResult(second.data)).toContain(`revision: ${plan.revision}`)
+    await expect(TeamPlanTool.call({ team_name: plan.teamName, operation: 'submit', expected_revision: firstDraft.revision }, context)).rejects.toThrow('changed')
+    expect((await readTeamPlan(plan.teamName))?.state).toBe('draft')
+    const latest = await TeamPlanTool.call({ team_name: plan.teamName, operation: 'get' }, context)
+    expect(latest.data.revision).toBe(plan.revision)
+    await submitCurrentRoster()
+    const pending = (await readTeamPlan(plan.teamName))!
+    expect(pending.state).toBe('review_pending')
+    const again = await stageThroughAgent('fix-touch')
+    expect((await readTeamPlan(plan.teamName))?.state).toBe('draft')
+    expect(mappedResult(again.data)).toContain('TeamPlan expected_revision')
+    await expect(approveTeamPlan(plan.teamName, { ...pending, expectedRevision: pending.revision }, 'stale-human', pending)).rejects.toThrow('changed')
+  })
+
+  describe('generated model suggestions for a non-Claude leader', () => {
+    beforeEach(() => {
+      Object.assign(process.env, {
+        ANTHROPIC_BASE_URL: 'http://127.0.0.1:1/anthropic',
+        ANTHROPIC_MODEL: 'deepseek-v4-flash',
+        ANTHROPIC_DEFAULT_OPUS_MODEL: 'deepseek-v4-pro',
+        ANTHROPIC_DEFAULT_SONNET_MODEL: 'deepseek-v4-pro',
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: 'deepseek-v4-flash',
+      })
+      for (const key of ['CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CODE_USE_AZURE_OPENAI']) delete process.env[key]
+      context.options.mainLoopModel = 'deepseek-v4-flash'
+    })
+
+    const proposal = (modelId: string, providerId = 'fake-provider', agentType = 'general-purpose') => ({
+      members: [{ id: 'w', name: 'w', agentType, prompt: 'Work', runtime: { providerId, modelId, effortLevel: 'high' } }],
+      tasks: [],
+    })
+
+    test('an automatic Opus suggestion follows Flash instead of the provider Pro slot', () => {
+      const member = resolveProposedTeamPlan(proposal('opus'), context).members[0]!
+      expect(member.runtime).toEqual({ providerId: 'fake-provider', modelId: 'deepseek-v4-flash' })
+      expect(member.suggestedRuntime).toEqual(member.runtime)
+    })
+
+    test('a generated legacy Claude version follows the selected provider model', () => {
+      process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = 'deepseek-v4-flash'
+      const member = resolveProposedTeamPlan(proposal('claude-opus-4-8'), context).members[0]!
+      expect(member.runtime).toEqual({ providerId: 'fake-provider', modelId: 'deepseek-v4-flash' })
+    })
+
+    test('preset snapshots preserve model specs while default members use the current provider mapping', () => {
+      process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = 'deepseek-v4-flash'
+      context.options.agentDefinitions.activeAgents.push({
+        agentType: 'legacy-opus', source: 'flagSettings', whenToUse: 'Fixture',
+        rawSystemPrompt: 'Fixture instructions', getSystemPrompt: () => 'Fixture instructions', model: 'claude-opus-4-6',
+      })
+      const catalog = snapshotTeamAgents(context)
+      expect(catalog['legacy-opus']?.model).toBe('claude-opus-4-6')
+      expect(catalog.Explore?.model).toBe('inherit')
+      const plan = resolveProposedTeamPlan({ members: [{ id: 'w', name: 'w', agentType: 'legacy-opus', prompt: 'Work' }], tasks: [] }, context)
+      expect(plan.members[0]?.runtime.modelId).toBe('deepseek-v4-flash')
+    })
+
+    for (const scenario of [
+      { agentType: 'manual-opus', model: 'opus', expectedModel: 'member-opus' },
+      { agentType: 'manual-legacy-opus', model: 'claude-opus-4-6', expectedModel: 'member-opus' },
+      { agentType: 'Explore', model: undefined, expectedModel: 'member-main' },
+    ]) {
+      test(`a preset switch to ${scenario.agentType} resolves against the member provider before approval`, async () => {
+        const { TeamPlanService } = await import('../../server/services/teamPlanService.js')
+        const { ProviderService } = await import('../../server/services/providerService.js')
+        const { validateTeamPlanRuntime } = await import('../../server/services/teamPlanRuntime.js')
+        const provider = await new ProviderService().addProvider({
+          presetId: 'custom', name: 'Member provider', baseUrl: 'http://127.0.0.1:1', apiKey: 'fake-member-key',
+          models: { main: 'member-main', sonnet: 'member-sonnet', opus: 'member-opus', haiku: 'member-haiku' },
+        })
+        if (scenario.model) context.options.agentDefinitions.activeAgents.push({
+          agentType: scenario.agentType, source: 'flagSettings', whenToUse: 'Fixture',
+          rawSystemPrompt: 'Fixture instructions', getSystemPrompt: () => 'Fixture instructions', model: scenario.model,
+        })
+        const created = await TeamCreateTool.call({ team_name: 'review-team', plan: {
+          members: [{ id: 'worker', name: 'worker', prompt: 'Work', runtime: { providerId: provider.id, modelId: 'member-main' } }],
+          tasks: [{ id: 'work', subject: 'Work', ownerId: 'worker', dependencies: [] }],
+        } }, context)
+        await TeamPlanTool.call({ team_name: 'review-team', operation: 'submit', expected_revision: created.data.plan!.revision }, context)
+        const pending = (await readTeamPlan('review-team'))!
+        const service = new TeamPlanService({ validate: validateTeamPlanRuntime, launch: async () => ({ memberIds: {} }), stop: async () => {} })
+        const edited = await service.update(pending.teamName, { ...pending, expectedRevision: pending.revision }, {
+          members: [{ id: 'worker', agentType: scenario.agentType }],
+        })
+        const validated = await validateTeamPlanRuntime(edited)
+        const approved = await approveTeamPlan(edited.teamName, { ...edited, expectedRevision: edited.revision }, 'fixture-approval', validated)
+        expect(approved.plan.approvedSnapshot?.members[0]?.runtime).toEqual({ providerId: provider.id, modelId: scenario.expectedModel })
+      })
+    }
+
+    test('a preset that pins a saved provider suggests that provider, its model slot and effort', async () => {
+      const { TeamPlanService } = await import('../../server/services/teamPlanService.js')
+      const { ProviderService } = await import('../../server/services/providerService.js')
+      const provider = await new ProviderService().addProvider({
+        presetId: 'custom', name: 'Reviewer provider', baseUrl: 'http://127.0.0.1:1', apiKey: 'fake-reviewer-key',
+        models: { main: 'reviewer-main', sonnet: 'reviewer-sonnet', opus: 'reviewer-opus', haiku: 'reviewer-haiku' },
+      })
+      context.options.agentDefinitions.activeAgents.push({
+        agentType: 'pinned-reviewer', source: 'flagSettings', whenToUse: 'Fixture',
+        rawSystemPrompt: 'Fixture instructions', getSystemPrompt: () => 'Fixture instructions',
+        model: 'haiku', provider: provider.id, effort: 'max',
+      })
+      expect(snapshotTeamAgents(context)['pinned-reviewer']).toMatchObject({ model: 'haiku', provider: provider.id })
+
+      // The lead's tier guess for its own provider does not outrank the preset.
+      const proposed = resolveProposedTeamPlan(proposal('opus', 'fake-provider', 'pinned-reviewer'), context).members[0]!
+      expect(proposed.runtime).toEqual({ providerId: provider.id, modelId: 'reviewer-haiku', effortLevel: 'max' })
+
+      const created = await TeamCreateTool.call({ team_name: 'review-team', plan: {
+        members: [{ id: 'worker', name: 'worker', prompt: 'Work' }],
+        tasks: [{ id: 'work', subject: 'Work', ownerId: 'worker', dependencies: [] }],
+      } }, context)
+      await TeamPlanTool.call({ team_name: 'review-team', operation: 'submit', expected_revision: created.data.plan!.revision }, context)
+      const pending = (await readTeamPlan('review-team'))!
+      const service = new TeamPlanService({ validate: async plan => plan, launch: async () => ({ memberIds: {} }), stop: async () => {} })
+      const switched = await service.update(pending.teamName, { ...pending, expectedRevision: pending.revision }, {
+        members: [{ id: 'worker', agentType: 'pinned-reviewer' }],
+      })
+      expect(switched.members[0]?.runtime).toEqual({ providerId: provider.id, modelId: 'reviewer-haiku', effortLevel: 'max' })
+      // The reviewer then lowers the effort; approval launches exactly that.
+      const lowered = await service.update(switched.teamName, { ...switched, expectedRevision: switched.revision }, {
+        members: [{ id: 'worker', runtime: { providerId: provider.id, modelId: 'reviewer-sonnet', effortLevel: 'low' } }],
+      })
+      const approved = await approveTeamPlan(lowered.teamName, { ...lowered, expectedRevision: lowered.revision }, 'fixture-approval', lowered)
+      expect(approved.plan.approvedSnapshot?.members[0]?.runtime).toEqual({
+        providerId: provider.id, modelId: 'reviewer-sonnet', effortLevel: 'low',
+      })
+    })
+
+    test('a pinned preset outranks a Claude lead\'s own suggestion and keeps the 1M mapping', async () => {
+      const { ProviderService } = await import('../../server/services/providerService.js')
+      const provider = await new ProviderService().addProvider({
+        presetId: 'custom', name: 'Pinned provider', baseUrl: 'http://127.0.0.1:1', apiKey: 'fake-pinned-key',
+        models: { main: 'pinned-main', sonnet: 'pinned-sonnet', opus: 'pinned-opus', haiku: 'pinned-haiku' },
+        model1mSupport: { main: false, haiku: true, sonnet: false, opus: false },
+      })
+      context.options.agentDefinitions.activeAgents.push({
+        agentType: 'pinned-reviewer', source: 'flagSettings', whenToUse: 'Fixture',
+        rawSystemPrompt: 'Fixture instructions', getSystemPrompt: () => 'Fixture instructions',
+        model: 'haiku', provider: provider.id, effort: 'max',
+      })
+      // A Claude Official lead: its tier suggestions are concrete choices, not
+      // something normalized away, yet the user's pin still wins.
+      for (const key of ['ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL']) delete process.env[key]
+      process.env.CC_HAHA_TEAM_LEADER_RUNTIME = JSON.stringify({ providerId: 'claude-official', modelId: 'claude-opus-4-7' })
+      context.options.mainLoopModel = 'claude-opus-4-7'
+
+      const member = resolveProposedTeamPlan(proposal('sonnet', 'claude-official', 'pinned-reviewer'), context).members[0]!
+
+      expect(member.runtime).toEqual({ providerId: provider.id, modelId: 'pinned-haiku[1m]', effortLevel: 'max' })
+      expect(member.suggestedRuntime).toEqual(member.runtime)
+    })
+
+    test('automatic suggestions preserve a manually configured Agent model and effort', () => {
+      context.options.agentDefinitions.activeAgents.push({
+        agentType: 'manual-pro', source: 'flagSettings', whenToUse: 'Fixture',
+        rawSystemPrompt: 'Fixture instructions', getSystemPrompt: () => 'Fixture instructions', model: 'deepseek-v4-pro', effort: 'low',
+      })
+      const member = resolveProposedTeamPlan(proposal('opus', 'fake-provider', 'manual-pro'), context).members[0]!
+      expect(member.runtime).toEqual({ providerId: 'fake-provider', modelId: 'deepseek-v4-pro', effortLevel: 'low' })
+    })
+
+    test('explicit model suggestions on another configured provider remain available for review', async () => {
+      await mkdir(join(directory, 'cc-haha'), { recursive: true })
+      await writeFile(join(directory, 'cc-haha', 'providers.json'), JSON.stringify({ providers: [{ id: 'other-provider' }] }))
+      const member = resolveProposedTeamPlan(proposal('opus', 'other-provider'), context).members[0]!
+      expect(member.runtime).toEqual({ providerId: 'other-provider', modelId: 'opus', effortLevel: 'high' })
+      expect(resolveProposedTeamPlan(proposal('deepseek-v4-pro'), context).members[0]?.runtime)
+        .toEqual({ providerId: 'fake-provider', modelId: 'deepseek-v4-pro', effortLevel: 'high' })
+    })
+  })
+
   test('headless team creation records the executing model when AppState has no model', async () => {
     context.setAppState(state => ({ ...state, mainLoopModel: null, mainLoopModelForSession: null }))
     context.options.mainLoopModel = 'executing-model'
@@ -211,5 +446,25 @@ describe('whole-team planning tools', () => {
     expect(await captureLegacyPlanTasks(increment)).toEqual([])
     const updated = await TaskUpdateTool.call({ taskId, status: 'in_progress' }, context)
     expect(updated.data.success).toBe(true)
+  })
+
+  test('a lead asked for another team is sent back to its own, where new members become an addition for review', async () => {
+    // Pointing at TeamDelete first had leads tear down a stopped team they
+    // could reuse, and delete its directories by hand when that stalled.
+    const created = await TeamCreateTool.call({ team_name: 'review-team', plan: {
+      members: [{ id: 'old', name: 'old', prompt: 'Existing work' }],
+      tasks: [{ id: 'work', subject: 'Existing work', ownerId: 'old', dependencies: [] }],
+    } }, context)
+    await TeamPlanTool.call({ team_name: 'review-team', operation: 'submit', expected_revision: created.data.plan!.revision }, context)
+    let plan = (await readTeamPlan('review-team'))!
+    const approved = await approveTeamPlan(plan.teamName, { ...plan, expectedRevision: plan.revision }, 'fixture-approval', plan)
+    plan = await mutateTeamPlan(plan.teamName, { ...approved.plan, expectedRevision: approved.plan.revision }, current => ({ ...current, state: 'running' }))
+
+    await expect(TeamCreateTool.call({ team_name: 'second-team' }, context)).rejects.toThrow(
+      'add members with the Agent tool (team_name: "review-team"). Use TeamDelete only when the user wants this team replaced',
+    )
+    const staged = await spawnTeammate({ name: 'writer', team_name: 'review-team', prompt: 'Write the summary' }, context)
+    expect(staged.data.staged).toBe(true)
+    expect(await readTeamPlan('review-team')).toMatchObject({ state: 'draft', parentPlanId: plan.planId })
   })
 })

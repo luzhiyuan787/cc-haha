@@ -11,8 +11,9 @@ import {
 } from './appZoom'
 
 import { CHAT_APPEARANCE_STORAGE_KEY, migrateChatAppearance } from './chatAppearance'
+import { PREVENT_SLEEP_STORAGE_KEY } from './preventSleepPreference'
 
-export const CURRENT_DESKTOP_PERSISTENCE_SCHEMA_VERSION = 6
+export const CURRENT_DESKTOP_PERSISTENCE_SCHEMA_VERSION = 7
 export const DESKTOP_PERSISTENCE_VERSION_KEY = 'cc-haha.persistence.schemaVersion'
 
 type DesktopMigrationReport = {
@@ -281,7 +282,13 @@ function migrateWorkspaceState(storage: StorageLike, report: DesktopMigrationRep
       sessions[sessionId] = { ...value, tabs }
     }
 
-    if (Object.keys(sessions).length === 0) {
+    // Closing the last tab still leaves a valid document owning the user's
+    // panel sizes. The hydrator applies the readable bounds when restoring it.
+    const hasStoredSizes = typeof parsed.sideWidth === 'number' &&
+      Number.isFinite(parsed.sideWidth) && parsed.sideWidth > 0 &&
+      typeof parsed.bottomHeight === 'number' &&
+      Number.isFinite(parsed.bottomHeight) && parsed.bottomHeight > 0
+    if (Object.keys(sessions).length === 0 && !hasStoredSizes) {
       storage.removeItem(WORKSPACE_STORAGE_KEY)
       report.migratedKeys.push(WORKSPACE_STORAGE_KEY)
       return
@@ -370,6 +377,15 @@ export function runDesktopPersistenceMigrations(storage: StorageLike | null = ge
   runMigrationStep(report, WORKSPACE_STORAGE_KEY, () => migrateWorkspaceState(storage, report))
   runMigrationStep(report, CHAT_APPEARANCE_STORAGE_KEY, () => {
     if (migrateChatAppearance(storage)) report.migratedKeys.push(CHAT_APPEARANCE_STORAGE_KEY)
+  })
+  // Schema 7 adds an opt-in power preference. Old installs stay off; upgrades
+  // preserve either explicit choice and normalize incomplete/invalid values.
+  runMigrationStep(report, PREVENT_SLEEP_STORAGE_KEY, () => {
+    const stored = storage.getItem(PREVENT_SLEEP_STORAGE_KEY)
+    if (stored !== '0' && stored !== '1') {
+      storage.setItem(PREVENT_SLEEP_STORAGE_KEY, '0')
+      report.migratedKeys.push(PREVENT_SLEEP_STORAGE_KEY)
+    }
   })
   try {
     storage.setItem(DESKTOP_PERSISTENCE_VERSION_KEY, String(CURRENT_DESKTOP_PERSISTENCE_SCHEMA_VERSION))

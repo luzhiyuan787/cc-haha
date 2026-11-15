@@ -6,7 +6,9 @@ import { join, relative, sep } from 'node:path'
 import { loadQuarantineManifest, quarantinedPathSet } from '../quality-gate/quarantine'
 import { rootBunTestFilter } from './bun-test-filter'
 import { classifyFailedFiles, formatFlakeReport } from './server-test-flakes'
+import { runServerTestFiles } from './server-test-scheduling'
 import { createSandboxedTestEnvironment } from './test-environment'
+import { parseShardArg, selectShard } from './test-shard'
 
 const root = process.cwd()
 // The root runtime is wider than src/server: CLI commands, query handling,
@@ -17,6 +19,9 @@ const roots = ['src']
 const excludedFiles = quarantinedPathSet(loadQuarantineManifest())
 const TEST_PROCESS_CONCURRENCY = 4
 const TEST_FILE_PATTERN = /\.test\.[cm]?[jt]sx?$/
+// CI splits the suite across runners with --shard=<index>/<total>; locally and in
+// the nightly sweep there is no flag and every file runs here.
+const shard = parseShardArg(process.argv.slice(2))
 
 function normalize(path: string) {
   return relative(root, path).split(sep).join('/')
@@ -52,6 +57,11 @@ testFiles.sort()
 if (testFiles.length === 0) {
   console.log('No server-side test files found.')
   process.exit(0)
+}
+
+const selectedFiles = selectShard(testFiles, shard)
+if (shard) {
+  console.log(`[server-tests] shard ${shard.index}/${shard.total}: ${selectedFiles.length} of ${testFiles.length} files`)
 }
 
 type TestFileResult = {
@@ -119,21 +129,8 @@ async function runTestFile(file: string): Promise<TestFileResult> {
   }
 }
 
-let nextFile = 0
-const results: TestFileResult[] = []
-async function runWorker() {
-  while (nextFile < testFiles.length) {
-    const file = testFiles[nextFile]
-    nextFile += 1
-    results.push(await runTestFile(file))
-  }
-}
-
-await Promise.all(
-  Array.from(
-    { length: Math.min(TEST_PROCESS_CONCURRENCY, testFiles.length) },
-    () => runWorker(),
-  ),
+const results = await runServerTestFiles(
+  selectedFiles, TEST_PROCESS_CONCURRENCY, runTestFile,
 )
 
 const failedFiles = results.filter((result) => !result.evidenceComplete)

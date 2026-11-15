@@ -125,6 +125,18 @@ export class SettingsService {
     return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null
   }
 
+  /** Desktop composer next-prompt suggestions; opt-in because each turn costs an extra request. */
+  async getNextPromptSuggestionsEnabled(): Promise<boolean> {
+    return (await this.getUserSettings()).nextPromptSuggestionsEnabled === true
+  }
+
+  /** Max output tokens escalation mode; missing means 'auto' (follow GrowthBook). */
+  async getMaxOutputTokensEscalationMode(): Promise<'auto' | 'enabled' | 'disabled'> {
+    const user = await this.getUserSettings()
+    const value = user.maxOutputTokensEscalationMode
+    return value === 'enabled' || value === 'disabled' ? value : 'auto'
+  }
+
   /** Read-time upgrade for older settings that only stored the team env flag.
    * Keep the original file intact until the user explicitly saves a choice.
    */
@@ -225,6 +237,12 @@ export class SettingsService {
         throw ApiError.badRequest('maxConcurrentSubagents must be null or a positive safe integer')
       }
     }
+    if (Object.hasOwn(settings, 'maxOutputTokensEscalationMode')) {
+      const value = settings.maxOutputTokensEscalationMode
+      if (value !== 'auto' && value !== 'enabled' && value !== 'disabled') {
+        throw ApiError.badRequest('maxOutputTokensEscalationMode must be auto, enabled, or disabled')
+      }
+    }
     const filePath = this.getUserSettingsPath()
     await this.withWriteLock(filePath, async () => {
       const current = await this.readJsonFile(filePath)
@@ -305,9 +323,9 @@ export class SettingsService {
   }
 
   /**
-   * 合并单个内置 Agent 的 model/effort 覆盖。
+   * 合并单个内置 Agent 的 model/provider/effort 覆盖。
    *
-   * `patch` 为 null 时删除 model/effort；字段值为 null 时只删该字段。
+   * `patch` 为 null 时删除 model/provider/effort；字段值为 null 时只删该字段。
    * 条目清空后连同条目一起删除，`builtInAgentOverrides` 变空时删掉这个 key，
    * 不在用户的 settings.json 里留下空壳。
    *
@@ -319,6 +337,7 @@ export class SettingsService {
     agentType: string,
     patch: {
       model?: string | null
+      provider?: string | null
       effort?: string | number | null
     } | null,
   ): Promise<void> {
@@ -333,9 +352,10 @@ export class SettingsService {
         // future per-agent fields, so reset must not erase data written by a
         // newer client or another settings editor.
         delete entry.model
+        delete entry.provider
         delete entry.effort
       } else {
-        for (const field of ['model', 'effort'] as const) {
+        for (const field of ['model', 'provider', 'effort'] as const) {
           if (!Object.hasOwn(patch, field)) continue
           if (patch[field] === null) {
             delete entry[field]

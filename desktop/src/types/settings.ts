@@ -5,18 +5,18 @@ export type PermissionMode = 'default' | 'acceptEdits' | 'auto' | 'plan' | 'bypa
 export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export type ReasoningEffortLevel = EffortLevel
 /**
- * The six 「纸 · 墨 · 印」 palettes, in the order the appearance picker shows
- * them: four paper grounds, then two ink ones. Each name matches a
+ * The palettes, in the order the appearance picker shows them: four light
+ * grounds, then three dark ones. Each name matches a
  * `[data-theme]` block in theme/globals.css.
  *
  * `light` was the pre-redesign key for the warm workspace; it migrates to
  * `warm-classic` (see lib/persistenceMigrations.ts).
  */
-export const THEME_MODES = ['white', 'paper', 'warm-classic', 'celadon', 'dark', 'ink-blue'] as const
+export const THEME_MODES = ['white', 'paper', 'warm-classic', 'celadon', 'dark', 'ink-blue', 'neutral-dark'] as const
 export type ThemeMode = (typeof THEME_MODES)[number]
 
-/** The two themes on a dark ground. Drives `color-scheme` and Mermaid. */
-export const DARK_THEME_MODES = ['dark', 'ink-blue'] as const
+/** The themes on a dark ground. Drives `color-scheme` and Mermaid. */
+export const DARK_THEME_MODES = ['dark', 'ink-blue', 'neutral-dark'] as const
 export type DarkThemeMode = (typeof DARK_THEME_MODES)[number]
 
 /**
@@ -29,7 +29,7 @@ export type LightThemeMode = (typeof LIGHT_THEME_MODES)[number]
 
 /**
  * Every palette belongs to exactly one half. This fails to compile if a
- * seventh theme is added without deciding which ground it sits on — the
+ * new theme is added without deciding which ground it sits on — the
  * appearance switch would otherwise silently never resolve to it.
  */
 const _everyThemeHasAGround: ThemeMode extends LightThemeMode | DarkThemeMode ? true : never = true
@@ -51,7 +51,7 @@ export function isDarkThemeMode(value: unknown): value is DarkThemeMode {
   return typeof value === 'string' && (DARK_THEME_MODES as readonly string[]).includes(value)
 }
 
-export type WebSearchMode = 'auto' | 'anthropic' | 'tavily' | 'brave' | 'disabled'
+export type WebSearchMode = 'auto' | 'anthropic' | 'tavily' | 'brave' | 'deepseek' | 'disabled'
 
 export type ChatSendBehavior = 'enter' | 'modifierEnter'
 
@@ -81,6 +81,7 @@ export type WebSearchSettings = {
   mode?: WebSearchMode
   tavilyApiKey?: string
   braveApiKey?: string
+  deepseekApiKey?: string
 }
 
 export type UpdateProxyMode = 'system' | 'manual'
@@ -136,6 +137,9 @@ export type DesktopTerminalStartupShell =
 export type DesktopTerminalSettings = {
   startupShell: DesktopTerminalStartupShell
   customShellPath: string
+  /** An installed font family name; empty keeps the built-in monospace stack. */
+  fontFamily: string
+  fontSize: number
 }
 
 export type ModelInfo = {
@@ -143,6 +147,8 @@ export type ModelInfo = {
   name: string
   description: string
   context: string
+  /** Highest window a user may set for this model; absent when no cap is known. */
+  maxContext?: string
   defaultReasoningEffort?: ReasoningEffortLevel
   supportedReasoningEfforts?: ReasoningEffortLevel[]
 }
@@ -158,6 +164,8 @@ export type UserSettings = {
   effort?: EffortLevel
   alwaysThinkingEnabled?: boolean
   workflowKeywordTriggerEnabled?: boolean
+  /** Desktop composer next-prompt suggestions; absent means off (opt-in, costs tokens). */
+  nextPromptSuggestionsEnabled?: boolean
   leanModeEnabled?: boolean
   agentTeamsEnabled?: boolean
   /** 同一会话的普通前台/后台 SubAgent 并发上限，缺省或 null 表示不限。 */
@@ -182,6 +190,8 @@ export type UserSettings = {
   desktopTerminal?: Partial<DesktopTerminalSettings>
   /** Days to keep transcripts. 0 disables session persistence entirely. */
   cleanupPeriodDays?: number
+  /** Max output tokens escalation mode; absent means 'auto' (follow GrowthBook). */
+  maxOutputTokensEscalationMode?: 'auto' | 'enabled' | 'disabled'
   [key: string]: unknown
 }
 

@@ -5,20 +5,19 @@ import type { QuerySource } from '../../constants/querySource.js'
 import type { ToolUseContext } from '../../Tool.js'
 import type { Message } from '../../types/message.js'
 import { getGlobalConfig } from '../../utils/config.js'
-import { getContextWindowForModel, has1mContext } from '../../utils/context.js'
+import { getEffectiveModelContextWindow } from '../../utils/context.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { isEnvTruthy } from '../../utils/envUtils.js'
 import { hasExactErrorMessage } from '../../utils/errors.js'
 import type { CacheSafeParams } from '../../utils/forkedAgent.js'
 import { logError } from '../../utils/log.js'
 import { findLastCompactBoundaryIndex } from '../../utils/messages.js'
-import { getOpenAICodexContextWindowForModel } from '../../services/openaiAuth/models.js'
-import { roughTokenCountEstimation } from '../../services/tokenEstimation.js'
-import { getConfiguredOrBuiltInModelContextWindow } from '../../utils/model/modelContextWindows.js'
+import { roughContextTokenCountEstimation } from '../../services/tokenEstimation.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
+import { getToolSchemaCache } from '../../utils/toolSchemaCache.js'
 import {
   getTokenUsage,
-  hasUsableContextUsage,
+  getCurrentUsage,
   isUsableContextUsage,
   tokenCountWithEstimation,
 } from '../../utils/tokens.js'
@@ -45,27 +44,7 @@ const MAX_SUMMARY_RESERVE_CONTEXT_FRACTION = 0.25
 
 // Returns the context window size minus the max output tokens for the model
 export function getEffectiveContextWindowSize(model: string): number {
-  let contextWindow = getContextWindowForModel(model, getSdkBetas())
-
-  const autoCompactWindow = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
-  if (autoCompactWindow) {
-    const parsed = parseInt(autoCompactWindow, 10)
-    if (!isNaN(parsed) && parsed > 0) {
-      // For models with a known window (configured, built-in, [1m], or Codex
-      // catalog) the global override can only lower it — a 1M value left over
-      // from another provider's preset must not pin a smaller model above its
-      // provider's hard cap, where auto-compact never fires (#1162). Unknown
-      // models resolve to the 200K default, and this env is the only way to
-      // declare their real window, so there it applies directly.
-      const hasKnownWindow =
-        has1mContext(model) ||
-        getConfiguredOrBuiltInModelContextWindow(model) !== undefined ||
-        getOpenAICodexContextWindowForModel(model) != null
-      contextWindow = hasKnownWindow
-        ? Math.min(contextWindow, parsed)
-        : parsed
-    }
-  }
+  const contextWindow = getEffectiveModelContextWindow(model, getSdkBetas())
 
   const reservedTokensForSummary = Math.min(
     getMaxOutputTokensForModel(model),
@@ -269,16 +248,38 @@ export function isAutoCompactEnabled(): boolean {
 export function estimateFallbackFixedContextTokens(
   cacheSafeParams: CacheSafeParams,
 ): number {
-  const tools = cacheSafeParams.toolUseContext.options.tools.map(tool => ({
-    name: tool.name,
-    input_schema: tool.inputJSONSchema ?? zodToJsonSchema(tool.inputSchema),
-  }))
-  return roughTokenCountEstimation(jsonStringify({
+  // Tool descriptions come from async tool.prompt() and are usually the
+  // largest part of the prefix. Once a request has been sent they sit in the
+  // session tool schema cache (same keys as toolToAPISchema); tools not yet
+  // rendered fall back to name + input_schema.
+  const schemaCache = getToolSchemaCache()
+  const tools = cacheSafeParams.toolUseContext.options.tools.map(tool => {
+    const cacheKey = tool.inputJSONSchema
+      ? `${tool.name}:${jsonStringify(tool.inputJSONSchema)}`
+      : tool.name
+    return schemaCache.get(cacheKey) ?? {
+      name: tool.name,
+      input_schema: tool.inputJSONSchema ?? zodToJsonSchema(tool.inputSchema),
+    }
+  })
+  return roughContextTokenCountEstimation(jsonStringify({
     systemPrompt: cacheSafeParams.systemPrompt,
     systemContext: cacheSafeParams.systemContext,
     userContext: cacheSafeParams.userContext,
     tools,
   }))
+}
+
+/** The shared context count for compaction decisions and the desktop meter. */
+export function getAutoCompactTokenCount(
+  messages: Message[],
+  snipTokensFreed = 0,
+  fallbackFixedContextTokens = 0,
+): number {
+  const fixedContextTokens = fallbackFixedContextTokens > 0 && !getCurrentUsage(messages)
+    ? fallbackFixedContextTokens
+    : 0
+  return tokenCountWithEstimation(messages) + fixedContextTokens - snipTokensFreed
 }
 
 export async function shouldAutoCompact(
@@ -347,13 +348,10 @@ export async function shouldAutoCompact(
     }
   }
 
-  const fixedContextTokens = hasUsableContextUsage(messages)
-    ? 0
-    : fallbackFixedContextTokens
-  const tokenCount =
-    tokenCountWithEstimation(messages) +
-    fixedContextTokens -
-    snipTokensFreed
+  const fixedContextTokens = fallbackFixedContextTokens > 0 && !getCurrentUsage(messages)
+    ? fallbackFixedContextTokens
+    : 0
+  const tokenCount = getAutoCompactTokenCount(messages, snipTokensFreed, fixedContextTokens)
   const threshold = getAutoCompactThreshold(model)
   const effectiveWindow = getEffectiveContextWindowSize(model)
 
@@ -403,7 +401,7 @@ export async function autoCompactIfNeeded(
     model,
     querySource,
     snipTokensFreed,
-    estimateFallbackFixedContextTokens(cacheSafeParams),
+    getCurrentUsage(messages) ? 0 : estimateFallbackFixedContextTokens(cacheSafeParams),
   )
 
   if (!shouldCompact) {

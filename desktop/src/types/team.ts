@@ -43,6 +43,7 @@ export type TeamMember = {
   model?: string
   providerId?: string | null
   providerName?: string
+  effortLevel?: string
 }
 
 export type TeamDetail = {
@@ -94,6 +95,8 @@ export type TeamWorkbenchSnapshot = {
 
 export type TeamWorkbenchTimeline = {
   teamName: string
+  /** Discovery source; only a live team offers runtime controls. */
+  source?: 'live' | 'archive' | 'transcript'
   snapshots: TeamWorkbenchSnapshot[]
   loading: boolean
   error: string | null

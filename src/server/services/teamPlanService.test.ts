@@ -128,6 +128,30 @@ test('cold server observes durable pending launch as interrupted instead of repl
   const service = new TeamPlanService({ validate: async item => item, launch: async () => { throw new Error('must never launch') }, stop: async () => {} })
   expect((await service.getForSession('session'))?.state).toBe('interrupted')
 })
+test('a launch cut off before any member started fails like any launch and can be approved again', async () => {
+  const plan = await ready()
+  await approveTeamPlan('review', identity(plan), 'request', plan)
+  const reclaimed: string[] = []
+  const cold = new TeamPlanService({
+    validate: async item => item, launch: async () => { throw new Error('must never launch') }, stop: async () => {},
+    reclaimUnstarted: async item => { reclaimed.push(item.planId); return true },
+  })
+  const failed = await cold.getForSession('session')
+  expect(failed?.state).toBe('launch_failed')
+  expect(failed?.launch?.error).toContain('before any member started')
+  expect(reclaimed).toEqual([plan.planId])
+  // Nothing replays by itself; the user's retry goes back to review.
+  expect((await cold.action('review', 'retry', identity(failed!))).state).toBe('review_pending')
+
+  // One that may have started a member stays interrupted.
+  const started = await readTeamPlan('review')
+  await approveTeamPlan('review', identity(started!), 'second-request', started!)
+  const maybeStarted = new TeamPlanService({
+    validate: async item => item, launch: async () => { throw new Error('must never launch') }, stop: async () => {},
+    reclaimUnstarted: async () => false,
+  })
+  expect((await maybeStarted.getForSession('session'))?.state).toBe('interrupted')
+})
 
 test('UI update only edits allocation, freezes catalog preset and marks human route', async () => {
   const plan = await ready()
@@ -152,6 +176,39 @@ test('return and cancel send trusted leader control exactly once per revision', 
   expect(controls).toEqual(['returned', 'cancelled'])
 })
 
+test('a failed launch can be cancelled, which removes a team no member joined', async () => {
+  const notices: string[] = []
+  const ended: Array<{ planId: string; options?: { unlessStarted?: boolean } }> = []
+  const service = new TeamPlanService({
+    validate: async item => item, launch: async () => { throw new Error('CLI session exited before the control request completed') }, stop: async () => {},
+    end: async (plan, options) => { ended.push({ planId: plan.planId, options }); return true },
+    notifyLeader: async (_plan, kind) => { notices.push(kind) },
+  })
+  await service.approve('review', identity(await ready()))
+  const failed = await settle('launch_failed')
+  expect((await service.action('review', 'cancel', identity(failed))).state).toBe('cancelled')
+  expect(ended).toEqual([{ planId: failed.planId, options: { unlessStarted: true } }])
+  expect(notices).toEqual(['removed'])
+})
+
+test('only an interrupted team can be ended, and ending removes it', async () => {
+  const notices: string[] = []
+  const ended: Array<{ options?: { unlessStarted?: boolean } }> = []
+  const service = new TeamPlanService({
+    validate: async item => item, launch: async () => { throw Object.assign(new Error('release interrupted'), { executionStarted: true }) }, stop: async () => {},
+    end: async (_plan, options) => { ended.push({ options }); return true },
+    notifyLeader: async (_plan, kind) => { notices.push(kind) },
+  })
+  const plan = await ready()
+  await expect(service.action('review', 'end', identity(plan))).rejects.toThrow('Only an interrupted team can be ended')
+  await service.approve('review', identity(plan))
+  const interrupted = await settle('interrupted')
+  expect((await service.action('review', 'end', identity(interrupted))).state).toBe('cancelled')
+  // Its members did start, so it is ended whole rather than only if unstarted.
+  expect(ended).toEqual([{ options: undefined }])
+  expect(notices).toEqual(['ended'])
+})
+
 test('partial execution failure and lost running process cannot replay approved work', async () => {
   const plan = await ready()
   const service = new TeamPlanService({ validate: async item => item, launch: async () => { throw Object.assign(new Error('release interrupted'), { executionStarted: true }) }, stop: async () => {} })
@@ -174,6 +231,22 @@ test('preset switches recalculate suggestion under same provider and preserve hu
   const switched = await service.update('review', identity(human), { members: [{ id: 'worker', agentType: 'architect' }] })
   expect(switched.members[0]?.runtime).toEqual({ providerId: 'other', modelId: 'chosen' })
   expect(switched.members[0]?.suggestedRuntime).toEqual({ providerId: 'other', modelId: 'large-model', effortLevel: 'high' })
+})
+
+test.each([
+  ['fake', 'leader-model'],
+  ['other', 'member-model'],
+])('an inherit preset keeps the correct model under provider %s', async (providerId, expectedModel) => {
+  const plan = await ready()
+  const withCatalog = await replaceTeamPlan('review', identity(plan), {
+    leaderRuntime: { providerId: 'fake', modelId: 'leader-model' },
+    agentCatalog: { inherited: { systemPrompt: 'inherited instructions', model: 'inherit' } },
+    members: [{ ...plan.members[0]!, runtime: { providerId, modelId: 'member-model' } }],
+  })
+  const service = new TeamPlanService({ validate: async item => item, launch: async () => ({ memberIds: {} }), stop: async () => {} })
+  const changed = await service.update('review', identity(withCatalog), { members: [{ id: 'worker', agentType: 'inherited' }] })
+  expect(changed.members[0]?.runtime).toEqual({ providerId, modelId: expectedModel })
+  expect(changed.members[0]?.suggestedRuntime).toEqual({ providerId, modelId: expectedModel })
 })
 
 
@@ -213,4 +286,69 @@ test('a running team whose owner was lost is re-owned instead of being marked in
     isRunning: () => false, rehydrate: async () => false,
   })
   expect((await unrecoverable.getForSession('session'))?.state).toBe('interrupted')
+})
+
+test('a GET whose launching snapshot completes during lookup returns the advanced plan without orphaning it', async () => {
+  const pending = await ready()
+  let release!: () => void
+  const launchBarrier = new Promise<void>(resolve => { release = resolve })
+  let launches = 0, stops = 0
+  const service = new TeamPlanService({ validate: async item => item, launch: async () => {
+    launches++
+    await launchBarrier
+    return { memberIds: { worker: 'fixture-child' } }
+  }, stop: async () => { stops++ }, isRunning: () => true, reclaimUnstarted: async () => false })
+  await service.approve('review', identity(pending))
+  const find = teamPlanStore.findTeamPlanForSession
+  let heldSnapshot: TeamPlanRecord | null = null
+  let delayed = false
+  const lookup = spyOn(teamPlanStore, 'findTeamPlanForSession').mockImplementation(async id => {
+    const observed = await find(id)
+    if (!delayed && observed?.state === 'launching') {
+      delayed = true
+      heldSnapshot = observed
+      release()
+      await settle('running')
+      for (let i = 0; service.hasActiveOperations() && i < 100; i++) await Bun.sleep(1)
+      expect(service.hasActiveOperations()).toBe(false)
+    }
+    return observed
+  })
+  try {
+    const result = await service.getForSession('session')
+    expect(heldSnapshot?.state).toBe('launching')
+    expect(result?.state).toBe('running')
+    expect(result?.planId).toBe(heldSnapshot?.planId)
+    expect(result!.revision).toBeGreaterThan(heldSnapshot!.revision)
+    expect((await readTeamPlan('review'))?.state).toBe('running')
+    expect(launches).toBe(1)
+    expect(stops).toBe(0)
+  } finally { lookup.mockRestore(); release() }
+})
+
+test('GET observation recovery does not relax stale human approval or update revisions', async () => {
+  const stale = await ready()
+  await teamPlanStore.mutateTeamPlan('review', identity(stale), current => ({ ...current, feedback: 'newer human review' }))
+  let launches = 0
+  const service = new TeamPlanService({ validate: async item => item, launch: async () => { launches++; return { memberIds: {} } }, stop: async () => {} })
+  await expect(service.approve('review', identity(stale))).rejects.toThrow('Plan changed; refresh before continuing')
+  await expect(service.update('review', identity(stale), { members: [] })).rejects.toThrow('Plan changed; refresh before continuing')
+  expect(launches).toBe(0)
+})
+
+test.each([false, true])('GET preserves a conflict without its exact advancing revision proof (other error: %s)', async otherError => {
+  const plan = await ready()
+  await approveTeamPlan('review', identity(plan), 'request', plan)
+  const service = new TeamPlanService({ validate: async item => item, launch: async () => { throw new Error('must not replay') }, stop: async () => {} })
+  const mutate = teamPlanStore.mutateTeamPlan
+  const conflict = new teamPlanStore.TeamPlanError(otherError ? 'Other persisted plan conflict' : 'Plan changed; refresh before continuing')
+  const recovery = spyOn(teamPlanStore, 'mutateTeamPlan').mockImplementation(async (name, currentIdentity) => {
+    if (otherError) await mutate(name, currentIdentity, current => ({ ...current, state: 'running', launch: { ...current.launch, status: 'running' } }))
+    throw conflict
+  })
+  try {
+    await expect(service.getForSession('session')).rejects.toBe(conflict)
+    expect(recovery).toHaveBeenCalledTimes(1)
+    expect((await readTeamPlan('review'))?.state).toBe(otherError ? 'running' : 'launching')
+  } finally { recovery.mockRestore() }
 })

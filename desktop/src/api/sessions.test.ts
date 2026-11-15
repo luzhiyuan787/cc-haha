@@ -8,6 +8,22 @@ describe('sessionsApi', () => {
     vi.restoreAllMocks()
   })
 
+  it('queries archived sessions separately and changes archive state without deleting history', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('{}', {
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    await sessionsApi.list({ archived: true, limit: 50 })
+    await sessionsApi.listProjectHistory({ projectRoot: '/workspace/repo', archived: true, limit: 50 })
+    await sessionsApi.setArchived('session-1', true)
+    await sessionsApi.setArchived('session-1', false)
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('http://127.0.0.1:3456/api/sessions?limit=50&archived=true')
+    expect(fetchMock.mock.calls[1]?.[0]).toBe('http://127.0.0.1:3456/api/sessions/project-history?projectRoot=%2Fworkspace%2Frepo&limit=50&archived=true')
+    expect(fetchMock.mock.calls.slice(2).map(([url, init]) => [url, init?.method, init?.body])).toEqual([
+      ['http://127.0.0.1:3456/api/sessions/session-1/archive', 'PATCH', '{"archived":true}'],
+      ['http://127.0.0.1:3456/api/sessions/session-1/archive', 'PATCH', '{"archived":false}'],
+    ])
+  })
+
   it('lists a project history page without excluding sessions older than 30 days', async () => {
     const session = {
       id: 'old-session',
@@ -70,6 +86,25 @@ describe('sessionsApi', () => {
     expect(await sessionsApi.getSummary(summary.id)).toEqual(summary)
     expect(fetchMock).toHaveBeenCalledOnce()
     expect(fetchMock.mock.calls[0]?.[0]).toBe('http://127.0.0.1:3456/api/sessions/historical-session/summary')
+  })
+
+  it('requests only status from the session inspector', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response('{}', {
+      headers: { 'Content-Type': 'application/json' },
+    }))
+
+    await sessionsApi.getInspection('session-1', { statusOnly: true })
+
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('http://127.0.0.1:3456/api/sessions/session-1/inspection?statusOnly=1')
+  })
+
+  it('requests only the context summary without calculating the breakdown', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response('{}', {
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    await sessionsApi.getInspection('session-1', { includeContext: true, contextOnly: true, summaryOnly: true })
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('http://127.0.0.1:3456/api/sessions/session-1/inspection?includeContext=1&contextOnly=1&summaryOnly=1')
   })
 
   it.each([
@@ -186,6 +221,22 @@ describe('sessionsApi', () => {
     }))
     await sessionsApi.getGitInfo('session-1')
     expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('starts a fresh Git request after a directory change and keeps it when the old request settles', async () => {
+    const resolvers: Array<(response: Response) => void> = []
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise<Response>(resolve => resolvers.push(resolve)))
+    const old = sessionsApi.getGitInfo('switching-session')
+    sessionsApi.invalidateGitInfo('switching-session')
+    const fresh = sessionsApi.getGitInfo('switching-session')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    resolvers[0]!(new Response(JSON.stringify({ workDir: '/repo', worktree: null })))
+    await old
+    const concurrent = sessionsApi.getGitInfo('switching-session')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    resolvers[1]!(new Response(JSON.stringify({ workDir: '/repo/worktree', worktree: { enabled: true } })))
+    expect(await fresh).toEqual(await concurrent)
+    expect((await fresh).workDir).toBe('/repo/worktree')
   })
 
   it('fetches a single trace call from the call detail endpoint', async () => {

@@ -1,3 +1,4 @@
+import { ApiError } from '../api/client'
 import { openSideChat } from '@/lib/workspace/openSideChat'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, createEvent, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
@@ -22,7 +23,7 @@ const teamApiMocks = vi.hoisted(() => ({
   getTeam: vi.fn(),
   listTeams: vi.fn(),
   getWorkbenchForSession: vi.fn(
-    (): Promise<TeamWorkbenchSessionTimeline> => Promise.reject(new Error('not a team session')),
+    (_sessionId: string): Promise<TeamWorkbenchSessionTimeline> => Promise.reject(new Error('not a team session')),
   ),
   getWorkbench: vi.fn(),
   sendMemberMessage: vi.fn(),
@@ -132,6 +133,8 @@ import { useSessionStore } from '../stores/sessionStore'
 import { useSettingsStore } from '../stores/settingsStore'
 import { useTabStore } from '../stores/tabStore'
 import { useTeamStore } from '../stores/teamStore'
+import { useTeamPlanStore } from '../stores/teamPlanStore'
+import type { TeamPlanRecord } from '../../../src/shared/teamPlan'
 import { useActivityPanelStore } from '../stores/activityPanelStore'
 import { useSessionDelegationStore } from '../stores/sessionDelegationStore'
 import { sessionCollaborationApi, type SessionDelegationSnapshot } from '../api/sessionCollaboration'
@@ -189,6 +192,155 @@ afterEach(() => {
   useTrajectoryViewStore.setState({ modes: {}, opened: {}, nav: null })
 })
 
+describe('workspace split sizing', () => {
+  function fixture(scale = 1) {
+    const id = 'workspace-resize-regression'
+    useSettingsStore.setState({ locale: 'en' })
+    useTabStore.setState({ activeTabId: id, tabs: [{ sessionId: id, title: 'Main', type: 'session', status: 'idle' }] })
+    useSessionStore.setState({ sessions: [{ id, title: 'Main', messageCount: 1, createdAt: '', modifiedAt: '', projectPath: '/fixture', workDir: '/fixture', workDirExists: true }] })
+    useChatStore.setState({ sessions: { [id]: {
+      ...createDefaultSessionState(), connectionState: 'connected', historyStatus: 'ready', historyHydrated: true,
+      messages: [{ id: 'm', type: 'assistant_text', content: 'fixture', timestamp: 1 }],
+    } } })
+    useWorkspaceStore.getState().openTarget(id, { kind: 'file', path: 'fixture.md' })
+    const view = render(<ActiveSession />)
+    const panel = screen.getByTestId('workbench-panel')
+    const row = screen.getByTestId('active-session-content-row')
+    let rowWidth = 2400
+    // jsdom does not lay out CSS. Supply independent layout and rendered sizes,
+    // including the scale difference produced by CSS zoom (native zoom is 1).
+    const layoutWidth = () => Math.min(useWorkspaceStore.getState().sideWidth, rowWidth * .7, rowWidth - 401)
+    Object.defineProperty(row, 'offsetWidth', { configurable: true, get: () => rowWidth })
+    Object.defineProperty(panel, 'offsetWidth', { configurable: true, get: layoutWidth })
+    vi.spyOn(panel, 'getBoundingClientRect').mockImplementation(() => ({
+      width: layoutWidth() * scale, height: 720, left: 0, right: layoutWidth() * scale,
+      x: 0, y: 0, top: 0, bottom: 720, toJSON: () => ({}),
+    }))
+    act(() => { window.dispatchEvent(new Event('resize')) })
+    const handle = () => screen.getByTestId('workspace-resize-handle')
+    const pointer = (type: 'pointerdown' | 'pointermove', x: number, buttons = 1, pointerId = 1) => {
+      const event = type === 'pointerdown' ? createEvent.pointerDown(handle()) : new Event(type)
+      Object.defineProperties(event, {
+        button: { value: 0 }, buttons: { value: buttons }, clientX: { value: x }, pointerId: { value: pointerId },
+      })
+      act(() => { type === 'pointerdown' ? fireEvent(handle(), event) : window.dispatchEvent(event) })
+    }
+    return { id, view, handle, pointer, resize(width: number) {
+      rowWidth = width
+      act(() => { window.dispatchEvent(new Event('resize')) })
+    } }
+  }
+
+  it.each([.6, .7])('allows the right pane to reach %s of a sufficiently wide split', (fraction) => {
+    const { pointer } = fixture()
+    pointer('pointerdown', 1000)
+    pointer('pointermove', 1000 - (fraction * 2399 - 860))
+    act(() => { window.dispatchEvent(new Event('pointerup')) })
+    expect(useWorkspaceStore.getState().sideWidth).toBeCloseTo(Math.round(fraction * 2399), 0)
+  })
+
+  it('reports the effective bounds and restores the pixel preference after a row shrinks', () => {
+    const { handle, pointer, resize } = fixture()
+    expect(handle()).toHaveAttribute('aria-valuemin', '420')
+    expect(handle()).toHaveAttribute('aria-valuemax', '1680')
+    pointer('pointerdown', 1000)
+    pointer('pointermove', 260)
+    act(() => { window.dispatchEvent(new Event('pointerup')) })
+    expect(useWorkspaceStore.getState().sideWidth).toBe(1600)
+    resize(900)
+    expect(handle()).toHaveAttribute('aria-valuenow', '499')
+    expect(useWorkspaceStore.getState().sideWidth).toBe(1600)
+    resize(2400)
+    expect(handle()).toHaveAttribute('aria-valuenow', '1600')
+  })
+
+  it.each([1, 1.2])('uses layout pixels for pointer and keyboard changes at rendered scale %s', (scale) => {
+    const { handle, pointer } = fixture(scale)
+    act(() => { fireEvent.keyDown(handle(), { key: 'ArrowRight' }) })
+    expect(useWorkspaceStore.getState().sideWidth).toBe(828)
+    pointer('pointerdown', 1000)
+    pointer('pointermove', 1000)
+    expect(useWorkspaceStore.getState().sideWidth).toBe(828)
+    pointer('pointermove', 1000 - 100 * scale)
+    expect(useWorkspaceStore.getState().sideWidth).toBe(928)
+    act(() => { window.dispatchEvent(new Event('pointerup')) })
+  })
+
+  it('ignores a different pointer and clamps movement to the available two-pane range', () => {
+    const { handle, pointer } = fixture()
+    pointer('pointerdown', 1000)
+    pointer('pointermove', 0, 0, 2)
+    expect(useWorkspaceStore.getState().sideWidth).toBe(860)
+    pointer('pointermove', -2000)
+    expect(useWorkspaceStore.getState().sideWidth).toBe(1680)
+    pointer('pointermove', 4000)
+    expect(useWorkspaceStore.getState().sideWidth).toBe(420)
+    act(() => { fireEvent(handle(), new Event('lostpointercapture', { bubbles: true })) })
+    pointer('pointermove', 800)
+    expect(useWorkspaceStore.getState().sideWidth).toBe(420)
+    expect(document.body.style.userSelect).toBe('')
+  })
+
+  it.each(['pointerup', 'pointercancel', 'blur', 'no-buttons', 'unmount'])('ends a drag on %s and restores the original body styles', (end) => {
+    const { view, pointer } = fixture()
+    document.body.style.cursor = 'crosshair'
+    document.body.style.userSelect = 'text'
+    pointer('pointerdown', 1000)
+    pointer('pointermove', 900)
+    expect(useWorkspaceStore.getState().sideWidth).toBe(960)
+    act(() => {
+      if (end === 'unmount') view.unmount()
+      else if (end !== 'no-buttons') window.dispatchEvent(new Event(end))
+    })
+    pointer('pointermove', 700, 0)
+    expect(useWorkspaceStore.getState().sideWidth).toBe(960)
+    expect(document.body.style.cursor).toBe('crosshair')
+    expect(document.body.style.userSelect).toBe('text')
+    document.body.style.cursor = ''
+    document.body.style.userSelect = ''
+  })
+
+  it('keeps the chosen width and chat DOM through full, hidden and reopened layouts', () => {
+    const { id, handle } = fixture()
+    const composer = screen.getByTestId('chat-input')
+    act(() => { useWorkspaceStore.getState().setSideWidth(1500) })
+    act(() => { useWorkspaceStore.getState().toggleFullscreen(id) })
+    expect(screen.queryByTestId('workspace-resize-handle')).not.toBeInTheDocument()
+    expect(screen.getByTestId('chat-input')).toBe(composer)
+    act(() => { useWorkspaceStore.getState().toggleWorkspace(id) })
+    act(() => { useWorkspaceStore.getState().toggleWorkspace(id) })
+    expect(handle()).toBeInTheDocument()
+    expect(useWorkspaceStore.getState().sideWidth).toBe(1500)
+    expect(screen.getByTestId('chat-input')).toBe(composer)
+  })
+
+  it('ends the drag when the retained main session becomes inactive', () => {
+    const { view, pointer } = fixture()
+    pointer('pointerdown', 1000)
+    pointer('pointermove', 900)
+    act(() => { view.rerender(<ActiveSession active={false} />) })
+    pointer('pointermove', 700)
+    expect(useWorkspaceStore.getState().sideWidth).toBe(960)
+    expect(document.body.style.userSelect).toBe('')
+  })
+
+  it('ends the drag when changing to another main session', () => {
+    const { pointer } = fixture()
+    pointer('pointerdown', 1000)
+    pointer('pointermove', 900)
+    act(() => {
+      const id = 'another-workspace-session'
+      useChatStore.setState({ sessions: { ...useChatStore.getState().sessions, [id]: { ...createDefaultSessionState(), connectionState: 'connected', historyStatus: 'ready', historyHydrated: true } } })
+      useSessionStore.setState({ sessions: [...useSessionStore.getState().sessions, { id, title: 'Other', messageCount: 1, createdAt: '', modifiedAt: '', projectPath: '/fixture', workDir: '/fixture', workDirExists: true }] })
+      useWorkspaceStore.getState().openTarget(id, { kind: 'file', path: 'another.md' })
+      useTabStore.setState({ activeTabId: id, tabs: [...useTabStore.getState().tabs, { sessionId: id, title: 'Other', type: 'session', status: 'idle' }] })
+    })
+    pointer('pointermove', 700)
+    expect(useWorkspaceStore.getState().sideWidth).toBe(960)
+    expect(document.body.style.userSelect).toBe('')
+  })
+})
+
 describe('ActiveSession trajectory view', () => {
   function seedSession(id: string) {
     useSettingsStore.setState({ locale: 'en' })
@@ -196,6 +348,44 @@ describe('ActiveSession trajectory view', () => {
     useSessionStore.setState({ sessions: [{ id, title: 'Main', messageCount: 1, createdAt: '', modifiedAt: '', projectPath: '/repo', workDir: '/repo', workDirExists: true }] })
     useChatStore.setState({ sessions: { [id]: { ...createDefaultSessionState(), connectionState: 'connected', historyStatus: 'ready', historyHydrated: true, messages: [{ id: 'm', type: 'assistant_text', content: 'main', timestamp: 1 }] } } })
   }
+
+  it('remembers an absent workbench when returning to an ordinary session and rediscovers on reconnect', async () => {
+    useTeamStore.getState().clearTeam()
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ plan: null })))
+    teamApiMocks.getWorkbenchForSession.mockImplementation(async (sessionId: string) => {
+      throw new ApiError(404, {
+        error: 'NOT_FOUND',
+        message: `No Agent Teams workbench for session: ${sessionId}`,
+      })
+    })
+    const connect = vi.spyOn(useChatStore.getState(), 'connectToSession').mockImplementation(() => {})
+    try {
+      seedSession('ordinary-a')
+      const view = render(<ActiveSession sessionId="ordinary-a" />)
+      await act(async () => {})
+      await act(async () => {
+        seedSession('ordinary-b')
+        view.rerender(<ActiveSession sessionId="ordinary-b" />)
+      })
+      await act(async () => {
+        seedSession('ordinary-a')
+        view.rerender(<ActiveSession sessionId="ordinary-a" />)
+      })
+      expect(teamApiMocks.getWorkbenchForSession.mock.calls).toEqual([
+        ['ordinary-a'], ['ordinary-b'],
+      ])
+      await act(async () => {
+        useChatStore.getState().handleServerMessage('ordinary-a', { type: 'connected', sessionId: 'ordinary-a' })
+      })
+      expect(teamApiMocks.getWorkbenchForSession.mock.calls).toEqual([
+        ['ordinary-a'], ['ordinary-b'], ['ordinary-a'],
+      ])
+      expect(screen.getByRole('heading', { name: 'Main' })).toBeInTheDocument()
+    } finally {
+      connect.mockRestore()
+      useTeamStore.getState().clearTeam()
+    }
+  })
 
   it('retains the known tab title when summary metadata is unavailable', async () => {
     const id = 'history-with-unavailable-summary'
@@ -845,6 +1035,57 @@ describe('ActiveSession task polling', () => {
     expect(screen.getByRole('heading', { name: 'Regular Header Session' })).toBeInTheDocument()
   })
 
+  it('switches only the notified session workspace and refreshes Git without another chat message', async () => {
+    const source = '/workspace/project'
+    const worktreePath = `${source}/.claude/worktrees/entered`
+    let liveCwd = source
+    const oldInfo = { branch: 'main', repoName: 'project', workDir: source, changedFiles: 0, worktree: null }
+    let resolveOld!: (info: typeof oldInfo) => void
+    const oldRequest = new Promise<typeof oldInfo>(resolve => { resolveOld = resolve })
+    let switching = false
+    sessionApiMocks.getGitInfo.mockImplementation(async (id: string) => !switching && id === 'entered' ? oldRequest : ({
+      branch: id === 'entered' && liveCwd === worktreePath ? 'worktree-entered' : 'main',
+      repoName: 'project', workDir: id === 'entered' ? liveCwd : '/workspace/other', changedFiles: 0,
+      worktree: id === 'entered' && liveCwd === worktreePath
+        ? { enabled: true, path: worktreePath, plannedPath: worktreePath, sourceWorkDir: source, slug: 'entered', branch: 'worktree-entered' }
+        : null,
+    }))
+    useSessionStore.setState({ sessions: ['entered', 'other'].map(id => ({
+      id, title: id, createdAt: '2026-08-07T00:00:00.000Z', modifiedAt: '2026-08-07T00:00:00.000Z',
+      messageCount: 1, projectPath: source, projectRoot: id === 'entered' ? source : '/workspace/other',
+      workDir: id === 'entered' ? source : '/workspace/other', workDirExists: true,
+    })), activeSessionId: 'entered', isLoading: false, error: null })
+    useTabStore.setState({ tabs: ['entered', 'other'].map(sessionId => ({ sessionId, title: sessionId, type: 'session' as const, status: 'idle' as const })), activeTabId: 'entered' })
+    useChatStore.setState({ sessions: Object.fromEntries(['entered', 'other'].map(id => [id, {
+      ...createDefaultSessionState(), connectionState: 'connected' as const,
+      messages: [{ id: `${id}-ready`, type: 'assistant_text' as const, content: 'ready', timestamp: 1 }],
+    }])) })
+    render(<ActiveSession />)
+    await waitFor(() => expect(sessionApiMocks.getGitInfo).toHaveBeenCalledWith('entered'))
+    expect(screen.queryByTestId('session-worktree-indicator')).not.toBeInTheDocument()
+
+    liveCwd = worktreePath
+    switching = true
+    act(() => useChatStore.getState().handleServerMessage('entered', { type: 'system_notification', subtype: 'init', data: { cwd: worktreePath } }))
+    await waitFor(() => expect(useSessionStore.getState().sessions.find(row => row.id === 'entered')?.workDir).toBe(worktreePath))
+    expect(await screen.findByTestId('session-worktree-indicator')).toHaveTextContent('entered')
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); resolveOld(oldInfo); await oldRequest })
+    expect(screen.getByTestId('session-worktree-indicator')).toHaveTextContent('entered')
+    expect(useSessionStore.getState().sessions.find(row => row.id === 'entered')?.projectRoot).toBe(source)
+    expect(useSessionStore.getState().sessions.find(row => row.id === 'other')?.workDir).toBe('/workspace/other')
+    expect(useChatStore.getState().sessions.entered?.messages).toHaveLength(1)
+
+    act(() => useTabStore.getState().setActiveTab('other'))
+    await waitFor(() => expect(screen.queryByTestId('session-worktree-indicator')).not.toBeInTheDocument())
+    act(() => useTabStore.getState().setActiveTab('entered'))
+    expect(await screen.findByTestId('session-worktree-indicator')).toHaveTextContent('entered')
+
+    liveCwd = source
+    act(() => useChatStore.getState().handleServerMessage('entered', { type: 'system_notification', subtype: 'init', data: { cwd: source } }))
+    await waitFor(() => expect(screen.queryByTestId('session-worktree-indicator')).not.toBeInTheDocument())
+    expect(useSessionStore.getState().sessions.find(row => row.id === 'entered')?.workDir).toBe(source)
+  })
+
   it('shows a loading state for historical sessions while messages are loading', () => {
     const sessionId = 'history-visible-loading-session'
 
@@ -1353,7 +1594,7 @@ describe('ActiveSession task polling', () => {
     act(() => useActivityPanelStore.getState().close())
   })
 
-  it('auto-opens for current activity and seals unfinished tasks when the turn becomes idle', async () => {
+  it('keeps new activity collapsed until opened and seals unfinished tasks when the turn becomes idle', async () => {
     const sessionId = 'activity-auto-open-session'
     const fetchSessionTasks = vi.fn().mockResolvedValue(undefined)
 
@@ -1423,9 +1664,11 @@ describe('ActiveSession task polling', () => {
       })
     })
 
-    await waitFor(() => {
-      expect(useActivityPanelStore.getState().isOpen(sessionId)).toBe(true)
-    })
+    // #1639: the activity badge may update without reopening the conversation overlay.
+    expect(useActivityPanelStore.getState().isOpen(sessionId)).toBe(false)
+    expect(screen.queryByTestId('session-activity-panel')).not.toBeInTheDocument()
+
+    act(() => useActivityPanelStore.getState().open(sessionId))
     expect(screen.getByTestId('session-activity-panel')).toHaveAttribute('data-placement', 'rail')
     expect(screen.getByText('Draft implementation plan')).toBeInTheDocument()
     expect(within(screen.getByTestId('session-activity-panel')).getByLabelText('Task in progress')).toBeInTheDocument()
@@ -1445,6 +1688,22 @@ describe('ActiveSession task polling', () => {
     expect(within(screen.getByTestId('session-activity-panel')).getByLabelText('Stopped')).toBeInTheDocument()
     expect(within(screen.getByTestId('session-activity-panel')).queryByLabelText('Task in progress')).not.toBeInTheDocument()
     expect(screen.queryByText(/session active|会话活跃中/)).not.toBeInTheDocument()
+
+    act(() => {
+      useActivityPanelStore.getState().close(sessionId)
+      useCLITaskStore.setState({ tasks: [] })
+    })
+    act(() => {
+      useChatStore.setState((state) => ({
+        sessions: { ...state.sessions, [sessionId]: { ...state.sessions[sessionId]!, chatState: 'thinking' } },
+      }))
+      useCLITaskStore.setState({ tasks: [{
+        id: 'task-2', subject: 'Next turn task', description: '', status: 'in_progress',
+        blocks: [], blockedBy: [], taskListId: sessionId,
+      }] })
+    })
+    expect(useActivityPanelStore.getState().isOpen(sessionId)).toBe(false)
+    expect(screen.queryByTestId('session-activity-panel')).not.toBeInTheDocument()
   })
 
   it('renders completed historical TodoWrite activity in the rail', () => {
@@ -1876,6 +2135,61 @@ describe('ActiveSession task polling', () => {
     expect(useTeamStore.getState().workbenchesBySession[sessionId]?.snapshots).toHaveLength(1)
   })
 
+  it('shows an interrupted team as interrupted in the header strip, though its tasks read as running', () => {
+    const sessionId = 'team-interrupted-strip-session'
+    useTeamStore.setState({
+      workbenchesBySession: {
+        [sessionId]: {
+          teamName: 'cut-team', loading: false, error: null,
+          snapshots: [{
+            version: 'v1', generatedAt: '2026-10-27T00:00:00.000Z',
+            team: {
+              name: 'cut-team', leadAgentId: 'team-lead@cut-team', leadSessionId: sessionId,
+              members: [
+                { agentId: 'team-lead@cut-team', role: 'team-lead', status: 'idle' },
+                { agentId: 'lister@cut-team', name: 'lister', role: 'lister', status: 'idle' },
+              ],
+            },
+            tasks: [{ id: '1', subject: 'List files', description: '', status: 'pending', owner: 'lister', blocks: [], blockedBy: [], taskListId: 'cut-team' }],
+            messages: [],
+          }],
+        },
+      },
+    })
+    useSessionStore.setState({
+      sessions: [{ id: sessionId, title: 'Interrupted Team Session', createdAt: '2026-10-27T00:00:00.000Z', modifiedAt: '2026-10-27T00:00:00.000Z', messageCount: 1, projectPath: '/workspace/project', workDir: '/workspace/project', workDirExists: true }],
+      activeSessionId: sessionId, isLoading: false, error: null,
+    })
+    useTabStore.setState({ tabs: [{ sessionId, title: 'Interrupted Team Session', type: 'session', status: 'idle' }], activeTabId: sessionId })
+    useChatStore.setState({
+      sessions: {
+        [sessionId]: {
+          messages: [{ id: 'msg-1', type: 'assistant_text', content: 'hello', timestamp: 1 }],
+          chatState: 'idle', connectionState: 'connected', streamingText: '', streamingToolInput: '',
+          activeToolUseId: null, activeToolName: null, activeThinkingId: null, pendingPermission: null, pendingComputerUsePermission: null,
+          tokenUsage: { input_tokens: 0, output_tokens: 0 }, streamingResponseChars: 0, elapsedSeconds: 0, statusVerb: '',
+          slashCommands: [], backgroundAgentTasks: {}, agentTaskNotifications: {}, elapsedTimer: null,
+        },
+      },
+    })
+    try {
+      render(<ActiveSession />)
+      expect(screen.getByTestId('agent-teams-strip')).toHaveTextContent('Parallel execution')
+
+      act(() => {
+        useTeamPlanStore.setState({ bySession: { [sessionId]: {
+          plan: { teamName: 'cut-team', state: 'interrupted' } as TeamPlanRecord,
+          loading: false, busy: false, error: null, conflict: false,
+        } } })
+      })
+      const strip = screen.getByTestId('agent-teams-strip')
+      expect(strip).toHaveTextContent('Interrupted')
+      expect(strip).not.toHaveTextContent('Parallel execution')
+    } finally {
+      useTeamPlanStore.setState({ bySession: {} })
+    }
+  })
+
   it('updates the Team workbench without leaking its DAG, roster, or transcript spawns into main Activity', async () => {
     const sessionId = 'team-activity-runtime-state-session'
     const teamName = 'runtime-state-team'
@@ -2096,7 +2410,8 @@ describe('ActiveSession task polling', () => {
     })
 
     // Filtering is ownership-based, not a blanket Activity shutdown: a
-    // direct SubAgent spawned by the main session still opens the shared UI.
+    // direct SubAgent spawned by the main session still appears when Activity is opened.
+    act(() => useActivityPanelStore.getState().open(sessionId))
     const panel = await screen.findByTestId('session-activity-panel')
     expect(within(panel).getByText('Inspect a main-session seam')).toBeInTheDocument()
   })
@@ -3103,6 +3418,8 @@ describe('ActiveSession activity panel auto-close grace', () => {
 
     act(() => {
       patchSession({ backgroundAgentTasks: {}, messages: [], historyStatus: 'ready' })
+    })
+    act(() => {
       vi.advanceTimersByTime(1000)
     })
     act(() => {
@@ -3118,6 +3435,8 @@ describe('ActiveSession activity panel auto-close grace', () => {
           },
         },
       })
+    })
+    act(() => {
       vi.advanceTimersByTime(5000)
     })
 

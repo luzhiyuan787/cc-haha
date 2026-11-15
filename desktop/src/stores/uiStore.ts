@@ -136,10 +136,11 @@ export function applyTheme(
   theme: ThemeMode,
   followSystem = readStoredFollowSystemTheme(),
   lightTheme = readStoredLightTheme(),
+  darkTheme = readStoredDarkTheme(),
 ) {
   if (typeof document === 'undefined') return
   paintDocumentTheme(theme)
-  notifyHostAppearance(theme, followSystem, lightTheme)
+  notifyHostAppearance(theme, followSystem, lightTheme, darkTheme)
 }
 
 /**
@@ -147,15 +148,16 @@ export function applyTheme(
  * window background matches it on the next launch. Best effort: the browser
  * host and the Tauri shell have no such channel and simply no-op.
  *
- * `lightBackground` travels along because a cache written at night would
- * otherwise have no way to know which light theme to repaint in the morning.
+ * Both ground preferences travel along so a cache written in one appearance
+ * can paint the other correctly on the next launch or native OS update.
  */
-function notifyHostAppearance(theme: ThemeMode, followSystem: boolean, lightTheme: LightThemeMode) {
+function notifyHostAppearance(theme: ThemeMode, followSystem: boolean, lightTheme: LightThemeMode, darkTheme: DarkThemeMode) {
   void import('../lib/desktopHost')
     .then(({ desktopHost }) => desktopHost.appearance.setApplied({
       isDark: isDarkTheme(theme),
       background: THEME_BACKGROUNDS[theme],
       lightBackground: THEME_BACKGROUNDS[lightTheme],
+      darkBackground: THEME_BACKGROUNDS[darkTheme],
       followSystem,
     }))
     .catch(() => { /* host channel unavailable */ })
@@ -166,7 +168,7 @@ let stopStorageSync: (() => void) | null = null
 
 export function initializeTheme() {
   const state = useUIStore.getState()
-  applyTheme(state.theme, state.followSystemTheme, state.lightTheme)
+  applyTheme(state.theme, state.followSystemTheme, state.lightTheme, state.darkTheme)
   // Pin down the inferred default so it survives the next launch.
   persistThemeState({
     theme: state.theme,
@@ -194,7 +196,7 @@ export function initializeTheme() {
       systemAppearance: appearance,
     })
     if (next === current.theme) return
-    applyTheme(next, true, lightTheme)
+    applyTheme(next, true, lightTheme, darkTheme)
     persistThemeState({ theme: next, lightTheme, darkTheme, followSystem: true })
     useUIStore.setState({ theme: next, lightTheme, darkTheme, followSystemTheme: true })
   })
@@ -231,6 +233,8 @@ export type Toast = {
   type: 'success' | 'error' | 'warning' | 'info'
   message: string
   duration?: number
+  /** One follow-up, such as undo. Running it also dismisses the toast. */
+  action?: { label: string; onClick: () => void }
 }
 
 export type MarketTarget = {
@@ -272,6 +276,18 @@ export type NewSessionDraft = {
   hasContent: boolean
 }
 
+/** A workspace action the draft composer should perform after it assigns a session. */
+export type DraftWorkspaceAction = 'toggle-side' | 'toggle-bottom' | 'toggle-fullscreen'
+
+export type DraftWorkspaceRequest = {
+  action: DraftWorkspaceAction
+  /** Only the draft revision that asked for it may consume the request. */
+  revision: number
+  nonce: number
+  originatingTabId: string | null
+  originatingView: ActiveView
+}
+
 type UIStore = {
   /** The theme currently on `<html>` — resolved, not necessarily the manual pick. */
   theme: ThemeMode
@@ -297,6 +313,8 @@ type UIStore = {
   newSessionRequest: number
   /** Ephemeral composer seed. No server session exists until the first send. */
   newSessionDraft: NewSessionDraft | null
+  /** Set when a workspace control is used before the draft owns a session. */
+  draftWorkspaceRequest: DraftWorkspaceRequest | null
   activeModal: string | null
   toasts: Toast[]
 
@@ -319,6 +337,8 @@ type UIStore = {
   startNewSessionDraft: (workDir?: string) => void
   /** The composer of draft `revision` reports whether it holds unsent content. */
   setNewSessionDraftContent: (revision: number, hasContent: boolean) => void
+  requestDraftWorkspace: (action: DraftWorkspaceAction, originatingTabId?: string | null, originatingView?: ActiveView) => void
+  clearDraftWorkspaceRequest: (nonce: number) => void
   openModal: (id: string) => void
   closeModal: () => void
   addToast: (toast: Omit<Toast, 'id'>) => void
@@ -327,6 +347,7 @@ type UIStore = {
 
 let toastCounter = 0
 let newSessionDraftRevision = 0
+let draftWorkspaceRequestNonce = 0
 
 export const useUIStore = create<UIStore>((set) => ({
   theme: getInitialAppliedTheme(),
@@ -342,6 +363,7 @@ export const useUIStore = create<UIStore>((set) => ({
   pendingMarketTarget: null,
   newSessionRequest: 0,
   newSessionDraft: null,
+  draftWorkspaceRequest: null,
   activeModal: null,
   toasts: [],
 
@@ -359,7 +381,7 @@ export const useUIStore = create<UIStore>((set) => ({
         darkTheme,
         systemAppearance: getSystemAppearance(),
       })
-      applyTheme(applied, state.followSystemTheme, lightTheme)
+      applyTheme(applied, state.followSystemTheme, lightTheme, darkTheme)
       persistThemeState({ theme: applied, lightTheme, darkTheme, followSystem: state.followSystemTheme })
       return { theme: applied, lightTheme, darkTheme }
     })
@@ -376,7 +398,7 @@ export const useUIStore = create<UIStore>((set) => ({
         darkTheme: state.darkTheme,
         systemAppearance: getSystemAppearance(),
       })
-      applyTheme(applied, follow, state.lightTheme)
+      applyTheme(applied, follow, state.lightTheme, state.darkTheme)
       persistThemeState({
         theme: applied,
         lightTheme: state.lightTheme,
@@ -395,7 +417,7 @@ export const useUIStore = create<UIStore>((set) => ({
       const next = THEME_MODES[(currentIndex + 1) % THEME_MODES.length] ?? 'white'
       const lightTheme = isLightThemeMode(next) ? next : state.lightTheme
       const darkTheme = isDarkThemeMode(next) ? next : state.darkTheme
-      applyTheme(next, false, lightTheme)
+      applyTheme(next, false, lightTheme, darkTheme)
       persistThemeState({ theme: next, lightTheme, darkTheme, followSystem: false })
       return { theme: next, lightTheme, darkTheme, followSystemTheme: false }
     })
@@ -422,6 +444,7 @@ export const useUIStore = create<UIStore>((set) => ({
       return {
         activeView: 'code',
         newSessionDraft: { workDir: workDir ?? '', revision: ++newSessionDraftRevision, hasContent: false },
+        draftWorkspaceRequest: null,
       }
     }
     // New-chat navigation returns to the retained composer and never replaces
@@ -436,6 +459,19 @@ export const useUIStore = create<UIStore>((set) => ({
       ? { newSessionDraft: { ...state.newSessionDraft, hasContent } }
       : state
   )),
+  requestDraftWorkspace: (action, originatingTabId = null, originatingView = 'code') => set(state => state.newSessionDraft
+    ? {
+        draftWorkspaceRequest: {
+          action,
+          revision: state.newSessionDraft.revision,
+          nonce: ++draftWorkspaceRequestNonce,
+          originatingTabId,
+          originatingView,
+        },
+      }
+    : state),
+  clearDraftWorkspaceRequest: (nonce) => set(state =>
+    state.draftWorkspaceRequest?.nonce === nonce ? { draftWorkspaceRequest: null } : state),
   requestNewSession: () => set((state) => ({ newSessionRequest: state.newSessionRequest + 1 })),
   openModal: (id) => set({ activeModal: id }),
   closeModal: () => set({ activeModal: null }),

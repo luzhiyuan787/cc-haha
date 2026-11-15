@@ -1,5 +1,8 @@
+import { sanitizeRetryDiagnosticText } from '../../services/api/errorUtils.js'
 import { closeSideChatsForParent, getSideChat, isSideChatId, SIDE_CHAT_BOUNDARY } from './sideChatRegistry.js'
 import { migrationMaintenance, waitForMigrationExit } from '../migrationMaintenance.js'
+import { powerActivityClock } from './powerActivityClock.js'
+import { SDKPromptSuggestionActivityMessageSchema } from '../../entrypoints/sdk/coreSchemas.js'
 /**
  * ConversationService — CLI subprocess manager
  *
@@ -20,6 +23,7 @@ import {
   isOpenAIOfficialProviderId,
 } from './openaiOfficialProvider.js'
 import {
+  GROK_MODEL_CATALOG_ENV_KEY,
   GROK_OAUTH_FILE_ENV_KEY,
   GROK_OAUTH_PROVIDER_ENV_KEY,
 } from './grokOfficialProvider.js'
@@ -71,8 +75,8 @@ import {
   resolveStreamToolInputDurationMs,
   SYSTEM_PROXY_URL_ENV,
   type NetworkSettings,
-} from './networkSettings.js'
-import { readTraceCaptureSettings } from './traceCaptureService.js'
+  resolveProviderNetworkSettings,} from './networkSettings.js'
+import { readTraceCaptureSettings, traceCaptureService } from './traceCaptureService.js'
 import {
   killWindowsProcessTree,
   type WindowsTaskkillSpawn,
@@ -180,6 +184,12 @@ type SendMessageOptions = {
   canSend?: () => boolean
   messageUuid?: string
   onCommitted?: () => void
+  /**
+   * Server-generated input the user did not type (team runtime notices). The
+   * CLI then does not treat the turn as user-started, so it skips per-turn
+   * extras such as next-prompt suggestions.
+   */
+  synthetic?: boolean
 }
 
 type HandleSdkPayloadOptions = {
@@ -206,6 +216,7 @@ type TrackedPermissionRequest = {
   autoAnswerAbortController?: AbortController
   autoAnswerCancelled?: boolean
   autoAnswerCreatedAt?: number
+  autoAnswerDeadline?: number | null
   autoAnswerGeneration?: number
 }
 
@@ -278,6 +289,8 @@ function networkRoutingFingerprint(
 }
 
 type SessionProcess = {
+  /** A terminating process cannot accept a late permission or user turn. */
+  controlRevoked?: boolean
   runtimeSelection?: SessionRuntimeSelection
   proc: ReturnType<typeof Bun.spawn>
   outputCallbacks: SessionOutputCallback[]
@@ -286,6 +299,7 @@ type SessionProcess = {
   teamWorker?: TeamWorkerStart
   providerId?: string | null
   providerConfigFingerprint?: string
+  providerAuth?: { baseUrl: string; apiKey: string; authToken: string }
   networkRoutingFingerprint: string
   networkDerivedFirstTokenTimeout: boolean
   networkDerivedStreamMaxDuration: boolean
@@ -314,6 +328,10 @@ type SessionProcess = {
   pendingPermissionRequests: Map<string, TrackedPermissionRequest>
   autoResolvedRequestIds?: Set<string>
   pendingControlRequests: Map<string, (reason: Error) => void>
+  /** Last value sent with `set_prompt_suggestions`; the CLI starts disabled. */
+  promptSuggestionsEnabled?: boolean
+  promptSuggestionGenerations?: Set<string>
+  promptSuggestionExited?: boolean
 }
 
 export type PendingPermissionRequest = {
@@ -324,6 +342,7 @@ export type PendingPermissionRequest = {
   input: Record<string, unknown>
   description?: string
   displayName?: string
+  autoAnswerDeadline?: number | null
 }
 
 export type TeamWorkerStart = {
@@ -392,12 +411,17 @@ export type ConversationServiceProcessDeps = {
 }
 
 export class ConversationService {
+  private sessionStopPromises = new Map<string, Promise<void>>()
   private sessions = new Map<string, SessionProcess>()
   private teamStopOperations = new Map<string, Promise<void>>()
   private teamRuntimeListeners = new Set<TeamRuntimeListener>()
   private deletedSessions = new Set<string>()
   private providerService = new ProviderService()
   private pendingPermissionModeChanges = new Map<string, Map<string, number>>()
+  private promptSuggestionClientSessions = new Set<string>()
+  private promptSuggestionsSettingEnabled = false
+  // Retired runtimes keep ownership until their actual process exits.
+  private promptSuggestionWorkOwners = new Set<SessionProcess>()
   private readonly processDeps: ConversationServiceProcessDeps
 
   constructor(processDeps: ConversationServiceProcessDeps = {}) {
@@ -416,14 +440,37 @@ export class ConversationService {
   }
 
   cancelAutoQuestionAnswer(sessionId: string, requestId: string): void {
-    const request = this.sessions.get(sessionId)?.pendingPermissionRequests.get(requestId)
-    if (request?.toolName !== 'AskUserQuestion') return
+    // A team member's question reaches the desktop through its lead's session,
+    // so the user's activity arrives there too; it belongs to the member.
+    const child = [...this.sessions.entries()].find(([, entry]) => entry.teamWorker?.parentSessionId === sessionId && entry.pendingPermissionRequests.has(requestId))
+    if (child) return this.cancelAutoQuestionAnswer(child[0], requestId)
+    const session = this.sessions.get(sessionId)
+    const request = session?.pendingPermissionRequests.get(requestId)
+    if (request?.toolName !== 'AskUserQuestion' || request.autoAnswerCancelled) return
     this.clearAutoAnswerWait(request)
     request.autoAnswerTimer = undefined
     request.autoAnswerAbortController = undefined
     console.info(`[ConversationService] Automatic answer cancelled by user activity: session=${sessionId} request=${requestId}`)
     request.autoAnswerCancelled = true
     request.autoAnswerGeneration = (request.autoAnswerGeneration ?? 0) + 1
+    request.autoAnswerDeadline = null
+    if (session) this.publishAutoQuestionDeadline(sessionId, session, requestId, request)
+  }
+
+  private publishAutoQuestionDeadline(sessionId: string, session: SessionProcess, requestId: string, request: TrackedPermissionRequest): void {
+    const message = {
+      type: 'control_request', request_id: requestId,
+      request: {
+        subtype: 'can_use_tool', tool_name: request.toolName, tool_use_id: request.toolUseId,
+        input: request.input, description: request.description, display_name: request.displayName,
+        auto_answer_deadline: request.autoAnswerDeadline ?? null,
+      },
+    }
+    this.notifyOutputCallbacks(sessionId, session.outputCallbacks, message)
+    if (session.teamWorker) {
+      const parent = this.sessions.get(session.teamWorker.parentSessionId)
+      if (parent) this.notifyOutputCallbacks(session.teamWorker.parentSessionId, parent.outputCallbacks, message)
+    }
   }
 
   /** Apply setting changes to questions that are already waiting. */
@@ -452,12 +499,16 @@ export class ConversationService {
       const settings = normalizeAutoQuestionSettings(
         (await new SettingsService().getUserSettings()).autoQuestion,
       )
-      if (!settings.enabled || request.autoAnswerCancelled ||
+      if (request.autoAnswerCancelled ||
         (request.autoAnswerGeneration ?? 0) !== generation || this.sessions.get(sessionId) !== session ||
         session.pendingPermissionRequests.get(requestId) !== request) return
-
-      const remainingMs = Math.max(0, (request.autoAnswerCreatedAt ?? Date.now()) +
-        settings.timeoutMinutes * 60_000 - Date.now())
+      request.autoAnswerCreatedAt ??= Date.now()
+      request.autoAnswerDeadline = settings.enabled
+        ? request.autoAnswerCreatedAt + settings.timeoutMinutes * 60_000
+        : null
+      this.publishAutoQuestionDeadline(sessionId, session, requestId, request)
+      if (request.autoAnswerDeadline === null) return
+      const remainingMs = Math.max(0, request.autoAnswerDeadline - Date.now())
       console.info(`[ConversationService] Automatic answer scheduled: session=${sessionId} request=${requestId} remainingMs=${remainingMs}`)
       request.autoAnswerTimer = setTimeout(() => {
         request.autoAnswerTimer = undefined
@@ -580,6 +631,7 @@ export class ConversationService {
     options?: SessionStartOptions,
     repository?: PreparedSessionWorkspace['repository'],
     agentProfile: 'standard' | 'lean' = 'standard',
+    additionalDirectories: readonly string[] = [],
   ): string[] {
     const side = getSideChat(sessionId)
     const dangerousMode = process.env.CLAUDE_DANGEROUS_MODE === '1'
@@ -613,7 +665,9 @@ export class ConversationService {
         '--agent-name', options.teamWorker.name,
         '--team-name', options.teamWorker.teamName,
         '--parent-session-id', options.teamWorker.parentSessionId,
-        '--agents', JSON.stringify({ [options.teamWorker.name]: { ...options.teamWorker.agentDefinition, description: 'Approved team member', prompt: options.teamWorker.systemPrompt, model: options?.model, tools: options.teamWorker.tools } }),
+        // The member process already runs on its approved provider; a preset's
+        // pinned provider must not reroute the member's own model again.
+        '--agents', JSON.stringify({ [options.teamWorker.name]: { ...options.teamWorker.agentDefinition, description: 'Approved team member', prompt: options.teamWorker.systemPrompt, model: options?.model, provider: undefined, tools: options.teamWorker.tools } }),
         '--agent', options.teamWorker.name,
         ...(Array.isArray(options.teamWorker.agentDefinition?.disallowedTools) && options.teamWorker.agentDefinition.disallowedTools.length
           ? ['--disallowedTools', options.teamWorker.agentDefinition.disallowedTools.join(',')]
@@ -626,6 +680,7 @@ export class ConversationService {
           : []),
       ] : []),
       ...worktreeArgs,
+      ...additionalDirectories.flatMap(directory => ['--add-dir', directory]),
       '--replay-user-messages',
       ...this.getRuntimeArgs(options),
       ...this.getPermissionArgs(options?.permissionMode, dangerousMode),
@@ -646,6 +701,8 @@ export class ConversationService {
       )
     }
     if (this.sessions.has(sessionId)) return
+    // Re-read so an edit made outside the settings API applies to new CLIs.
+    this.promptSuggestionsSettingEnabled = await new SettingsService().getNextPromptSuggestionsEnabled()
 
     const side = getSideChat(sessionId)
     if (isSideChatId(sessionId) && (!side || side.closed || side.started)) {
@@ -655,6 +712,9 @@ export class ConversationService {
       throw new ConversationStartupError('Agent teams are unavailable in lean sessions', 'LEAN_CAPABILITY_UNAVAILABLE')
     }
     const launchInfo = options?.teamWorker ? null : await sessionService.getSessionLaunchInfo(sessionId)
+    const additionalDirectories = (options?.teamWorker
+      ? (await sessionService.getSessionLaunchInfo(options.teamWorker.parentSessionId))?.additionalDirectories
+      : launchInfo?.additionalDirectories) ?? []
     if (launchInfo?.agentProfile === 'lean' && (options?.permissionMode ?? launchInfo.permissionMode) === 'plan') {
       throw new ConversationStartupError('Plan mode is unavailable in lean sessions. Choose another permission mode before continuing.', 'LEAN_CAPABILITY_UNAVAILABLE')
     }
@@ -737,6 +797,13 @@ export class ConversationService {
       )
     }
 
+    // `--resume` finds the conversation only from the folder that holds it.
+    // After EnterWorktree that is not where the CLI works; the resumed CLI
+    // re-enters the worktree itself from the transcript's worktree state.
+    const cliCwd = shouldResume && !side && !options?.teamWorker
+      ? await sessionService.resolveResumeLaunchDir(sessionId, launchWorkDir)
+      : launchWorkDir
+
     const args = this.buildSessionCliArgs(
       sessionId,
       sdkUrl,
@@ -744,10 +811,11 @@ export class ConversationService {
       options,
       launchRepository,
       launchInfo?.agentProfile ?? 'standard',
+      additionalDirectories,
     )
 
     console.log(
-      `[ConversationService] Starting CLI for ${sessionId}, cwd: ${launchWorkDir} (process.cwd()=${process.cwd()}, CALLER_DIR will be pinned to workDir)`,
+      `[ConversationService] Starting CLI for ${sessionId}, cwd: ${cliCwd} (process.cwd()=${process.cwd()}, CALLER_DIR will be pinned to workDir)`,
     )
 
     // IMPORTANT (Bug#5): 必须覆盖子进程继承的 CALLER_DIR / PWD。
@@ -768,7 +836,7 @@ export class ConversationService {
     }
     const providerCapture: { fingerprint?: string } = {}
     const childEnv = await this.buildChildEnv(
-      launchWorkDir,
+      cliCwd,
       sdkUrl,
       options,
       networkSettings,
@@ -816,7 +884,7 @@ export class ConversationService {
       this.stopSession(sessionId, { keepTeamWorkers: true })
     }
     try {
-      proc = Bun.spawn(args, buildConversationCliSpawnOptions(launchWorkDir, childEnv))
+      proc = Bun.spawn(args, buildConversationCliSpawnOptions(cliCwd, childEnv))
       if (side) side.started = true
     } catch (spawnErr) {
       void diagnosticsService.recordEvent({
@@ -833,7 +901,7 @@ export class ConversationService {
         },
       })
       throw new ConversationStartupError(
-        `Failed to spawn CLI in ${launchWorkDir}: ${
+        `Failed to spawn CLI in ${cliCwd}: ${
           spawnErr instanceof Error ? spawnErr.message : String(spawnErr)
         }`,
         'CLI_SPAWN_FAILED',
@@ -857,6 +925,13 @@ export class ConversationService {
         ...(options.openAIFastMode !== undefined ? { openAIFastMode: options.openAIFastMode } : {}),
       } : undefined,
       providerConfigFingerprint: providerCapture.fingerprint,
+      ...(typeof options?.providerId === 'string' && {
+        providerAuth: {
+          baseUrl: childEnv.ANTHROPIC_BASE_URL ?? '',
+          apiKey: childEnv.ANTHROPIC_API_KEY ?? '',
+          authToken: childEnv.ANTHROPIC_AUTH_TOKEN ?? '',
+        },
+      }),
       networkRoutingFingerprint: networkRoutingFingerprint(networkSettings, childEnv),
       networkDerivedFirstTokenTimeout: networkRuntimeMetadata.firstTokenTimeoutDerived,
       networkDerivedStreamMaxDuration: networkRuntimeMetadata.streamMaxDurationDerived,
@@ -882,6 +957,7 @@ export class ConversationService {
       pendingControlRequests: new Map(),
     }
     this.sessions.set(sessionId, session)
+    this.syncPromptSuggestions(sessionId)
 
     session.outputDrain = Promise.all([
       this.readProcessOutputStream(sessionId, proc.stdout, 'stdout'),
@@ -962,6 +1038,7 @@ export class ConversationService {
       const metadataWorkDir = this.getSessionWorkDir(sessionId) || launchWorkDir
       await sessionService.appendSessionMetadata(sessionId, {
         workDir: metadataWorkDir,
+        additionalDirectories,
         customTitle: launchInfo?.customTitle ?? null,
         repository: launchRepository,
         permissionMode: options?.permissionMode || launchInfo?.permissionMode,
@@ -971,6 +1048,14 @@ export class ConversationService {
         ...(options?.model ? { runtimeModelId: options.model } : {}),
         ...(options?.effort ? { effortLevel: options.effort } : {}),
       })
+      // Startup resumes once the SDK socket attaches, usually before init, so
+      // init can move the session while this write is in flight. If it lands
+      // after init's own write, restore init's cwd and drop the placeholder.
+      const initWorkDir = this.getSessionWorkDir(sessionId)
+      if (initWorkDir && initWorkDir !== metadataWorkDir) {
+        await sessionService.appendSessionMetadata(sessionId, { workDir: initWorkDir })
+        await sessionService.deletePlaceholderSessionFiles(sessionId, initWorkDir)
+      }
     }
 
     console.log(`[ConversationService] CLI started successfully for ${sessionId}`)
@@ -1029,10 +1114,14 @@ export class ConversationService {
       return false
     }
     session = this.sessions.get(sessionId)
+    if (session && !await this.refreshProviderCredentialsBeforeTurn(sessionId, session)) {
+      return false
+    }
+    session = this.sessions.get(sessionId)
     if (session) {
       await this.refreshOfficialOAuthTokenBeforeTurn(sessionId, session)
     }
-    // Building attachments, refreshing network settings, and refreshing OAuth
+    // Building attachments and refreshing network settings or credentials
     // can all suspend this call. Stop may revoke the owning desktop turn while
     // one of those awaits is pending, so check ownership at the last possible
     // point before writing the user message to the SDK socket.
@@ -1046,8 +1135,35 @@ export class ConversationService {
       },
       parent_tool_use_id: null,
       session_id: '',
+      ...(options?.synthetic ? { isSynthetic: true } : {}),
     })
     if (sent) options?.onCommitted?.()
+    return sent
+  }
+
+  private async refreshProviderCredentialsBeforeTurn(
+    sessionId: string,
+    session: SessionProcess,
+  ): Promise<boolean> {
+    if (!session.providerId || !session.providerAuth) return true
+    let env: Record<string, string>
+    try {
+      env = await this.providerService.getProviderRuntimeEnv(session.providerId)
+    } catch {
+      // A removed provider must not silently switch this session to another one.
+      return this.sessions.get(sessionId) === session
+    }
+    if (this.sessions.get(sessionId) !== session) return false
+    // A credential saved for a new address must never reach the old endpoint.
+    if ((env.ANTHROPIC_BASE_URL ?? '') !== session.providerAuth.baseUrl) return true
+    const apiKey = env.ANTHROPIC_API_KEY ?? ''
+    const authToken = env.ANTHROPIC_AUTH_TOKEN ?? ''
+    if (apiKey === session.providerAuth.apiKey && authToken === session.providerAuth.authToken) return true
+    const sent = this.sendSdkMessage(sessionId, {
+      type: 'update_environment_variables',
+      variables: { ANTHROPIC_API_KEY: apiKey, ANTHROPIC_AUTH_TOKEN: authToken },
+    })
+    if (sent) session.providerAuth = { ...session.providerAuth, apiKey, authToken }
     return sent
   }
 
@@ -1055,7 +1171,15 @@ export class ConversationService {
     sessionId: string,
     session: SessionProcess,
   ): Promise<boolean> {
-    const settings = await loadNetworkSettings()
+    // The session may pin a provider whose proxy override diverges from the
+    // global network settings; the hot update must keep honoring it.
+    const sessionProvider = session.providerId
+      ? await this.providerService.getProvider(session.providerId).catch(() => null)
+      : null
+    const settings = resolveProviderNetworkSettings(
+      await loadNetworkSettings(),
+      sessionProvider?.proxy,
+    )
     const baseEnv = await getProcessEnvWithTerminalShellEnvironment()
     const networkEnv = buildNetworkEnvironment(settings, baseEnv)
     const fingerprint = networkRoutingFingerprint(settings, {
@@ -1121,7 +1245,7 @@ export class ConversationService {
     const pendingRequest = session?.pendingPermissionRequests.get(requestId)
     this.clearAutoAnswerWait(pendingRequest)
     if (session) {
-      session.pendingPermissionRequests.delete(requestId)
+      if (session.pendingPermissionRequests.delete(requestId)) powerActivityClock.changed()
     }
 
     return this.sendSdkMessage(sessionId, {
@@ -1280,6 +1404,40 @@ export class ConversationService {
     })
   }
 
+  /**
+   * Next-prompt suggestions cost one extra model request per turn, so the CLI
+   * only generates them while the user setting is on and a client that can
+   * show them (the desktop composer) is watching the session. IM adapters,
+   * the phone app and team workers never trigger the extra request.
+   */
+  setPromptSuggestionClientPresent(sessionId: string, present: boolean): void {
+    if (present) this.promptSuggestionClientSessions.add(sessionId)
+    else this.promptSuggestionClientSessions.delete(sessionId)
+    this.syncPromptSuggestions(sessionId)
+  }
+
+  async refreshPromptSuggestionsSetting(): Promise<void> {
+    this.promptSuggestionsSettingEnabled = await new SettingsService().getNextPromptSuggestionsEnabled()
+    for (const sessionId of this.sessions.keys()) {
+      this.syncPromptSuggestions(sessionId)
+    }
+  }
+
+  private syncPromptSuggestions(sessionId: string): void {
+    const session = this.sessions.get(sessionId)
+    if (!session) return
+    const enabled = this.promptSuggestionsSettingEnabled &&
+      !session.teamWorker &&
+      this.promptSuggestionClientSessions.has(sessionId)
+    if ((session.promptSuggestionsEnabled ?? false) === enabled) return
+    session.promptSuggestionsEnabled = enabled
+    this.sendSdkMessage(sessionId, {
+      type: 'control_request',
+      request_id: crypto.randomUUID(),
+      request: { subtype: 'set_prompt_suggestions', enabled },
+    })
+  }
+
   setMaxThinkingTokensForActiveSessions(maxThinkingTokens: number | null): number {
     let sent = 0
     for (const sessionId of this.getActiveSessions()) {
@@ -1290,7 +1448,7 @@ export class ConversationService {
     return sent
   }
 
-  sendInterrupt(sessionId: string): boolean {
+  pauseTeamWorkers(sessionId: string): boolean {
     // Stop ends all team activity immediately, but an approved team that is
     // already working is paused rather than destroyed: the runtime marks its
     // members as user-stopped before their processes die, and a later message
@@ -1303,18 +1461,26 @@ export class ConversationService {
         console.error('[ConversationService] Team runtime interrupt hook failed', error)
       }
     }
-    for (const [childId, child] of this.sessions) {
-      if (child.teamWorker?.parentSessionId === sessionId) this.stopSession(childId)
-    }
+    const childStops = [...this.sessions].filter(([, child]) => child.teamWorker?.parentSessionId === sessionId)
+      .map(([childId]) => this.stopSessionAndWait(childId, undefined, { requireExit: true }))
+    // Keep rejected physical-exit confirmations owned until the queued team
+    // operation records its partial state; never report a vanished map as exit.
+    const childrenStopped = Promise.allSettled(childStops)
     const stop = (this.teamStopOperations.get(sessionId) ?? Promise.resolve()).then(async () => {
       const runtime = await import('./teamPlanRuntime.js')
       await runtime.stopTeamPlanRuntimesForParent(sessionId, { pauseReleased: true })
+      await childrenStopped
     }).catch(error => {
       console.error('[ConversationService] Failed to revoke interrupted team launch', error)
     }).finally(() => {
       if (this.teamStopOperations.get(sessionId) === stop) this.teamStopOperations.delete(sessionId)
     })
     this.teamStopOperations.set(sessionId, stop)
+    return pausedTeam
+  }
+
+  sendInterrupt(sessionId: string): boolean {
+    const pausedTeam = this.pauseTeamWorkers(sessionId)
     // A paused team's lead also holds the mail its members sent before the
     // Stop until the user speaks again; acting on it would start lead turns,
     // and restart members, that the user just stopped.
@@ -1343,7 +1509,7 @@ export class ConversationService {
     while (Date.now() - startedAt < timeoutMs) {
       if (signal?.aborted) throw controlRequestAbortReason(signal)
       const session = this.sessions.get(sessionId)
-      if (!session) {
+      if (!session || session.controlRevoked) {
         throw new Error('CLI session is not running')
       }
       if (this.isControlChannelReady(session)) {
@@ -1361,6 +1527,7 @@ export class ConversationService {
     timeoutMs = 10_000,
     signal?: AbortSignal,
     canSend?: () => boolean,
+    beforeSend?: () => Promise<boolean>,
   ): Promise<Record<string, unknown>> {
     if (signal?.aborted) {
       return Promise.reject(controlRequestAbortReason(signal))
@@ -1375,6 +1542,22 @@ export class ConversationService {
     if (!session) {
       throw new Error('CLI session is not running')
     }
+    if (request.subtype === 'enqueue_scheduled_task') {
+      // Scheduled work starts a user turn through the control channel. A live
+      // CLI must receive changed provider proxy/timeouts just like sendMessage.
+      // Refresh before the durable delivery receipt, and recheck ownership after
+      // the asynchronous settings read so cancellation cannot enqueue stale work.
+      if (signal?.aborted) throw controlRequestAbortReason(signal)
+      if (canSend && !canSend()) throw new Error('Scheduled delivery was cancelled')
+      if (!await this.refreshNetworkEnvironmentBeforeTurn(sessionId, session)) {
+        throw new Error('CLI session is not running')
+      }
+      if (signal?.aborted) throw controlRequestAbortReason(signal)
+      if (this.sessions.get(sessionId) !== session || (canSend && !canSend())) {
+        throw new Error('Scheduled delivery was cancelled')
+      }
+    }
+    if (beforeSend && !await beforeSend()) throw new Error('Scheduled task changed before delivery')
     const responseTimeoutMs = Math.max(1, timeoutMs - (Date.now() - startedAt))
     const requestId = crypto.randomUUID()
     return new Promise((resolve, reject) => {
@@ -1479,6 +1662,7 @@ export class ConversationService {
       input: request.input,
       ...(request.description ? { description: request.description } : {}),
       ...(request.displayName ? { displayName: request.displayName } : {}),
+      ...(request.autoAnswerDeadline !== undefined ? { autoAnswerDeadline: request.autoAnswerDeadline } : {}),
     }))
   }
 
@@ -1487,7 +1671,7 @@ export class ConversationService {
     token: string | null | undefined,
   ): boolean {
     const session = this.sessions.get(sessionId)
-    return Boolean(session && token && token === session.sdkToken)
+    return Boolean(session && !session.controlRevoked && token && token === session.sdkToken)
   }
 
   attachSdkConnection(
@@ -1495,7 +1679,7 @@ export class ConversationService {
     socket: { send(data: string): void },
   ): boolean {
     const session = this.sessions.get(sessionId)
-    if (!session) return false
+    if (!session || session.controlRevoked) return false
 
     session.sdkSocket = socket
     session.resolveSdkAttached?.()
@@ -1554,7 +1738,7 @@ export class ConversationService {
     options?: HandleSdkPayloadOptions,
   ): void {
     const session = this.sessions.get(sessionId)
-    if (!session) return
+    if (!session || session.controlRevoked) return
 
     const lines = rawPayload
       .split('\n')
@@ -1565,6 +1749,13 @@ export class ConversationService {
       try {
         const msg = JSON.parse(line)
         if (this.isReplayedSdkMessage(session, msg)) continue
+        if (msg?.type === 'system' && msg.subtype === 'prompt_suggestion_activity') {
+          const activity = SDKPromptSuggestionActivityMessageSchema().safeParse(msg)
+          if (activity.success) {
+            this.trackPromptSuggestionActivity(session, activity.data.generation_id, activity.data.active)
+          }
+          continue
+        }
         if (
           msg?.type === 'system' &&
           msg.subtype === 'api_retry' &&
@@ -1589,11 +1780,23 @@ export class ConversationService {
         if (sdkError) {
           void diagnosticsService.recordEvent({
             type: sdkError.type,
-            severity: 'error',
+            // A retry the CLI is still attempting is a recoverable state, not an error; the
+            // exhausted request is recorded separately as an error.
+            severity: sdkError.type === 'sdk_api_retry' ? 'info' : 'error',
             sessionId,
             summary: sdkError.summary,
             details: sdkError.details,
           })
+          if (sdkError.type === 'sdk_api_retry') {
+            void traceCaptureService.recordEvent({
+              sessionId,
+              phase: 'api_retry',
+              severity: 'warning',
+              title: 'API request retry',
+              message: sdkError.summary,
+              metadata: sdkError.details,
+            }).catch(() => {})
+          }
         }
         if (msg?.type === 'system' && msg.subtype === 'init') {
           session.initMessage = msg
@@ -1635,6 +1838,7 @@ export class ConversationService {
           }
           this.clearAutoAnswerWait(session.pendingPermissionRequests.get(msg.request_id))
           session.pendingPermissionRequests.set(msg.request_id, request)
+          powerActivityClock.changed()
           void this.scheduleAutoQuestionAnswer(sessionId, session, msg.request_id, request)
         }
         if (
@@ -1642,14 +1846,14 @@ export class ConversationService {
           typeof msg.request_id === 'string'
         ) {
           this.clearAutoAnswerWait(session.pendingPermissionRequests.get(msg.request_id))
-          session.pendingPermissionRequests.delete(msg.request_id)
+          if (session.pendingPermissionRequests.delete(msg.request_id)) powerActivityClock.changed()
         }
         if (
           msg?.type === 'control_response' &&
           typeof msg.response?.request_id === 'string'
         ) {
           this.clearAutoAnswerWait(session.pendingPermissionRequests.get(msg.response.request_id))
-          session.pendingPermissionRequests.delete(msg.response.request_id)
+          if (session.pendingPermissionRequests.delete(msg.response.request_id)) powerActivityClock.changed()
         }
         if (session.teamWorker && msg?.type === 'control_request' && msg.request?.subtype === 'can_use_tool') {
           const parent = this.sessions.get(session.teamWorker.parentSessionId)
@@ -1664,6 +1868,33 @@ export class ConversationService {
         )
       }
     }
+  }
+
+  hasPromptSuggestionPowerActivity(): boolean {
+    return this.promptSuggestionWorkOwners.size > 0
+  }
+
+  private trackPromptSuggestionActivity(session: SessionProcess, generationId: string, active: boolean): void {
+    if (session.promptSuggestionExited || session.proc.exitCode != null) return
+    if (!session.promptSuggestionGenerations) {
+      if (!active) return
+      session.promptSuggestionGenerations = new Set()
+      void session.proc.exited.then(() => {
+        session.promptSuggestionExited = true
+        session.promptSuggestionGenerations?.clear()
+        if (this.promptSuggestionWorkOwners.delete(session)) powerActivityClock.changed()
+      }, () => {})
+    }
+    const generations = session.promptSuggestionGenerations
+    if (active) {
+      if (generations.has(generationId)) return
+      generations.add(generationId)
+      this.promptSuggestionWorkOwners.add(session)
+    } else {
+      if (!generations.delete(generationId)) return
+      if (generations.size === 0) this.promptSuggestionWorkOwners.delete(session)
+    }
+    powerActivityClock.changed()
   }
 
   private notifyOutputCallbacks(
@@ -1818,6 +2049,21 @@ export class ConversationService {
     timeoutMs = DESKTOP_CLI_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
     options?: { keepTeamWorkers?: boolean; requireExit?: boolean },
   ): Promise<void> {
+    const pending = this.sessionStopPromises.get(sessionId)
+    if (pending) return pending
+    const operation = this.stopSessionAndWaitOnce(sessionId, timeoutMs, options)
+    this.sessionStopPromises.set(sessionId, operation)
+    try { await operation }
+    finally {
+      if (this.sessionStopPromises.get(sessionId) === operation) this.sessionStopPromises.delete(sessionId)
+    }
+  }
+
+  private async stopSessionAndWaitOnce(
+    sessionId: string,
+    timeoutMs: number,
+    options?: { keepTeamWorkers?: boolean; requireExit?: boolean },
+  ): Promise<void> {
     if (!options?.keepTeamWorkers) {
       for (const [childId, child] of this.sessions) {
         if (child.teamWorker?.parentSessionId === sessionId) await this.stopSessionAndWait(childId, timeoutMs, options)
@@ -1826,8 +2072,11 @@ export class ConversationService {
     const session = this.sessions.get(sessionId)
     if (!session) return
 
+    session.controlRevoked = true
+    session.pendingOutbound.length = 0
     this.cancelPendingControlRequests(session)
     this.clearSessionAutoAnswerWaits(session)
+    session.pendingPermissionRequests.clear()
     if (!options?.requireExit) this.sessions.delete(sessionId)
     await this.stopProcessAndWait(sessionId, session, timeoutMs, options?.requireExit)
     if (this.sessions.get(sessionId) === session) this.sessions.delete(sessionId)
@@ -1948,6 +2197,8 @@ export class ConversationService {
     return Array.from(this.sessions.keys())
   }
 
+  hasPendingTeamStops(): boolean { return this.teamStopOperations.size > 0 }
+
   getProcessIds(): number[] {
     return [...this.sessions.values()].map(session => session.proc.pid).filter(pid => pid > 0)
   }
@@ -2027,7 +2278,7 @@ export class ConversationService {
     payload: Record<string, unknown>,
   ): boolean {
     const session = this.sessions.get(sessionId)
-    if (!session) return false
+    if (!session || session.controlRevoked) return false
 
     const line = JSON.stringify(payload) + '\n'
     if (session.sdkSocket) {
@@ -2049,21 +2300,30 @@ export class ConversationService {
 
     const activeSession = this.sessions.get(sessionId)
     if (activeSession?.proc === proc) {
+      // A confirmed-exit stop retains its map entry until the process leaves.
+      // It is still an intentional stop, not a second crashed model turn.
+      if (activeSession.controlRevoked) return
       // A lead process that dies on its own (crash, OOM, provider SDK fault)
       // must not take its approved team with it: members are independent
       // processes, their messages queue in the lead's mailbox, and the next
       // lead start receives the team snapshot again. Explicit stops (close,
       // delete, /clear) still stop workers through stopSession.
-      this.cancelPendingControlRequests(
-        activeSession,
-        new Error('CLI session exited before the control request completed'),
-      )
       if (activeSession.startupPending) {
+        this.cancelPendingControlRequests(
+          activeSession,
+          new Error('CLI session exited before the control request completed'),
+        )
         activeSession.startupExitCode = code
         return
       }
       await this.waitForProcessOutputDrain(activeSession)
       const exitError = this.buildRuntimeExitMessage(sessionId, code)
+      // A caller waiting on the process (a team member's startup) has to say
+      // why it is gone, not only that it is.
+      this.cancelPendingControlRequests(
+        activeSession,
+        new Error(`CLI session exited before the control request completed. ${exitError}`),
+      )
       void diagnosticsService.recordEvent({
         type: 'cli_runtime_exit',
         severity: cliExitSeverity(code),
@@ -2153,6 +2413,7 @@ export class ConversationService {
       'ANTHROPIC_API_KEY',
       'ANTHROPIC_BASE_URL',
       'ANTHROPIC_AUTH_TOKEN',
+      'CLAUDE_CODE_SUBAGENT_MODEL',
       'ENABLE_TOOL_SEARCH',
       'ANTHROPIC_MODEL',
       'ANTHROPIC_DEFAULT_FABLE_MODEL',
@@ -2176,6 +2437,7 @@ export class ConversationService {
       'CC_HAHA_OPENAI_FAST_MODE',
       GROK_OAUTH_PROVIDER_ENV_KEY,
       GROK_OAUTH_FILE_ENV_KEY,
+      GROK_MODEL_CATALOG_ENV_KEY,
       DEEPSEEK_OAUTH_PROVIDER_ENV_KEY,
       DEEPSEEK_OAUTH_FILE_ENV_KEY,
       IMAGE_GENERATION_PROVIDER_KIND_ENV_KEY,
@@ -2221,6 +2483,11 @@ export class ConversationService {
       }
     }
 
+    // A Magpie session runs any model in Magpie's catalog; write the catalog's
+    // current windows and reply limits back first so the env built below carries them.
+    await this.providerService.refreshMagpieProvider(
+      typeof options?.providerId === 'string' ? options.providerId : null,
+    )
     const explicitProvider =
       typeof options?.providerId === 'string'
         ? await this.providerService.getProvider(options.providerId)
@@ -2233,7 +2500,10 @@ export class ConversationService {
       : null
     if (explicitProviderEnv) delete explicitProviderEnv.CC_HAHA_OPENAI_FAST_MODE
     const networkEnv = buildNetworkEnvironment(
-      networkSettingsOverride ?? await loadNetworkSettings(),
+      resolveProviderNetworkSettings(
+        networkSettingsOverride ?? await loadNetworkSettings(),
+        explicitProvider?.proxy,
+      ),
       cleanEnv,
     )
     // The overall-duration cap has to scale with the user's "请求超时" or raising
@@ -2546,6 +2816,7 @@ export class ConversationService {
         OPENAI_CODEX_OAUTH_FILE_ENV_KEY,
         GROK_OAUTH_PROVIDER_ENV_KEY,
         GROK_OAUTH_FILE_ENV_KEY,
+        GROK_MODEL_CATALOG_ENV_KEY,
         DEEPSEEK_OAUTH_PROVIDER_ENV_KEY,
         DEEPSEEK_OAUTH_FILE_ENV_KEY,
         IMAGE_GENERATION_PROVIDER_KIND_ENV_KEY,
@@ -2688,13 +2959,12 @@ export class ConversationService {
     }
 
     const normalizedDetail = detail.trim()
-    // A Windows Bun that crashes before running any code almost always failed
-    // to commit memory for JavaScriptCore: the machine's commit limit (RAM +
-    // page file) is used up, which every extra CLI process (e.g. each team
-    // member) brings closer. The raw crash report alone points at Bun instead.
+    // A Bun crash report identifies a runtime failure, not its cause. Preserve
+    // the panic and report URL without inferring memory exhaustion from the
+    // platform, exit code, or process memory snapshot.
     if (/Bun has crashed/i.test(normalizedDetail) && /\bWindows\b/.test(normalizedDetail)) {
       return new ConversationStartupError(
-        `CLI runtime crashed during startup (code ${exitCode}). On Windows this usually means the system has run out of commit memory (RAM + page file). Close other programs, set the page file (virtual memory) to system managed, or start fewer team members, then retry. Crash output: ${normalizedDetail}`,
+        `CLI runtime crashed during startup (code ${exitCode}). Include the crash output and diagnostics when reporting this problem. Crash output: ${normalizedDetail}`,
         'CLI_START_FAILED',
         true,
       )
@@ -2804,6 +3074,23 @@ export class ConversationService {
     summary: string
     details: Record<string, unknown>
   } | null {
+    if (message?.type === 'system' && message.subtype === 'api_retry') {
+      const detail = typeof message.error_message === 'string' ? message.error_message : ''
+      return {
+        type: 'sdk_api_retry',
+        summary: sanitizeRetryDiagnosticText(detail || `API request retry: ${message.error ?? 'unknown'}`),
+        details: {
+          attempt: message.attempt,
+          maxRetries: message.max_retries,
+          retryDelayMs: message.retry_delay_ms,
+          errorStatus: message.error_status,
+          error: message.error,
+          requestId: typeof message.request_id === 'string' ? sanitizeRetryDiagnosticText(message.request_id) : undefined,
+          messageUuid: message.uuid,
+        },
+      }
+    }
+
     if (this.isAssistantApiErrorMessage(message)) {
       const summary = this.redactProcessOutput(
         this.extractAssistantApiErrorDetail(message) || 'Assistant API error',

@@ -209,6 +209,9 @@ const legacyRoutes = [
   '/docs', '/features/computer-use', '/features/computer-use-architecture',
   '/guide/cli-reference', '/guide/contributing', '/guide/env-vars', '/guide/faq',
   '/guide/global-usage', '/guide/quick-start', '/guide/third-party-models',
+  '/internals/computer-use-cef-injection', '/internals/computer-use-codex-parity-review',
+  '/internals/computer-use-codex-redesign', '/internals/computer-use-handoff',
+  '/internals/computer-use-native-manual-qa', '/internals/computer-use-native-swift-design',
   '/memory', '/memory/01-usage-guide', '/memory/02-implementation', '/memory/03-autodream',
   '/reference/fixes', '/reference/local-server', '/reference/project-structure',
   '/skills', '/skills/01-usage-guide', '/skills/02-implementation'
@@ -239,9 +242,9 @@ async function main() {
 
   await createRouteEntry('/en', shell, {
     alternate: '/',
-    description: 'Write code, work across apps, and review every change. Give cc-haha a goal and put your ideas in motion.',
+    description: 'Parallel sessions, Agent Teams, Computer Use, and any model you like. Pair your phone to approve and start tasks away from your desk.',
     path: '/en',
-    title: 'cc-haha — Less busywork. More room for life.'
+    title: 'cc-haha — Claude Code on your desktop and in your pocket'
   })
 
   for (const legacy of legacyRoutes) {

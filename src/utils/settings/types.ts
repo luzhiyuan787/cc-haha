@@ -485,6 +485,22 @@ export const SettingsSchema = lazySchema(() =>
           'Enable the "ultracode" keyword trigger: including the keyword in a prompt ' +
             'opts that turn into the Workflow tool. Set to false to disable the trigger. Default: true.',
         ),
+      nextPromptSuggestionsEnabled: z
+        .boolean()
+        .optional()
+        .describe(
+          'Desktop: show a predicted next prompt in the empty composer after each reply ' +
+            '(one extra model request per turn). Default: false.',
+        ),
+      maxOutputTokensEscalationMode: z
+        .enum(['auto', 'enabled', 'disabled'])
+        .optional()
+        .describe(
+          'Controls the native output budget cap (up to 8k) and model-bounded retry (up to 64k). ' +
+            'auto = follow GrowthBook remote flag (tengu_otk_slot_v1). ' +
+            'enabled = opt in on supported routes, preserving explicit budgets. ' +
+            'disabled = use model defaults. Continuation recovery remains available in all modes.',
+        ),
       workflowSizeGuideline: z
         .enum(['unrestricted', 'small', 'medium', 'large'])
         .optional()
@@ -698,15 +714,19 @@ export const SettingsSchema = lazySchema(() =>
       webSearch: z
         .object({
           mode: z
-            .enum(['auto', 'anthropic', 'tavily', 'brave', 'disabled'])
+            .enum(['auto', 'anthropic', 'tavily', 'brave', 'deepseek', 'disabled'])
             .optional()
             .describe(
-              'WebSearch backend selection. auto uses native Claude web search for Claude model names, then Tavily, then Brave.',
+              'WebSearch backend selection. auto uses supported native search (Claude or official DeepSeek Anthropic endpoint), then Tavily, Brave, DeepSeek.',
             ),
           tavilyApiKey: z
             .string()
             .optional()
             .describe('Tavily API key for WebSearch fallback'),
+          deepseekApiKey: z
+            .string()
+            .optional()
+            .describe('DeepSeek API key for the standalone Search API'),
           braveApiKey: z
             .string()
             .optional()
@@ -815,6 +835,8 @@ export const SettingsSchema = lazySchema(() =>
               // Any non-empty string, matching the Markdown `model` frontmatter
               // parser — third-party model IDs are not aliases.
               model: z.string().trim().min(1).optional().catch(undefined),
+              // Saved cc-haha provider id that serves `model` for this agent.
+              provider: z.string().trim().min(1).optional().catch(undefined),
               // Agent-level effort takes the full level set, unlike the
               // session-level `effortLevel` above. Levels are inlined rather
               // than imported from utils/effort.js: that module reads settings,
@@ -839,7 +861,7 @@ export const SettingsSchema = lazySchema(() =>
         // parseSettingsFileUncached drops every setting when the schema throws.
         .catch(undefined)
         .describe(
-          'Per-agent model/effort overrides for built-in agents. Keys are the ' +
+          'Per-agent model/provider/effort overrides for built-in agents. Keys are the ' +
             'agentType as spawned (e.g. "Explore"), case-sensitive. Other ' +
             'built-in fields stay read-only.',
         ),

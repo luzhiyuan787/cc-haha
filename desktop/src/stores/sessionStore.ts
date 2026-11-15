@@ -41,6 +41,9 @@ type CreateSessionOptions = {
 
 type BranchSessionResult = Pick<BranchSessionResponse, 'sessionId' | 'title' | 'workDir'>
 
+export type ArchiveSessionsFailure = { id: string; error: unknown }
+export type ArchiveSessionsResult = { successes: string[]; failures: ArchiveSessionsFailure[] }
+
 type SessionStore = {
   sessions: SessionListItem[]
   activeSessionId: string | null
@@ -54,6 +57,7 @@ type SessionStore = {
   recentSessionIds: Set<string>
   recentProjectBoundaries: Record<string, RecentProjectBoundary>
   projectSessionTotals: Record<string, number>
+  projectArchivedTotals: Record<string, number>
   projectHistory: Record<string, ProjectHistoryState>
 
   fetchSessions: (project?: string) => Promise<void>
@@ -76,9 +80,13 @@ type SessionStore = {
   deselectSessions: (ids: string[]) => void
   clearSessionSelection: () => void
   renameSession: (id: string, title: string) => Promise<void>
+  setSessionArchived: (id: string, archived: boolean) => Promise<void>
+  /** Archives or restores each id in order and refreshes the list once. */
+  setSessionsArchived: (ids: string[], archived: boolean) => Promise<ArchiveSessionsResult>
   updateSessionTitle: (id: string, title: string) => void
   updateSessionMessageCount: (id: string, messageCount: number) => void
   updateSessionPermissionMode: (id: string, mode: PermissionMode) => void
+  updateSessionWorkDir: (id: string, workDir: string) => void
   setActiveSession: (id: string | null) => void
 }
 
@@ -97,6 +105,7 @@ const pendingCreatedSessionIds = new Set<string>()
 // those authoritative names so a later stale `Untitled Session` row cannot
 // erase them while the local index reconciles.
 const pendingSessionTitles = new Map<string, string>()
+const pendingSessionWorkDirs = new Map<string, string>()
 
 export const useSessionStore = create<SessionStore>((set, get) => ({
   sessions: [],
@@ -111,6 +120,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   recentSessionIds: new Set(),
   recentProjectBoundaries: {},
   projectSessionTotals: {},
+  projectArchivedTotals: {},
   projectHistory: {},
 
   fetchSessions: async (project?: string) => {
@@ -124,6 +134,12 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       const response = await sessionsApi.list(buildSessionListParams(project))
       if (requestId !== get().sessionListRequestId) return
       const raw = response.sessions
+      // Only server rows can acknowledge a cwd notification. During index
+      // building, mergeSessionList also visits retained local rows.
+      for (const row of raw) {
+        if (pendingSessionWorkDirs.get(row.id) === row.workDir) pendingSessionWorkDirs.delete(row.id)
+      }
+      const archivedIds = response.archivedSessionIds ? new Set(response.archivedSessionIds) : null
       const indexStatus = response.index ?? null
       useSessionRuntimeStore.getState().syncFromSessions(raw, runtimeSelections)
       let syncedSessions: SessionListItem[] = []
@@ -137,7 +153,9 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
         // page. Closing its tab releases it even while the index is building.
         const retainedSessions = state.sessions.filter((session) => (
           !state.historicalSessionIds.has(session.id) || historicalSessionIds.has(session.id) || projectSessionIds.has(session.id)
-        ))
+        )).map((session) => archivedIds && Boolean(session.archived) !== archivedIds.has(session.id)
+          ? { ...session, archived: archivedIds.has(session.id) }
+          : session)
         const incomingSessions = reconcilePendingCreatedSessions(raw, retainedSessions)
         const incomingIds = new Set(incomingSessions.map((session) => session.id))
         const retainedHistory = retainedSessions.filter((session) => (
@@ -160,6 +178,9 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
           recentProjectBoundaries: shouldRetainRenderedSessions(indexStatus) ? {} : buildRecentProjectBoundaries(raw),
           projectSessionTotals: response.projects
             ? Object.fromEntries(response.projects.map((project) => [project.projectRoot, project.total]))
+            : {},
+          projectArchivedTotals: response.projects
+            ? Object.fromEntries(response.projects.map((project) => [project.projectRoot, project.archivedTotal ?? 0]))
             : {},
           indexStatus,
           isLoading: indexStatus?.state === 'building' && sessions.length === 0,
@@ -389,6 +410,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     useTabStore.getState().markSessionsDeleted([id])
     pendingCreatedSessionIds.delete(id)
     pendingSessionTitles.delete(id)
+    pendingSessionWorkDirs.delete(id)
     invalidateRecentProjectsCache()
     useSessionRuntimeStore.getState().clearSelection(id)
     excludeDeletedProjectSessions([id])
@@ -414,6 +436,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       releaseWorkspaceSession(id)
       pendingCreatedSessionIds.delete(id)
       pendingSessionTitles.delete(id)
+      pendingSessionWorkDirs.delete(id)
       useSessionRuntimeStore.getState().clearSelection(id)
     }
     excludeDeletedProjectSessions(result.successes)
@@ -455,6 +478,77 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   })),
   clearSessionSelection: () => set({ selectedSessionIds: new Set() }),
 
+  setSessionArchived: async (id, archived) => {
+    const { failures } = await get().setSessionsArchived([id], archived)
+    if (failures.length > 0) throw failures[0]!.error
+  },
+
+  setSessionsArchived: async (ids, archived) => {
+    const successes: string[] = []
+    const failures: ArchiveSessionsFailure[] = []
+    const restoredSessions: SessionListItem[] = []
+    // One request at a time: each archive is checked against the session's
+    // activity on the server, and a batch must not race its own refresh.
+    for (const id of ids) {
+      try {
+        // The restored row can be older than the sidebar preview and absent
+        // from the cache. Read its metadata before the mutation, so a failed
+        // read leaves the archive intact and a fully loaded project can regain
+        // the actual row.
+        const restored = archived ? null : { ...await sessionsApi.getSummary(id), archived: false }
+        await sessionsApi.setArchived(id, archived)
+        if (restored) restoredSessions.push(restored)
+        successes.push(id)
+      } catch (error) {
+        failures.push({ id, error })
+      }
+    }
+    if (successes.length === 0) return { successes, failures }
+
+    // This is a reversible visibility change. Keep open tabs, workspace state,
+    // runtime selections and connections intact; only delete releases them.
+    if (archived) {
+      for (const id of successes) pendingCreatedSessionIds.delete(id)
+      excludeDeletedProjectSessions(successes)
+    } else {
+      for (const request of projectHistoryRequests.values()) {
+        for (const id of successes) request.excludedSessionIds.delete(id)
+      }
+    }
+    invalidateRecentProjectsCache()
+    const changed = new Set(successes)
+    const openIds = getOpenSessionIds()
+    const restoredIdsByRoot = new Map<string, string[]>()
+    for (const session of restoredSessions) {
+      const root = session.projectRoot || session.workDir || session.projectPath
+      restoredIdsByRoot.set(root, [...restoredIdsByRoot.get(root) ?? [], session.id])
+    }
+    set((state) => ({
+      sessions: archived
+        ? state.sessions.map((session) => changed.has(session.id) ? { ...session, archived } : session)
+        : mergeSessionList([...restoredSessions, ...state.sessions.filter((session) => !changed.has(session.id))], state.sessions),
+      recentSessionIds: archived ? removeIdsFromSet(state.recentSessionIds, successes) : state.recentSessionIds,
+      historicalSessionIds: successes.some((id) => openIds.has(id))
+        ? new Set([...state.historicalSessionIds, ...successes.filter((id) => openIds.has(id))])
+        : state.historicalSessionIds,
+      selectedSessionIds: removeIdsFromSet(state.selectedSessionIds, successes),
+      projectHistory: archived
+        ? removeProjectHistorySessionIds(state.projectHistory, successes)
+        : Object.fromEntries(Object.entries(state.projectHistory).map(([root, history]) => [root, {
+          ...history,
+          sessionIds: restoredIdsByRoot.has(root)
+            ? new Set([...history.sessionIds, ...restoredIdsByRoot.get(root)!])
+            : history.sessionIds,
+          excludedSessionIds: removeIdsFromSet(history.excludedSessionIds ?? new Set(), successes),
+        }])),
+      // A response begun before this mutation may still contain the old flag.
+      sessionListRequestId: ++fetchSessionsRequestId,
+      isLoading: false,
+    }))
+    await get().fetchSessions()
+    return { successes, failures }
+  },
+
   renameSession: async (id: string, title: string) => {
     await sessionsApi.rename(id, title)
     pendingSessionTitles.set(id, title)
@@ -494,6 +588,20 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
         session.id === id ? { ...session, permissionMode: mode } : session,
       ),
     }))
+  },
+
+  updateSessionWorkDir: (id, workDir) => {
+    if (!workDir.trim()) return
+    pendingSessionWorkDirs.set(id, workDir)
+    if (get().sessions.find(row => row.id === id)?.workDir === workDir) return
+    sessionsApi.invalidateGitInfo(id)
+    set((state) => {
+      const session = state.sessions.find(row => row.id === id)
+      if (!session || session.workDir === workDir) return state
+      return { sessions: state.sessions.map(row => row.id === id
+        ? { ...row, workDir, workDirExists: true, workspaceState: 'available' as const }
+        : row) }
+    })
   },
 
   setActiveSession: (id) => set({ activeSessionId: id }),
@@ -584,7 +692,7 @@ export function reconcileSessionSnapshots(
   return snapshots.map((snapshot) => {
     const current = currentById.get(snapshot.id)
     return current && sessionModifiedTime(current) >= sessionModifiedTime(snapshot)
-      ? current
+      ? (snapshot.archived !== undefined ? { ...current, archived: snapshot.archived } : current)
       : snapshot
   })
 }
@@ -598,7 +706,7 @@ function mergeSessionList(
 
   for (const item of incoming) {
     const current = currentById.get(item.id)
-    const candidate = applyPendingSessionTitle(preserveLocalTitle(current, item))
+    const candidate = applyPendingSessionWorkDir(applyPendingSessionTitle(preserveLocalTitle(current, item)))
     const existing = byId.get(candidate.id)
     if (!existing || sessionModifiedTime(candidate) > sessionModifiedTime(existing)) {
       byId.set(candidate.id, candidate)
@@ -606,6 +714,13 @@ function mergeSessionList(
   }
 
   return [...byId.values()].sort((a, b) => sessionModifiedTime(b) - sessionModifiedTime(a))
+}
+
+function applyPendingSessionWorkDir(session: SessionListItem): SessionListItem {
+  const workDir = pendingSessionWorkDirs.get(session.id)
+  if (!workDir) return session
+  if (session.workDir === workDir) return session
+  return { ...session, workDir, workDirExists: true, workspaceState: 'available' }
 }
 
 function applyPendingSessionTitle(session: SessionListItem): SessionListItem {
