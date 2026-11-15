@@ -2604,7 +2604,7 @@ describe('ProviderService', () => {
         expect(noThinkingResponse.status).toBe(200)
         const noThinkingMessages = calls[2].messages as Array<Record<string, unknown>>
         const noThinkingAssistant = noThinkingMessages.find(message => message.role === 'assistant')
-        expect(noThinkingAssistant?.reasoning_content).toBe('(reasoning omitted)')
+        expect(noThinkingAssistant?.reasoning_content).toBe('(reasoning unavailable)')
       } finally {
         globalThis.fetch = originalFetch
       }

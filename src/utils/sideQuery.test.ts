@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createSandboxedTestEnvironment } from '../../scripts/pr/test-environment.js'
 import { getIsInteractive, setIsInteractive } from '../bootstrap/state.js'
+import { getClaudeCodeModelCapabilities } from '../shared/modelReasoning.js'
 import { enableConfigs } from './config.js'
 import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
 import { generatePermissionExplanation } from './permissions/permissionExplainer.js'
@@ -35,6 +36,7 @@ async function withCapturedRequests<T>(
   responseContent: unknown[] = [{
     type: 'tool_use', id: 'toolu_fixture', name: 'explain_command', input: explanation,
   }],
+  extraEnv: Record<string, string> = {},
 ) {
   const requests: Record<string, any>[] = []
   const headers: Headers[] = []
@@ -71,6 +73,7 @@ async function withCapturedRequests<T>(
       ANTHROPIC_MODEL: model,
       CC_HAHA_SEND_DISABLED_THINKING: '1',
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+      ...extraEnv,
     }, originalEnv))
     setIsInteractive(false)
     get3PModelCapabilityOverride.cache.clear()
@@ -174,4 +177,27 @@ test('existing non-Fable side queries preserve forced tools and disabled thinkin
   expect(requests[0]?.tool_choice).toEqual({ type: 'tool', name: 'explain_command' })
   expect(requests[0]?.thinking).toEqual({ type: 'disabled' })
   expect(requests[0]?.max_tokens).toBe(1024)
+})
+
+test('MiniMax side classifiers keep adaptive thinking and relax the forced tool choice', async () => {
+  // MiniMax answers `thinking.type=disabled` with 400 "requires adaptive
+  // thinking", and a forced tool choice is invalid next to thinking. The
+  // auto-mode permission classifier sends both, so without this contract every
+  // classified tool call fails closed and the CLI asks the user for permission
+  // instead of deciding on its own.
+  const model = 'MiniMax-M3.1-Flash'
+  const capabilities = getClaudeCodeModelCapabilities(model, 'anthropic')
+  const { requests } = await withCapturedRequests(model, () => sideQuery({
+    model, messages: [{ role: 'user', content: 'Classify action' }],
+    tools: [{ name: 'classify_result', input_schema: { type: 'object', properties: {} } }],
+    tool_choice: { type: 'tool', name: 'classify_result' },
+    thinking: false, temperature: 0, max_tokens: 4096, querySource: 'auto_mode',
+  }), [{ type: 'text', text: 'ok' }], {
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: model,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES: capabilities,
+  })
+  expect(requests[0]?.thinking).toEqual({ type: 'adaptive' })
+  expect(requests[0]?.tool_choice).toEqual({ type: 'auto', disable_parallel_tool_use: true })
+  expect(requests[0]?.max_tokens).toBeGreaterThan(4096)
+  expect(JSON.stringify(requests[0]?.system)).toContain('classify_result')
 })

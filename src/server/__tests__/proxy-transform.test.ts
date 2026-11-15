@@ -330,7 +330,7 @@ describe('anthropicToOpenaiChat', () => {
 
     const result = anthropicToOpenaiChat(req, { roundTripReasoningContent: true })
     expect(result.messages[1]).toMatchObject({ role: 'assistant', tool_calls: [{ id: 'call_1' }] })
-    expect(result.messages[1]!.reasoning_content).toBe('(reasoning omitted)')
+    expect(result.messages[1]!.reasoning_content).toBe('(reasoning unavailable)')
     // A plain assistant turn without tool calls does not need the marker.
     expect(result.messages.at(-1)).toMatchObject({ role: 'assistant', content: 'One file.' })
     expect(result.messages.at(-1)!.reasoning_content).toBeUndefined()

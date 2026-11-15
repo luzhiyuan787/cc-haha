@@ -47,8 +47,10 @@ const DOCUMENT_TEXT_INLINE_LIMIT = 2000
 // the upstream ignores replayed reasoning. A transcript can legitimately lack
 // it — the model answered a tool call without emitting reasoning, the CLI
 // stripped thinking after a model/credential change, or the session predates
-// thinking — so a marker keeps those turns replayable.
-const MISSING_REASONING_CONTENT = '(reasoning omitted)'
+// thinking — so a marker keeps those turns replayable. The marker must not
+// contain the word "omitted": upstream's own omission markers (dropped images,
+// dropped documents) share that word, and tests assert on its absence.
+const MISSING_REASONING_CONTENT = '(reasoning unavailable)'
 
 /**
  * Convert Anthropic Messages request to OpenAI Chat Completions request.

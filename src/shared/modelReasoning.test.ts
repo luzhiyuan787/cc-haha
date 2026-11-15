@@ -47,11 +47,23 @@ describe('model reasoning capability pass-through', () => {
 
   test('enables the current Claude Code effort capabilities for compatible models', () => {
     expect(getClaudeCodeModelCapabilities('MiniMax-M3', 'anthropic')).toBe(
-      'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
+      'thinking,required_thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
     )
     expect(getClaudeCodeModelCapabilities('gpt-5.6-sol', 'openai_responses')).toBe(
       'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
     )
+  })
+
+  test('requires adaptive thinking for every MiniMax M3 point release', () => {
+    // MiniMax answers `thinking.type=disabled` with 400 "requires adaptive
+    // thinking", so the M3.1 line has to carry the same contract as M3: an
+    // unknown id would fall back to the generic profile, ask for thinking off
+    // and break the auto-mode permission classifier.
+    for (const modelId of ['minimax-m3', 'minimax-m3.1', 'minimax-m3.1-flash']) {
+      expect(resolveModelReasoningProfile(modelId, 'anthropic')?.family).toBe('minimax')
+      expect(getClaudeCodeModelCapabilities(modelId, 'anthropic')).toContain('required_thinking')
+      expect(getClaudeCodeModelCapabilities(modelId, 'anthropic')).toContain('adaptive_thinking')
+    }
   })
 
   test('requires enabled thinking for exact GLM 5.3 model ids', () => {

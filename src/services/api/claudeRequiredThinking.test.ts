@@ -1145,7 +1145,10 @@ for (const [model, expectedThinking] of [
   ['claude-opus-4-6', MANUAL_BUDGET],
   ['claude-sonnet-4-6', MANUAL_BUDGET],
   ['deepseek-v4-pro', MANUAL_BUDGET],
-  ['minimax-m3', MANUAL_BUDGET],
+  // MiniMax answers `thinking.type=disabled` with 400 "requires adaptive
+  // thinking", so its family declares required_thinking and keeps adaptive
+  // thinking even when the optional adaptive opt-out is set.
+  ['minimax-m3', { type: 'adaptive' }],
   ['glm-5.3', MANUAL_BUDGET],
   ['kimi-k3', MANUAL_BUDGET],
   ['doubao-seed-2-0-pro', MANUAL_BUDGET],

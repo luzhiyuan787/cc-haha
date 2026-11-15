@@ -165,11 +165,19 @@ const MODEL_REASONING_CAPABILITY_REGISTRY: readonly ModelReasoningCapabilityEntr
   {
     family: 'minimax',
     apiFormats: ['anthropic', 'openai_chat'],
-    claudeCodeCapabilities: 'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
+    // MiniMax's Anthropic-compatible endpoint refuses `thinking.type=disabled`
+    // with `400 invalid params, model "…" requires adaptive thinking
+    // (including reasoning.effort=none) is not allowed`. Thinking is therefore
+    // mandatory for this family, and a forced tool choice has to relax to
+    // `auto` next to it — otherwise the auto-mode permission classifier fails
+    // closed and the CLI asks the user for every tool call.
+    claudeCodeCapabilities: 'thinking,required_thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
     matches: modelId => (
       modelId.startsWith('minimax-m2.7') ||
       modelId === 'minimax-m3' ||
-      modelId.startsWith('minimax-m3-')
+      modelId.startsWith('minimax-m3-') ||
+      // Point releases (M3.1, M3.1-Flash) share the M3 contract.
+      modelId.startsWith('minimax-m3.')
     ),
   },
 ]
